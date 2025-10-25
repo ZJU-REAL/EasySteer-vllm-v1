@@ -71,6 +71,7 @@ class Scheduler(SchedulerInterface):
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
+        self.steer_vector_config = vllm_config.steer_vector_config
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
@@ -418,6 +419,16 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
+        # Record the SteerVectors in scheduled_running_reqs
+        scheduled_steer_vectors: set[int] = set()
+        if self.steer_vector_config:
+            scheduled_steer_vectors = set(
+                req.steer_vector_request.steer_vector_int_id
+                for req in scheduled_running_reqs
+                if req.steer_vector_request and req.steer_vector_request.steer_vector_int_id > 0
+            )
+            assert len(scheduled_steer_vectors) <= self.steer_vector_config.max_steer_vectors
+
         # Use a temporary RequestQueue to collect requests that need to be
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
@@ -466,6 +477,21 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
+
+                # Check that adding the request still respects the max_steer_vectors
+                # constraint.
+                if (
+                    self.steer_vector_config
+                    and request.steer_vector_request
+                    and (
+                        len(scheduled_steer_vectors) == self.steer_vector_config.max_steer_vectors
+                        and request.steer_vector_request.steer_vector_int_id not in scheduled_steer_vectors
+                    )
+                ):
+                    # Scheduling would exceed max_steer_vectors, skip.
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
                     continue
@@ -631,6 +657,8 @@ class Scheduler(SchedulerInterface):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
+                if self.steer_vector_config and request.steer_vector_request:
+                    scheduled_steer_vectors.add(request.steer_vector_request.steer_vector_int_id)
                 req_to_new_blocks[request.request_id] = (
                     self.kv_cache_manager.get_blocks(request.request_id)
                 )

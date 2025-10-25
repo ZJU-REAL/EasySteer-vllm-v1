@@ -19,6 +19,7 @@ from vllm.multimodal.processing import EncDecMultiModalProcessor
 from vllm.multimodal.utils import argsort_mm_positions
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.mistral import MistralTokenizer
 from vllm.utils import length_from_prompt_token_ids_or_embeds
@@ -255,6 +256,16 @@ class InputProcessor:
                 "[lora_path]` to use the LoRA tokenizer."
             )
 
+    def _validate_steer_vector(self, steer_vector_request: SteerVectorRequest | None) -> None:
+        if steer_vector_request is None:
+            return
+
+        # SteerVector request passed in while SteerVector is not enabled
+        if not self.vllm_config.steer_vector_config:
+            raise ValueError(
+                f"Got steer_vector_request {steer_vector_request} but SteerVector is not enabled!"
+            )
+
     def _validate_structured_output(self, params: SamplingParams) -> None:
         if not params.structured_outputs or not self.structured_outputs_config:
             return
@@ -396,12 +407,14 @@ class InputProcessor:
         params: SamplingParams | PoolingParams,
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
+        steer_vector_request: SteerVectorRequest | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
     ) -> EngineCoreRequest:
         self._validate_lora(lora_request)
+        self._validate_steer_vector(steer_vector_request)
         self._validate_params(params)
 
         data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
@@ -524,6 +537,7 @@ class InputProcessor:
             eos_token_id=eos_token_id,
             arrival_time=arrival_time,
             lora_request=lora_request,
+            steer_vector_request=steer_vector_request,
             cache_salt=decoder_inputs.get("cache_salt"),
             priority=priority,
             data_parallel_rank=data_parallel_rank,

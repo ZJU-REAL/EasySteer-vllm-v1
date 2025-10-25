@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from vllm.lora.request import LoRARequest
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
@@ -45,6 +46,7 @@ class CachedRequestState:
     xdrope_positions: torch.Tensor | None = None
 
     lora_request: LoRARequest | None = None
+    steer_vector_request: SteerVectorRequest | None = None
     prompt_embeds: torch.Tensor | None = None
 
     # Used when both async_scheduling and spec_decode are enabled.
@@ -220,6 +222,11 @@ class InputBatch:
         self.request_lora_mapping = np.zeros((self.max_num_reqs,), dtype=np.int64)
         self.lora_id_to_request_ids: dict[int, set[str]] = {}
         self.lora_id_to_lora_request: dict[int, LoRARequest] = {}
+
+        # steer vector related
+        self.request_steer_vector_mapping = np.zeros((self.max_num_reqs,), dtype=np.int32)
+        self.steer_vector_id_to_request_ids: dict[int, set[str]] = {}
+        self.steer_vector_id_to_steer_vector_request: dict[int, SteerVectorRequest] = {}
 
         # req_index -> generator
         # NOTE(woosuk): The indices of the requests that do not have their own
@@ -448,6 +455,19 @@ class InputBatch:
             # No LoRA
             self.request_lora_mapping[req_index] = 0
 
+        # Add request steer vector ID
+        if request.steer_vector_request:
+            steer_vector_id = request.steer_vector_request.steer_vector_int_id
+            if steer_vector_id not in self.steer_vector_id_to_request_ids:
+                self.steer_vector_id_to_request_ids[steer_vector_id] = set()
+
+            self.request_steer_vector_mapping[req_index] = steer_vector_id
+            self.steer_vector_id_to_request_ids[steer_vector_id].add(request.req_id)
+            self.steer_vector_id_to_steer_vector_request[steer_vector_id] = request.steer_vector_request
+        else:
+            # No SteerVector
+            self.request_steer_vector_mapping[req_index] = 0
+
         return req_index
 
     def remove_request(self, req_id: str) -> int | None:
@@ -478,6 +498,16 @@ class InputBatch:
                 del self.lora_id_to_request_ids[lora_id]
                 del self.lora_id_to_lora_request[lora_id]
             self.request_lora_mapping[req_index] = 0
+
+        # SteerVector
+        steer_vector_id = self.request_steer_vector_mapping[req_index]
+        if steer_vector_id != 0:
+            steer_vector_req_ids = self.steer_vector_id_to_request_ids[steer_vector_id]
+            steer_vector_req_ids.discard(req_id)
+            if not steer_vector_req_ids:
+                del self.steer_vector_id_to_request_ids[steer_vector_id]
+                del self.steer_vector_id_to_steer_vector_request[steer_vector_id]
+            self.request_steer_vector_mapping[req_index] = 0
 
         if self.is_pooling_model:
             self.pooling_params.pop(req_id, None)
@@ -567,6 +597,11 @@ class InputBatch:
         self.request_lora_mapping[i1], self.request_lora_mapping[i2] = (
             self.request_lora_mapping[i2],
             self.request_lora_mapping[i1],
+        )
+
+        self.request_steer_vector_mapping[i1], self.request_steer_vector_mapping[i2] = (
+            self.request_steer_vector_mapping[i2],
+            self.request_steer_vector_mapping[i1],
         )
 
         if self.is_pooling_model:
@@ -693,6 +728,10 @@ class InputBatch:
             self.block_table.move_row(last_req_index, empty_index)
 
             self.request_lora_mapping[empty_index] = self.request_lora_mapping[
+                last_req_index
+            ]
+
+            self.request_steer_vector_mapping[empty_index] = self.request_steer_vector_mapping[
                 last_req_index
             ]
 
@@ -906,6 +945,18 @@ class InputBatch:
         )
 
         return prompt_lora_mapping, token_lora_mapping, active_lora_requests
+
+    def make_steer_vector_inputs(
+        self, num_scheduled_tokens: np.ndarray
+    ) -> set[SteerVectorRequest]:
+        """
+        Given the num_scheduled_tokens for each request in the batch, return
+        the set of active SteerVectorRequests.
+        Returns:
+            steer_vector_requests: Set of active SteerVectorRequest objects.
+        """
+        # Return a set of unique SteerVectorRequests (now hashable)
+        return set(self.steer_vector_id_to_steer_vector_request.values())
 
     def set_async_sampled_token_ids(
         self,

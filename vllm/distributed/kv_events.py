@@ -52,6 +52,7 @@ class BlockStored(KVCacheEvent):
     token_ids: list[int]
     block_size: int
     lora_id: int | None
+    steer_vector_id: int | None
     medium: str | None
 
     def __hash__(self) -> int:

@@ -287,6 +287,7 @@ class BlockPool:
                     lora_id=request.lora_request.adapter_id
                     if request.lora_request
                     else None,
+                    steer_vector_id=request.steer_vector_request.steer_vector_int_id if request.steer_vector_request else None,
                     medium=MEDIUM_GPU,
                 )
             )

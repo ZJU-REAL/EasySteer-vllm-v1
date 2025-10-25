@@ -20,6 +20,7 @@ from vllm.config.model import (
     iter_architecture_defaults,
     try_match_architecture_defaults,
 )
+from vllm.config.steer_vector import SteerVectorConfig
 from vllm.config.multimodal import MultiModalConfig
 from vllm.config.observability import ObservabilityConfig
 from vllm.config.parallel import EPLBConfig, ParallelConfig
@@ -73,6 +74,8 @@ __all__ = [
     "ModelConfig",
     "iter_architecture_defaults",
     "try_match_architecture_defaults",
+    # From vllm.config.steer_vector
+    "SteerVectorConfig",
     # From vllm.config.multimodal
     "MultiModalConfig",
     # From vllm.config.observability

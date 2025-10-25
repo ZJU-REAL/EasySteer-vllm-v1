@@ -482,6 +482,9 @@ class EngineArgs:
     fully_sharded_loras: bool = LoRAConfig.fully_sharded_loras
     max_cpu_loras: int | None = LoRAConfig.max_cpu_loras
     lora_dtype: str | torch.dtype | None = LoRAConfig.lora_dtype
+    # Steer Vector fields
+    enable_steer_vector: bool = False
+    max_steer_vectors: int = 1
 
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
@@ -995,6 +998,23 @@ class EngineArgs:
             "--fully-sharded-loras", **lora_kwargs["fully_sharded_loras"]
         )
         lora_group.add_argument("--default-mm-loras", **lora_kwargs["default_mm_loras"])
+
+        # Steer Vector related configs
+        steer_vector_group = parser.add_argument_group(
+            title="SteerVectorConfig",
+            description="Configuration for steer vector support.",
+        )
+        steer_vector_group.add_argument(
+            "--enable-steer-vector",
+            action=argparse.BooleanOptionalAction,
+            help="If True, enable handling of steer vector adapters.",
+        )
+        steer_vector_group.add_argument(
+            "--max-steer-vectors",
+            type=int,
+            default=EngineArgs.max_steer_vectors,
+            help="Maximum number of steer vectors in a single batch.",
+        )
 
         # Observability arguments
         observability_kwargs = get_kwargs(ObservabilityConfig)
@@ -1637,6 +1657,16 @@ class EngineArgs:
                 "decreasing num_speculative_tokens"
             )
 
+        # Steer Vector configuration
+        from vllm.config.steer_vector import SteerVectorConfig
+        steer_vector_config = (
+            SteerVectorConfig(
+                max_steer_vectors=self.max_steer_vectors,
+            )
+            if self.enable_steer_vector
+            else None
+        )
+
         # bitsandbytes pre-quantized model need a specific model loader
         if model_config.quantization == "bitsandbytes":
             self.quantization = self.load_format = "bitsandbytes"
@@ -1705,6 +1735,7 @@ class EngineArgs:
             load_config=load_config,
             attention_config=attention_config,
             lora_config=lora_config,
+            steer_vector_config=steer_vector_config,
             speculative_config=speculative_config,
             structured_outputs_config=self.structured_outputs_config,
             observability_config=observability_config,

@@ -14,6 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.tasks import SupportedTask
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -92,6 +93,7 @@ class Executor(ABC):
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
+        self.steer_vector_config = vllm_config.steer_vector_config
         self.load_config = vllm_config.load_config
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
@@ -289,6 +291,15 @@ class Executor(ABC):
         for s in sets:
             assert s == sets[0], "All workers should have the same LORAs."
         return sets[0]
+
+    def add_steer_vector(self, steer_vector_request: SteerVectorRequest) -> bool:
+        assert steer_vector_request.steer_vector_int_id > 0, \
+            "steer_vector_id must be greater than 0."
+        return all(self.collective_rpc("add_steer_vector", args=(steer_vector_request,)))
+
+    def remove_steer_vector(self, steer_vector_id: int) -> bool:
+        assert steer_vector_id > 0, "steer_vector_id must be greater than 0."
+        return all(self.collective_rpc("remove_steer_vector", args=(steer_vector_id,)))
 
     def reset_mm_cache(self) -> None:
         """Reset the multi-modal cache in each worker."""

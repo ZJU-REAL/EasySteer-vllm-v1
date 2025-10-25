@@ -24,6 +24,7 @@ from vllm.v1.utils import ConstantList
 
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
+    from vllm.steer_vectors.request import SteerVectorRequest
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 
@@ -40,6 +41,7 @@ class Request:
         prompt_embeds: torch.Tensor | None = None,
         mm_features: list[MultiModalFeatureSpec] | None = None,
         lora_request: Optional["LoRARequest"] = None,
+        steer_vector_request: Optional["SteerVectorRequest"] = None,
         cache_salt: str | None = None,
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
@@ -53,6 +55,7 @@ class Request:
         # Because of LoRA, the eos token id can be different for each request.
         self.eos_token_id = eos_token_id
         self.lora_request = lora_request
+        self.steer_vector_request = steer_vector_request
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
             sampling_params
         )
@@ -154,6 +157,7 @@ class Request:
             eos_token_id=request.eos_token_id,
             arrival_time=request.arrival_time,
             lora_request=request.lora_request,
+            steer_vector_request=request.steer_vector_request,
             cache_salt=request.cache_salt,
             priority=request.priority,
             trace_headers=request.trace_headers,

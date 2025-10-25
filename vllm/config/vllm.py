@@ -42,6 +42,7 @@ from .parallel import ParallelConfig
 from .profiler import ProfilerConfig
 from .scheduler import SchedulerConfig
 from .speculative import SpeculativeConfig
+from .steer_vector import SteerVectorConfig
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config
 
@@ -198,6 +199,8 @@ class VllmConfig:
     """Attention configuration."""
     lora_config: LoRAConfig | None = None
     """LoRA configuration."""
+    steer_vector_config: SteerVectorConfig | None = None
+    """Steer Vector configuration."""
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
     structured_outputs_config: StructuredOutputsConfig = Field(

@@ -154,8 +154,10 @@ from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
+from vllm.v1.worker.hidden_states_model_runner_mixin import HiddenStatesModelRunnerMixin
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.steer_vector_model_runner_mixin import SteerVectorModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -267,7 +269,11 @@ class ExecuteModelState(NamedTuple):
 
 
 class GPUModelRunner(
-    LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
+    HiddenStatesModelRunnerMixin,
+    SteerVectorModelRunnerMixin,
+    LoRAModelRunnerMixin,
+    KVConnectorModelRunnerMixin,
+    ECConnectorModelRunnerMixin
 ):
     def __init__(
         self,
@@ -836,6 +842,7 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                steer_vector_request=new_req_data.steer_vector_request,
             )
             self.requests[req_id] = req_state
 
@@ -1511,6 +1518,13 @@ class GPUModelRunner(
             self.set_active_loras(
                 self.input_batch, num_scheduled_tokens, num_sampled_tokens
             )
+
+        # Hot-Swap steer vector model
+        if self.vllm_config.steer_vector_config:
+            steer_vector_requests = self.input_batch.make_steer_vector_inputs(
+                num_scheduled_tokens
+            )
+            self.set_active_steer_vectors(steer_vector_requests)
 
         return (
             logits_indices,
@@ -3071,6 +3085,26 @@ class GPUModelRunner(
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        
+        # Prepare current_tokens for steer vectors (supports continuous batching)
+        # In V1 continuous batching, input_ids contains all tokens (decode + prefill) concatenated.
+        # Steer vector algorithms will use query_start_loc to slice out per-sample tokens.
+        current_tokens_tensor = None
+        try:
+            if input_ids is not None:
+                current_tokens_tensor = input_ids
+                # Flatten if multi-dimensional
+                if current_tokens_tensor.dim() > 1:
+                    current_tokens_tensor = current_tokens_tensor.view(-1)
+        except Exception:
+            current_tokens_tensor = None
+        
+        # Prepare num_computed_tokens_cpu for prefix cache support in steer vectors
+        num_computed_tokens_cpu_tensor = None
+        if hasattr(self.input_batch, "num_computed_tokens_cpu"):
+            num_reqs = self.input_batch.num_reqs
+            num_computed_tokens_cpu_tensor = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+
         with (
             set_forward_context(
                 attn_metadata,
@@ -3080,6 +3114,8 @@ class GPUModelRunner(
                 cudagraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
+                current_tokens=current_tokens_tensor,
+                num_computed_tokens_cpu=num_computed_tokens_cpu_tensor,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
@@ -3585,6 +3621,10 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
+                # Wrap model with steer vector support if enabled
+                self.model = self._wrap_model_with_steer_vectors(self.model)
+                # Wrap model for hidden states capture
+                self.model = self._wrap_model_for_hidden_states(self.model)
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     self.drafter.load_model(self.model)
@@ -4183,6 +4223,25 @@ class GPUModelRunner(
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
 
+            # Prepare current_tokens for steer vectors (supports continuous batching)
+            # In V1 continuous batching, input_ids contains all tokens (decode + prefill) concatenated.
+            # Steer vector algorithms will use query_start_loc to slice out per-sample tokens.
+            current_tokens_tensor = None
+            try:
+                if input_ids is not None:
+                    current_tokens_tensor = input_ids
+                    # Flatten if multi-dimensional
+                    if current_tokens_tensor.dim() > 1:
+                        current_tokens_tensor = current_tokens_tensor.view(-1)
+            except Exception:
+                current_tokens_tensor = None
+            
+            # Prepare num_computed_tokens_cpu for prefix cache support in steer vectors (CUDA graph path)
+            num_computed_tokens_cpu_tensor = None
+            if hasattr(self.input_batch, "num_computed_tokens_cpu"):
+                num_reqs = num_reqs  # Already defined earlier in this function
+                num_computed_tokens_cpu_tensor = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
                 set_forward_context(
@@ -4193,6 +4252,8 @@ class GPUModelRunner(
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
+                    current_tokens=current_tokens_tensor,
+                    num_computed_tokens_cpu=num_computed_tokens_cpu_tensor,
                 ),
             ):
                 outputs = self.model(
