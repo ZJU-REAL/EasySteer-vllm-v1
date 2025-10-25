@@ -375,10 +375,12 @@ def need_extra_keys(request: Request) -> bool:
 
     # Multimodal requests need to include the MM hash.
     # LoRA requests need to include the LoRA name.
+    # SteerVector requests need to include the SteerVector name.
     # Request with provided cache salt need to include the salt.
     return (
         bool(request.mm_features)
         or (request.lora_request is not None)
+        or (request.steer_vector_request is not None)
         or (request.cache_salt is not None)
     )
 
@@ -462,6 +464,21 @@ def _gen_lora_extra_hash_keys(request: Request) -> list[str]:
     return [request.lora_request.lora_name]
 
 
+def _gen_steer_vector_extra_hash_keys(request: Request) -> list[str]:
+    """Generate extra keys related to SteerVector for block hash computation.
+
+    Args:
+        request: The request object.
+
+    Returns:
+        Return SteerVector name of the request if it is a SteerVector request.
+        Return empty list otherwise.
+    """
+    if not request.steer_vector_request:
+        return []
+    return [request.steer_vector_request.steer_vector_name]
+
+
 def _gen_prompt_embeds_extra_hash_keys(
     request: Request, start_token_idx: int, end_token_idx: int
 ) -> list[bytes]:
@@ -504,6 +521,7 @@ def generate_block_hash_extra_keys(
         request, start_token_idx, end_token_idx, start_mm_idx
     )
     lora_extra_keys: list[str] = _gen_lora_extra_hash_keys(request)
+    steer_vector_extra_keys: list[str] = _gen_steer_vector_extra_hash_keys(request)
     cache_salt_keys: list[str] = (
         [request.cache_salt] if (start_token_idx == 0 and request.cache_salt) else []
     )
@@ -512,7 +530,7 @@ def generate_block_hash_extra_keys(
     )
 
     extra_keys: list[Any] = (
-        lora_extra_keys + mm_extra_keys + cache_salt_keys + prompt_embeds_keys
+        lora_extra_keys + steer_vector_extra_keys + mm_extra_keys + cache_salt_keys + prompt_embeds_keys
     )
 
     if not extra_keys:

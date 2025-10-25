@@ -13,6 +13,7 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 
@@ -55,6 +56,7 @@ class EngineCoreRequest(
     eos_token_id: int | None
     arrival_time: float
     lora_request: LoRARequest | None
+    steer_vector_request: SteerVectorRequest | None
     cache_salt: str | None
     data_parallel_rank: int | None
     prompt_embeds: torch.Tensor | None = None

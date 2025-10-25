@@ -60,6 +60,7 @@ from vllm.inputs.parse import get_prompt_components
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.outputs import (
     ClassificationRequestOutput,
     EmbeddingRequestOutput,
@@ -380,6 +381,7 @@ class LLM:
         *,
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: list[LoRARequest] | LoRARequest | None = None,
+        steer_vector_request: list[SteerVectorRequest] | SteerVectorRequest | None = None,
         priority: list[int] | None = None,
     ) -> list[RequestOutput]:
         """Generates the completions for the input prompts.
@@ -435,6 +437,7 @@ class LLM:
             params=sampling_params,
             use_tqdm=use_tqdm,
             lora_request=lora_request,
+            steer_vector_request=steer_vector_request,
             priority=priority,
         )
 
@@ -1552,6 +1555,7 @@ class LLM:
         *,
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None,
+        steer_vector_request: Sequence[SteerVectorRequest] | SteerVectorRequest | None = None,
         priority: list[int] | None = None,
     ) -> None:
         if isinstance(prompts, (str, dict)):
@@ -1564,6 +1568,10 @@ class LLM:
         if isinstance(lora_request, Sequence) and len(lora_request) != num_requests:
             raise ValueError(
                 "The lengths of prompts and lora_request must be the same."
+            )
+        if isinstance(steer_vector_request, Sequence) and len(steer_vector_request) != num_requests:
+            raise ValueError(
+                "The lengths of prompts and steer_vector_request must be the same."
             )
         if priority is not None and len(priority) != num_requests:
             raise ValueError(
@@ -1595,6 +1603,9 @@ class LLM:
                 lora_request=lora_request[i]
                 if isinstance(lora_request, Sequence)
                 else lora_request,
+                steer_vector_request=steer_vector_request[i]
+                if isinstance(steer_vector_request, Sequence)
+                else steer_vector_request,
                 priority=priority[i] if priority else 0,
             )
 
@@ -1653,6 +1664,7 @@ class LLM:
         params: SamplingParams | PoolingParams,
         *,
         lora_request: LoRARequest | None,
+        steer_vector_request: SteerVectorRequest | None,
         priority: int,
     ) -> tuple[EngineCoreRequest, dict[str, Any]]:
         """Use the Processor to process inputs for LLMEngine."""
@@ -1668,6 +1680,7 @@ class LLM:
             engine_prompt,
             params,
             lora_request=lora_request,
+            steer_vector_request=steer_vector_request,
             tokenization_kwargs=tokenization_kwargs,
             priority=priority,
         )
@@ -1678,6 +1691,7 @@ class LLM:
         prompt: PromptType,
         params: SamplingParams | PoolingParams,
         lora_request: LoRARequest | None = None,
+        steer_vector_request: SteerVectorRequest | None = None,
         priority: int = 0,
     ) -> None:
         prompt_text, _, _ = get_prompt_components(prompt)
@@ -1688,6 +1702,7 @@ class LLM:
             prompt,
             params,
             lora_request=lora_request,
+            steer_vector_request=steer_vector_request,
             priority=priority,
         )
 
@@ -1696,6 +1711,7 @@ class LLM:
             engine_request,
             params,
             lora_request=lora_request,
+            steer_vector_request=steer_vector_request,
             tokenization_kwargs=tokenization_kwargs,
             priority=priority,
             prompt_text=prompt_text,

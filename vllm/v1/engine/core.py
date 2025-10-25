@@ -25,6 +25,7 @@ from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import engine_receiver_cache_from_config
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.utils.gc_utils import maybe_attach_gc_debug_callback
@@ -437,6 +438,12 @@ class EngineCore:
 
     def pin_lora(self, lora_id: int) -> bool:
         return self.model_executor.pin_lora(lora_id)
+
+    def add_steer_vector(self, steer_vector_request: SteerVectorRequest) -> bool:
+        return self.model_executor.add_steer_vector(steer_vector_request)
+
+    def remove_steer_vector(self, steer_vector_id: int) -> bool:
+        return self.model_executor.remove_steer_vector(steer_vector_id)
 
     def save_sharded_state(
         self,
