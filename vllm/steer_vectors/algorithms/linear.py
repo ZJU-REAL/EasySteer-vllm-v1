@@ -11,80 +11,19 @@ logger = logging.getLogger(__name__)
 
 @register_algorithm("linear")
 class LinearTransformAlgorithm(AlgorithmTemplate):
-    """
-    Linear transformation algorithm: wh+b
+    """Linear transformation algorithm: h' = W @ h + b
     
-    Applies a linear transformation to hidden states, including weight matrix 
-    multiplication and bias vector addition.
-    Uses the same weight matrix and bias vector for all target layers.
+    This algorithm demonstrates dict payload with weight and bias:
+    - Only 2 methods needed: _transform and load_from_path
+    - Payload is a dict containing weight and optional bias
+    - All parameter management is handled by AlgorithmTemplate
     """
-
-    def __init__(self, layer_id=None, normalize=False):
-        super().__init__(layer_id)
-        # normalize is accepted for signature consistency, but not used.
-        self.weights = {}  # Store weight matrix W
-        self.biases = {}   # Store bias vector b
-        self.scale_factors = {}  # Store scale factors
-        self.active_tensor_index = None
-        self.active_params: Optional[dict] = None
-
-    def set_steer_vector(self, index: int, **kwargs):
-        """Set weight matrix and bias vector."""
-        payload = kwargs.get("payload")
-        scale_factor = kwargs.get("scale_factor", 1.0)
-        
-        if not payload or "weight" not in payload:
-            logger.warning(f"Missing required 'weight' in payload for layer {self.layer_id}")
-            return
-
-        # Save weight matrix and bias vector
-        self.weights[index] = payload["weight"]
-        self.biases[index] = payload.get("bias", None)  # Bias is optional
-        self.scale_factors[index] = scale_factor
-
-    def reset_steer_vector(self, index: int):
-        """Reset vector at specific index."""
-        if index in self.weights:
-            del self.weights[index]
-        if index in self.biases:
-            del self.biases[index]
-        if index in self.scale_factors:
-            del self.scale_factors[index]
-        if self.active_tensor_index == index:
-            self.active_tensor_index = None
-
-    def set_active_tensor(self, index: int):
-        """Set currently active tensor index."""
-        self.active_tensor_index = index
-        if index is not None and index in self.weights:
-            weight = self.weights[index]
-            bias = self.biases.get(index, None)
-            scale = self.scale_factors.get(index, 1.0)
-            
-            self.active_params = {
-                "weight": weight,
-                "bias": bias,
-                "scale": scale
-            }
-        else:
-            self.active_params = None
-
-    # Implement abstract methods required by algorithm template
-    def _get_params(self) -> Optional[dict]:
-        """Get currently active algorithm parameters."""
-        return self.active_params
-
-    def _is_valid(self, params: Any) -> bool:
-        """Check if algorithm parameters are valid."""
-        return (params is not None and 
-                isinstance(params, dict) and 
-                "weight" in params)
 
     def _transform(self, hidden_state: torch.Tensor, params: dict) -> torch.Tensor:
-        """Apply linear transformation to single token: wh+b * scale."""
+        """Apply linear transformation: h' = W @ h + b"""
         weight = params["weight"]
-        bias = params.get("bias", None)
-        scale = params.get("scale", 1.0)
+        bias = params.get("bias")
+        scale_factor = params.get("scale_factor", 1.0)
         
         # Ensure data types match
         device = hidden_state.device
@@ -94,22 +33,17 @@ class LinearTransformAlgorithm(AlgorithmTemplate):
         if bias is not None:
             bias = bias.to(device).to(dtype)
         
-        # Check dimension matching
-        if weight.shape[0] != hidden_state.shape[-1]:
-            logger.error(f"Dimension mismatch: weight shape={weight.shape}, hidden_state shape={hidden_state.shape}")
-            return hidden_state
-        
-        # Apply weight matrix: matrix multiplication
+        # Apply weight matrix: W @ h
         transformed = torch.matmul(hidden_state, weight.T)
         
         # Add bias if present
         if bias is not None:
             transformed = transformed + bias
-            
+        
         # Apply scale factor
-        if scale != 1.0:
-            transformed = transformed * scale
-            
+        if scale_factor != 1.0:
+            transformed = transformed * scale_factor
+        
         return transformed
 
     @classmethod

@@ -8,52 +8,16 @@ from .factory import register_algorithm
 
 @register_algorithm("loreft")
 class LoReFTAlgorithm(AlgorithmTemplate):
-    """LoReFT steer vector algorithm implementation."""
+    """LoReFT algorithm: h' = h + R^T(Wh + b - Rh)
     
-    def __init__(self, layer_id: Optional[int] = None, normalize: bool = False, **kwargs):
-        super().__init__(layer_id)
-        # normalize is accepted for signature consistency, but not used.
-        self.loreft_params: dict[int, dict] = {}
-        self.active_loreft_params: Optional[dict] = None
-
-    def set_steer_vector(self, index: int, **kwargs) -> None:
-        """Set LoReFT parameters."""
-        payload = kwargs.get("payload")
-        scale_factor = kwargs.get("scale_factor", 1.0)
-        
-        if payload is None or not isinstance(payload, dict):
-            raise ValueError("LoReFTAlgorithm requires 'payload' (dict) in kwargs")
-            
-        self.loreft_params[index] = {
-            "rotate_layer": payload.get("rotate_layer"),
-            "learned_source_weight": payload.get("learned_source.weight"),
-            "learned_source_bias": payload.get("learned_source.bias"),
-            "scale_factor": scale_factor
-        }
-
-    def reset_steer_vector(self, index: int) -> None:
-        """Reset LoReFT parameters."""
-        if index in self.loreft_params:
-            del self.loreft_params[index]
-
-    def set_active_tensor(self, index: int) -> None:
-        """Set active LoReFT parameters."""
-        if index is not None and index in self.loreft_params:
-            self.active_loreft_params = self.loreft_params[index]
-        else:
-            self.active_loreft_params = None
-
-    # Implement abstract methods required by algorithm template
-    def _get_params(self) -> Optional[dict]:
-        """Get currently active algorithm parameters."""
-        return self.active_loreft_params
-
-    def _is_valid(self, params: Any) -> bool:
-        """Check if algorithm parameters are valid."""
-        return params is not None
+    This algorithm demonstrates handling dict payloads:
+    - Only 2 methods needed: _transform and load_from_path
+    - Payload is a dict containing rotate_layer, learned_source_weight, learned_source_bias
+    - All parameter management is handled by AlgorithmTemplate
+    """
 
     def _transform(self, hidden_state: torch.Tensor, params: dict) -> torch.Tensor:
-        """Apply LoReFT transformation to single token: h + R^T(Wh + b - Rh) * scale_factor."""
+        """Apply LoReFT transformation: h + R^T(Wh + b - Rh) * scale_factor."""
         return self._apply_loreft_transformation(hidden_state, params)
 
     def _apply_loreft_transformation(self, hidden_states: torch.Tensor, loreft_params: dict) -> torch.Tensor:
@@ -177,8 +141,8 @@ class LoReFTAlgorithm(AlgorithmTemplate):
         loreft_params = {
             config_layer_idx: {
                 "rotate_layer": rotate_layer,
-                "learned_source.weight": learned_source_weight,
-                "learned_source.bias": learned_source_bias
+                "learned_source_weight": learned_source_weight,
+                "learned_source_bias": learned_source_bias
             }
         }
         

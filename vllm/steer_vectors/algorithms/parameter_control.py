@@ -234,6 +234,7 @@ def apply_exclusions_gpu(
     prefill_sample_ids: torch.Tensor,
     prefill_exclude_positions: Optional[list],
     prefill_exclude_tokens: Optional[set],
+    query_start_loc: torch.Tensor,
     device: torch.device
 ) -> torch.Tensor:
     """
@@ -246,8 +247,9 @@ def apply_exclusions_gpu(
         relative_positions: [total_tokens] relative position within each sample
         num_computed: [num_samples] cached token counts or None
         prefill_sample_ids: [num_prefill_samples] IDs of prefill samples
-        prefill_exclude_positions: List of positions to exclude or None
+        prefill_exclude_positions: List of positions to exclude or None (supports negative indices)
         prefill_exclude_tokens: Set of token IDs to exclude or None
+        query_start_loc: [num_samples+1] sample boundaries
         device: Device to create tensors on
         
     Returns:
@@ -255,6 +257,10 @@ def apply_exclusions_gpu(
     """
     # ========== 1. Exclude by position ==========
     if prefill_exclude_positions is not None:
+        # Separate positive and negative indices
+        positive_excludes = [p for p in prefill_exclude_positions if p >= 0]
+        negative_excludes = [p for p in prefill_exclude_positions if p < 0]
+        
         # Compute original positions (accounting for cache)
         if num_computed is not None:
             num_computed_expanded = num_computed[sample_ids]
@@ -262,18 +268,47 @@ def apply_exclusions_gpu(
         else:
             original_positions = relative_positions
         
-        exclude_positions_tensor = torch.tensor(
-            list(prefill_exclude_positions),
-            dtype=original_positions.dtype,
-            device=device
-        )
-        exclude_position_match = torch.isin(original_positions, exclude_positions_tensor)
+        # ===== Handle positive indices =====
+        if positive_excludes:
+            exclude_positions_tensor = torch.tensor(
+                positive_excludes,
+                dtype=original_positions.dtype,
+                device=device
+            )
+            exclude_position_match = torch.isin(original_positions, exclude_positions_tensor)
+            
+            # Only exclude from prefill samples
+            exclude_position_match &= torch.isin(sample_ids, prefill_sample_ids)
+            
+            # Remove excluded positions
+            mask &= ~exclude_position_match
         
-        # Only exclude from prefill samples
-        exclude_position_match &= torch.isin(sample_ids, prefill_sample_ids)
-        
-        # Remove excluded positions
-        mask &= ~exclude_position_match
+        # ===== Handle negative indices (Python-style: -1 means last position) =====
+        if negative_excludes:
+            # Compute each sample's total length (including cached tokens)
+            sample_lengths = query_start_loc[1:] - query_start_loc[:-1]  # [num_samples]
+            if num_computed is not None:
+                sample_total_lengths = sample_lengths + num_computed
+            else:
+                sample_total_lengths = sample_lengths
+            
+            # For each negative index
+            for neg_idx in negative_excludes:
+                # Convert negative index to absolute position for each sample
+                # Example: length=19, neg_idx=-1 → abs_pos=18
+                abs_positions_per_sample = sample_total_lengths + neg_idx  # [num_samples]
+                
+                # Expand to per-token: what's the target absolute position for this token's sample?
+                abs_positions_expanded = abs_positions_per_sample[sample_ids]  # [total_tokens]
+                
+                # Match: is this token at the target absolute position?
+                neg_exclude_match = (original_positions == abs_positions_expanded)
+                
+                # Only exclude from prefill samples
+                neg_exclude_match &= torch.isin(sample_ids, prefill_sample_ids)
+                
+                # Remove excluded positions
+                mask &= ~neg_exclude_match
     
     # ========== 2. Exclude by token ==========
     if prefill_exclude_tokens is not None:
@@ -346,6 +381,10 @@ def get_prefill_mask_gpu(
     
     # ========== 1. Position-based triggers ==========
     if prefill_trigger_positions is not None:
+        # Separate positive and negative indices
+        positive_positions = [p for p in prefill_trigger_positions if p >= 0]
+        negative_positions = [p for p in prefill_trigger_positions if p < 0]
+        
         # Compute original positions accounting for prefix caching
         if num_computed is not None:
             num_computed_expanded = num_computed[sample_ids]
@@ -353,24 +392,55 @@ def get_prefill_mask_gpu(
         else:
             original_positions = relative_positions
         
-        # Match trigger positions
-        trigger_positions_tensor = torch.tensor(
-            list(prefill_trigger_positions),
-            dtype=original_positions.dtype,
-            device=device
-        )
-        position_match = torch.isin(original_positions, trigger_positions_tensor)
+        # ===== Handle positive indices =====
+        if positive_positions:
+            trigger_positions_tensor = torch.tensor(
+                positive_positions,
+                dtype=original_positions.dtype,
+                device=device
+            )
+            position_match = torch.isin(original_positions, trigger_positions_tensor)
+            
+            # Only apply to prefill samples
+            position_match &= torch.isin(sample_ids, prefill_sample_ids)
+            
+            # Filter out cached positions (only process current forward)
+            if num_computed is not None:
+                uncached_mask = original_positions >= num_computed_expanded
+                position_match &= uncached_mask
+            
+            mask |= position_match
         
-        # Only apply to prefill samples
-        position_match &= torch.isin(sample_ids, prefill_sample_ids)
-        
-        # Filter out cached positions (only process current forward)
-        if num_computed is not None:
-            num_computed_expanded = num_computed[sample_ids]
-            uncached_mask = original_positions >= num_computed_expanded
-            position_match &= uncached_mask
-        
-        mask |= position_match
+        # ===== Handle negative indices (Python-style: -1 means last position) =====
+        if negative_positions:
+            # Compute each sample's total length (including cached tokens)
+            sample_lengths = query_start_loc[1:] - query_start_loc[:-1]  # [num_samples]
+            if num_computed is not None:
+                sample_total_lengths = sample_lengths + num_computed
+            else:
+                sample_total_lengths = sample_lengths
+            
+            # For each negative index
+            for neg_idx in negative_positions:
+                # Convert negative index to absolute position for each sample
+                # Example: length=19, neg_idx=-1 → abs_pos=18
+                abs_positions_per_sample = sample_total_lengths + neg_idx  # [num_samples]
+                
+                # Expand to per-token: what's the target absolute position for this token's sample?
+                abs_positions_expanded = abs_positions_per_sample[sample_ids]  # [total_tokens]
+                
+                # Match: is this token at the target absolute position?
+                neg_position_match = (original_positions == abs_positions_expanded)
+                
+                # Only apply to prefill samples
+                neg_position_match &= torch.isin(sample_ids, prefill_sample_ids)
+                
+                # Filter out cached positions (only process current forward)
+                if num_computed is not None:
+                    uncached_mask = original_positions >= num_computed_expanded
+                    neg_position_match &= uncached_mask
+                
+                mask |= neg_position_match
     
     # ========== 2. Token-based triggers ==========
     if prefill_trigger_tokens is not None:
@@ -397,6 +467,7 @@ def get_prefill_mask_gpu(
             prefill_sample_ids=prefill_sample_ids,
             prefill_exclude_positions=prefill_exclude_positions,
             prefill_exclude_tokens=prefill_exclude_tokens,
+            query_start_loc=query_start_loc,
             device=device
         )
     

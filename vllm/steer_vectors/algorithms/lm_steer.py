@@ -11,97 +11,25 @@ logger = logging.getLogger(__name__)
 
 @register_algorithm("lm_steer")
 class LMSteerAlgorithm(AlgorithmTemplate):
-    """
-    LM-Steer algorithm.
+    """LM-Steer algorithm: h' = h + α * ((h @ P1) @ P2^T)
     
-    Uses low-rank optimization form: h = h + α*((h·P1)·P2^T)
-    where P1 and P2 are low-rank projection matrices, · denotes matrix multiplication.
+    This algorithm demonstrates low-rank optimization:
+    - Only 2 methods needed: _transform and load_from_path
+    - Payload is a dict containing P1, P2 projection matrices
+    - All parameter management is handled by AlgorithmTemplate
     """
-
-    def __init__(self, layer_id=None, normalize=False):
-        super().__init__(layer_id)
-        # normalize is accepted for signature consistency, but not used.
-        self.projector1 = {}  # Store projection matrix P1
-        self.projector2 = {}  # Store projection matrix P2
-        self.scale_factors = {}  # Store scale factor α
-        self.active_tensor_index = None
-        self.active_params: Optional[dict] = None
-
-    def set_steer_vector(self, index: int, **kwargs):
-        """Set projection matrices and scale factor."""
-        payload = kwargs.get("payload")
-        scale_factor = kwargs.get("scale_factor", 1.0)
-        
-        if not payload:
-            logger.warning(f"Missing payload for layer {self.layer_id}")
-            return
-            
-        # Check if required projector matrices are present
-        if "projector1" in payload and "projector2" in payload:
-            self.projector1[index] = payload["projector1"]
-            self.projector2[index] = payload["projector2"]
-            # logger.info(f"Set projector matrices for index {index}")
-        else:
-            logger.warning(f"Missing required 'projector1'/'projector2' in payload for layer {self.layer_id}")
-            return
-
-        self.scale_factors[index] = scale_factor
-
-    def reset_steer_vector(self, index: int):
-        """Reset vector at specific index."""
-        if index in self.projector1:
-            del self.projector1[index]
-        if index in self.projector2:
-            del self.projector2[index]
-        if index in self.scale_factors:
-            del self.scale_factors[index]
-        if self.active_tensor_index == index:
-            self.active_tensor_index = None
-
-    def set_active_tensor(self, index: int):
-        """Set currently active tensor index."""
-        self.active_tensor_index = index
-        if index is not None and index in self.projector1 and index in self.projector2:
-            P1 = self.projector1[index]
-            P2 = self.projector2[index]
-            alpha = self.scale_factors.get(index, 1.0)
-            
-            # Select the first steer vector (index 0) if multi-dimensional
-            if P1.dim() > 2:
-                P1_active = P1[0]  # shape: [embed_dim, rank]
-            else:
-                P1_active = P1
-                
-            if P2.dim() > 2:
-                P2_active = P2[0]  # shape: [embed_dim, rank]
-            else:
-                P2_active = P2
-            
-            self.active_params = {
-                "P1": P1_active,
-                "P2": P2_active,
-                "alpha": alpha
-            }
-        else:
-            self.active_params = None
-
-    # Implement abstract methods required by algorithm template
-    def _get_params(self) -> Optional[dict]:
-        """Get currently active algorithm parameters."""
-        return self.active_params
-
-    def _is_valid(self, params: Any) -> bool:
-        """Check if algorithm parameters are valid."""
-        return (params is not None and 
-                isinstance(params, dict) and 
-                "P1" in params and 
-                "P2" in params)
 
     def _transform(self, hidden_state: torch.Tensor, params: dict) -> torch.Tensor:
-        """Apply LM-Steer transformation to single token: h = h + α*((h·P1)·P2^T)."""
-        P1 = params["P1"]
-        P2 = params["P2"]
-        alpha = params.get("alpha", 1.0)
+        """Apply LM-Steer transformation: h' = h + α * ((h @ P1) @ P2^T)"""
+        P1 = params["projector1"]
+        P2 = params["projector2"]
+        scale_factor = params.get("scale_factor", 1.0)
+        
+        # Select the first steer vector (index 0) if multi-dimensional
+        if P1.dim() > 2:
+            P1 = P1[0]
+        if P2.dim() > 2:
+            P2 = P2[0]
         
         # Ensure data types match
         device = hidden_state.device
@@ -110,12 +38,12 @@ class LMSteerAlgorithm(AlgorithmTemplate):
         P1 = P1.to(device).to(dtype)
         P2 = P2.to(device).to(dtype)
         
-        # Apply low-rank transformation: (h·P1)·P2^T
+        # Apply low-rank transformation: (h @ P1) @ P2^T
         transformed = torch.matmul(hidden_state, P1)  # [..., rank]
         transformed = torch.matmul(transformed, P2.transpose(-2, -1))  # [..., hidden_dim]
         
-        # Add original hidden state: h = h + α*((h·P1)·P2^T)
-        return hidden_state + alpha * transformed
+        # Add original hidden state: h' = h + α * delta
+        return hidden_state + scale_factor * transformed
 
     @classmethod
     def load_from_path(cls, file_path: str, device: str, config=None, target_layers=None):

@@ -9,21 +9,23 @@ import logging
 logger = logging.getLogger(__name__)
 @register_algorithm("direct")
 class DirectAlgorithm(AlgorithmTemplate):
-    """Direct steer vector algorithm implementation."""
+    """Direct addition algorithm: h' = h + vector
+    
+    This algorithm demonstrates the ultimate simplicity:
+    - Only 2 methods needed: _transform and load_from_path
+    - All parameter management (including normalize) is handled by AlgorithmTemplate
+    - Payload is a simple Tensor
+    """
 
-    def __init__(self, layer_id: Optional[int] = None, normalize: bool = False, **kwargs):
-        super().__init__(layer_id)
-        self.normalize = normalize
-        self.steer_vectors: dict[int, torch.Tensor | int] = {}
-        self.active_vector: Optional[torch.Tensor] = None
-
-    def set_steer_vector(self, index: int, **kwargs) -> None:
-        """Set steer vector."""
-        payload = kwargs.get("payload")
-        scale_factor = kwargs.get("scale_factor", 1.0)
-        if payload is None or not isinstance(payload, torch.Tensor):
-            raise ValueError("DirectAlgorithm requires 'payload' (torch.Tensor) in kwargs")
-        self.steer_vectors[index] = payload * scale_factor
+    def _transform(self, hidden_state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        """Apply direct addition: h' = h + vector (with optional normalization)."""
+        if self.normalize:
+            norm_pre = torch.norm(hidden_state, dim=-1, keepdim=True)
+            transformed = hidden_state + params
+            norm_post = torch.norm(transformed, dim=-1, keepdim=True)
+            return transformed * norm_pre / norm_post
+        else:
+            return hidden_state + params
 
     @classmethod
     def load_from_path(cls, path: str, device: str, **kwargs) -> dict:
@@ -199,46 +201,5 @@ class DirectAlgorithm(AlgorithmTemplate):
         sv_weights = {config_layer_idx: vector}
         
         return {"layer_payloads": sv_weights}
-
-    def reset_steer_vector(self, index: int) -> None:
-        """Reset steer vector."""
-        if index in self.steer_vectors:
-            if isinstance(self.steer_vectors[index], torch.Tensor):
-                shape = self.steer_vectors[index].shape
-                device = self.steer_vectors[index].device
-                dtype = self.steer_vectors[index].dtype
-                self.steer_vectors[index] = torch.zeros(shape, device=device, dtype=dtype)
-            else:
-                self.steer_vectors[index] = None
-
-    def set_active_tensor(self, index: int) -> None:
-        """Set active steer vector."""
-        if index is not None and index in self.steer_vectors:
-            if not isinstance(self.steer_vectors[index], torch.Tensor):
-                self.active_vector = None
-            else:
-                self.active_vector = self.steer_vectors[index]
-        else:
-            self.active_vector = None
-
-    # Implement abstract methods required by algorithm template
-    def _get_params(self) -> Optional[torch.Tensor]:
-        """Get currently active algorithm parameters."""
-        return self.active_vector
-
-    def _is_valid(self, params: Any) -> bool:
-        """Check if algorithm parameters are valid."""
-        return params is not None and isinstance(params, torch.Tensor) and params.numel() > 0
-
-    def _transform(self, hidden_state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        """Apply Direct transformation to single token: h = h + cv (optional normalization)."""
-        if self.normalize:
-            norm_pre = torch.norm(hidden_state, dim=-1, keepdim=True)
-            transformed = hidden_state + params
-            norm_post = torch.norm(transformed, dim=-1, keepdim=True)
-            return transformed * norm_pre / norm_post
-        else:
-            logger.debug("yes!")
-            return hidden_state + params
 
  
