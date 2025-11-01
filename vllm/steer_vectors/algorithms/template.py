@@ -29,24 +29,87 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
     completely decoupled from algorithm logic.
     """
     
-    def __init__(self, layer_id: Optional[int] = None):
+    def __init__(self, layer_id: Optional[int] = None, normalize: bool = False, **kwargs):
         super().__init__(layer_id)
         # Intervention parameters - directly exposed for clean access
         self.params = InterventionController()
+        
+        # Universal payload storage - can store ANY type (Tensor, dict, list, etc.)
+        # Algorithms don't need to manage storage - just implement _transform and load_from_path
+        self._payloads: dict[int, Any] = {}
+        self._active_payload: Optional[Any] = None
+        
+        # Common parameters - all algorithms inherit these, but only use what they need
+        self.normalize = normalize  # Direct algorithm uses this
+        # Future common parameters can be added here:
+        # self.clamp_range = kwargs.get('clamp_range', None)
+        # self.dropout_rate = kwargs.get('dropout_rate', 0.0)
     
-    @abstractmethod
+    def set_steer_vector(self, index: int, **kwargs) -> None:
+        """
+        Universal implementation: Store payload of any type.
+        
+        Algorithms don't need to override this - just define what payload format
+        they need in load_from_path, and use it in _transform.
+        """
+        payload = kwargs.get("payload")
+        scale_factor = kwargs.get("scale_factor", 1.0)
+        
+        if payload is None:
+            raise ValueError(f"{self.__class__.__name__} requires 'payload' in kwargs")
+        
+        # Handle scale_factor for different payload types
+        if isinstance(payload, torch.Tensor):
+            # For Tensor payload: apply scale_factor directly
+            payload = payload * scale_factor
+        elif isinstance(payload, dict):
+            # For dict payload: add scale_factor to the dict
+            payload = {**payload, "scale_factor": scale_factor}
+        # For other types: store as-is (algorithms handle scaling themselves)
+        
+        self._payloads[index] = payload
+    
+    def set_active_tensor(self, index: int) -> None:
+        """
+        Universal implementation: Activate stored payload.
+        
+        Algorithms don't need to override this.
+        """
+        self._active_payload = self._payloads.get(index)
+    
+    def reset_steer_vector(self, index: int) -> None:
+        """
+        Universal implementation: Remove payload.
+        
+        Algorithms don't need to override this.
+        """
+        if index in self._payloads:
+            del self._payloads[index]
+    
     def _get_params(self) -> Any:
-        """Get currently active algorithm parameters. Implemented by specific algorithm."""
-        pass
+        """
+        Universal implementation: Return active payload as-is.
+        
+        Algorithms don't need to override this - payload format is defined
+        by the algorithm's load_from_path method.
+        """
+        return self._active_payload
     
-    @abstractmethod
     def _is_valid(self, params: Any) -> bool:
-        """Check if algorithm parameters are valid. Implemented by specific algorithm."""
-        pass
+        """
+        Universal implementation: Check params is not None.
+        
+        Algorithms rarely need to override this.
+        """
+        return params is not None
     
     @abstractmethod
     def _transform(self, hidden_state: torch.Tensor, params: Any) -> torch.Tensor:
-        """Transform hidden state of individual token. Implemented by specific algorithm."""
+        """
+        Transform hidden state (MUST be implemented by subclass).
+        
+        This is the core logic of your algorithm - the only truly required method.
+        """
         pass
     
     def apply_intervention(self, hidden_states: torch.Tensor) -> torch.Tensor:
