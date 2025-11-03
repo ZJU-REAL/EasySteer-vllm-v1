@@ -131,13 +131,26 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
             return hidden_states
 
         # ========== Fast Path: Global Application ==========
-        # If configured to apply to ALL tokens (most common case), use direct transformation
-        # This provides 2-3x speedup by avoiding index_select/index_copy overhead
+        # When configured to apply to ALL tokens in BOTH prefill AND generate phases,
+        # we can use direct tensor transformation for optimal performance.
+        # This provides 2-3x speedup by avoiding index_select/index_copy overhead.
+        #
+        # Fast path requirements:
+        #   - prefill_trigger_tokens contains -1 (global marker for prefill phase)
+        #   - generate_trigger_tokens contains -1 (global marker for generate phase)
+        #   - No exclusion filters (exclude_tokens, exclude_positions)
+        #
+        # Note: prefill_trigger_positions is ignored when -1 is present, as the normal
+        # path returns immediately when matching all tokens.
+        #
+        # Design constraint: Single-phase global configs (e.g., only prefill) cannot
+        # use fast path because we need forward context to distinguish phases in mixed batches.
+        # The normal path handles phase separation correctly through batch metadata.
         
         if self.params.is_global_only_config():
             # Direct tensor transformation - fastest path!
             if self.params.debug:
-                print(f"[{self.__class__.__name__}] ✨ Fast Path: Global application to ALL {hidden_states.shape[0]} tokens")
+                print(f"[{self.__class__.__name__}] ✨ Fast Path: Global application to ALL {hidden_states.shape[0]} tokens (both phases)")
             original_dtype = hidden_states.dtype
             return self._transform(hidden_states, algo_params).to(original_dtype)
 
