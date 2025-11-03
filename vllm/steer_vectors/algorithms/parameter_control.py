@@ -111,37 +111,52 @@ class InterventionController:
         Check if this is a global-only configuration.
         
         A global-only configuration means interventions are applied to ALL tokens
-        without any position-based or exclusion filters, which enables the fast path
-        that avoids index_select/index_copy overhead.
+        in BOTH prefill and generate phases, without any position-based or exclusion
+        filters. This enables the fast path that avoids index_select/index_copy overhead.
+        
+        Design rationale:
+        - Fast path requires BOTH phases to be configured as global
+        - Single-phase global configs must use the normal path because:
+          * Fast path operates on the entire hidden_states tensor
+          * Phase information (prefill vs generate) is only available via forward context
+          * Mixed batches are common in continuous batching scenarios
+        - The -1 token ID is a special marker indicating "apply to all tokens in this phase"
+        
+        Requirements:
+        - prefill_trigger_tokens must contain -1
+        - generate_trigger_tokens must contain -1
+        - No exclusions (prefill_exclude_tokens = None, prefill_exclude_positions = None)
+        
+        Note: 
+        - Additional token IDs can coexist with -1 (e.g., {1234, -1}), as -1 takes 
+          precedence and matches all tokens in the normal path.
+        - prefill_trigger_positions is NOT checked because when -1 is present in 
+          trigger_tokens, the normal path returns immediately without processing positions.
         
         Returns:
-            True if configured for global application only, False otherwise
+            True if BOTH phases are configured for global application, False otherwise
         """
-        # No position-based or exclusion triggers
-        has_no_filters = (
-            self.prefill_trigger_positions is None and
+        # Only exclusion filters matter (-1 in trigger_tokens overrides position triggers)
+        has_no_exclusions = (
             self.prefill_exclude_tokens is None and
             self.prefill_exclude_positions is None
         )
         
-        if not has_no_filters:
+        if not has_no_exclusions:
             return False
         
-        # Check if trigger configuration is global (-1 means apply to all)
-        prefill_is_global = (self.prefill_trigger_tokens == {-1})
-        generate_is_global = (self.generate_trigger_tokens == {-1})
-        prefill_is_none = (self.prefill_trigger_tokens is None)
-        generate_is_none = (self.generate_trigger_tokens is None)
-        
-        # One of the following must be true:
-        # 1. Only prefill global trigger
-        # 2. Only generate global trigger  
-        # 3. Both are global triggers
-        return (
-            (prefill_is_global and generate_is_none) or
-            (generate_is_global and prefill_is_none) or
-            (prefill_is_global and generate_is_global)
+        # Check if BOTH trigger configurations contain -1 (global marker)
+        prefill_is_global = (
+            self.prefill_trigger_tokens is not None and 
+            -1 in self.prefill_trigger_tokens
         )
+        generate_is_global = (
+            self.generate_trigger_tokens is not None and 
+            -1 in self.generate_trigger_tokens
+        )
+        
+        # Both phases must be global for fast path
+        return prefill_is_global and generate_is_global
     
     # ========== Core Functionality ==========
     
