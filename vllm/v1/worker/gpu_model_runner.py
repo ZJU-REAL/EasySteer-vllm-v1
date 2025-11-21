@@ -2533,6 +2533,14 @@ class GPUModelRunner(
                 # Flatten if multi-dimensional
                 if current_tokens_tensor.dim() > 1:
                     current_tokens_tensor = current_tokens_tensor.view(-1)
+            elif hasattr(self, 'input_ids') and hasattr(self.input_ids, 'gpu'):
+                # Fallback for multimodal/VL models where input_ids may be None
+                # Use self.input_ids.gpu which contains ALL positions (including image placeholders)
+                # This ensures alignment with hidden_states dimensions
+                # Note: Image positions will have placeholder token IDs, but the is_token_ids mask
+                # (if available) can be used by algorithms to distinguish text vs image tokens
+                num_scheduled = scheduler_output.total_num_scheduled_tokens
+                current_tokens_tensor = self.input_ids.gpu[:num_scheduled]
         except Exception:
             current_tokens_tensor = None
         
@@ -3516,6 +3524,13 @@ class GPUModelRunner(
                     # Flatten if multi-dimensional
                     if current_tokens_tensor.dim() > 1:
                         current_tokens_tensor = current_tokens_tensor.view(-1)
+                elif hasattr(self, 'input_ids') and hasattr(self.input_ids, 'gpu'):
+                    # Fallback for multimodal/VL models where input_ids may be None
+                    # Use self.input_ids.gpu which contains ALL positions (including image placeholders)
+                    # This ensures alignment with hidden_states dimensions
+                    # Note: Image positions will have placeholder token IDs, but the is_token_ids mask
+                    # (if available) can be used by algorithms to distinguish text vs image tokens
+                    current_tokens_tensor = self.input_ids.gpu[:num_tokens_after_padding]
             except Exception:
                 current_tokens_tensor = None
             
