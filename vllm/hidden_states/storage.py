@@ -25,7 +25,6 @@ class HiddenStatesStore:
         self.batch_pooling_metadata: List[Any] = []
         self.multi_batch_mode = False
         self.finalized = False
-        self.layer_0_call_count = 0  # Track layer 0 calls to detect new batches
 
     def clear(self):
         """Clear all stored hidden states"""
@@ -37,10 +36,11 @@ class HiddenStatesStore:
             self.batch_pooling_metadata.clear()
             self.multi_batch_mode = False
             self.finalized = False
-            self.layer_0_call_count = 0  # Reset counter
             
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Note: torch.cuda.empty_cache() can be very slow (seconds to minutes)
+            # especially with multi-GPU setups and large memory allocations.
+            # Since hidden states are stored on CPU, we don't need to clear GPU cache.
+            # The GPU cache will be managed by PyTorch automatically.
 
     def enable_capture(self):
         """Enable hidden states capture"""
@@ -61,14 +61,11 @@ class HiddenStatesStore:
             if self.finalized:
                 return
             
-            # Detect new forward pass in multi-batch mode
-            # We track layer 0 calls: if it's called again, it means a new batch started
-            if self.multi_batch_mode and layer_id == 0:
-                self.layer_0_call_count += 1
-                
-                # If this is the 2nd+ call to layer 0, we're starting a new batch
-                if self.layer_0_call_count > 1 and self.hidden_states:
-                    self.finish_current_batch()
+            # Detect new forward pass in multi-batch mode:
+            # If layer 0 is called and we already have layer 0 data,
+            # it means a new batch has started - save the previous batch first
+            if self.multi_batch_mode and layer_id == 0 and 0 in self.hidden_states:
+                self._finish_current_batch_unlocked()
             
             # Move to CPU and clone to avoid modifications
             cpu_hidden_state = hidden_state.detach().cpu().clone()
@@ -120,17 +117,19 @@ class HiddenStatesStore:
         """Enable multi-batch capture mode"""
         with self.lock:
             self.multi_batch_mode = True
-            self.layer_0_call_count = 0  # Initialize counter
     
-    def finish_current_batch(self):
-        """Mark the current batch as finished"""
-        if self.multi_batch_mode and self.hidden_states:
+    def _finish_current_batch_unlocked(self):
+        """Internal: save current batch (caller must hold lock)"""
+        if self.hidden_states:
             self.batch_hidden_states.append(self.hidden_states.copy())
             self.batch_pooling_metadata.append(self.pooling_metadata)
             self.hidden_states.clear()
             self.pooling_metadata = None
-            # Reset layer 0 counter for the new batch
-            self.layer_0_call_count = 0
+    
+    def finish_current_batch(self):
+        """Mark the current batch as finished"""
+        if self.multi_batch_mode:
+            self._finish_current_batch_unlocked()
     
     def finalize_multi_batch(self):
         """Finalize multi-batch capture by combining all batches"""
@@ -139,7 +138,7 @@ class HiddenStatesStore:
                 return
                 
             if self.hidden_states:
-                self.finish_current_batch()
+                self._finish_current_batch_unlocked()
             
             if not self.batch_hidden_states:
                 return
@@ -153,25 +152,23 @@ class HiddenStatesStore:
                 for batch in self.batch_hidden_states:
                     all_layer_ids.update(batch.keys())
                 
-                device = None
+                # Concatenate directly on CPU (much faster for multi-batch)
+                # Avoids costly CPU<->GPU transfers
                 for layer_id in sorted(all_layer_ids):
                     layer_tensors = []
                     for batch in self.batch_hidden_states:
                         if layer_id in batch:
                             tensor = batch[layer_id]
-                            if device is None:
-                                if torch.cuda.is_available():
-                                    device = torch.device('cuda')
-                                else:
-                                    device = tensor.device
-                            layer_tensors.append(tensor.to(device))
+                            # Ensure on CPU
+                            if tensor.device.type != 'cpu':
+                                tensor = tensor.cpu()
+                            layer_tensors.append(tensor)
                     
                     if layer_tensors:
+                        # Concatenate on CPU along token dimension (dim=0)
                         combined_tensor = torch.cat(layer_tensors, dim=0)
-                        combined_hidden_states[layer_id] = combined_tensor.cpu()
+                        combined_hidden_states[layer_id] = combined_tensor
                         del layer_tensors
-                        if device and device.type == 'cuda':
-                            torch.cuda.empty_cache()
                 
                 self.hidden_states = combined_hidden_states
                 
@@ -185,8 +182,8 @@ class HiddenStatesStore:
             self.batch_pooling_metadata.clear()
             self.multi_batch_mode = False
             
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Don't call empty_cache() here - it's extremely slow and unnecessary
+            # since we're working with CPU tensors
             
             self.finalized = True
 
