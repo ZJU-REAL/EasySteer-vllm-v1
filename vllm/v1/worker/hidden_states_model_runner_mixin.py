@@ -165,7 +165,6 @@ class HiddenStatesModelRunnerMixin:
                 'capture_enabled': store.capture_enabled,
                 'multi_batch_mode': store.multi_batch_mode,
                 'finalized': store.finalized,
-                'layer_0_call_count': store.layer_0_call_count,
                 'num_batches_captured': len(store.batch_hidden_states),
                 'batch_shapes': [
                     {layer_id: list(tensor.shape) for layer_id, tensor in batch.items()}
