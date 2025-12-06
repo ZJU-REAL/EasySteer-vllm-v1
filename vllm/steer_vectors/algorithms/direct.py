@@ -76,8 +76,17 @@ class DirectAlgorithm(AlgorithmTemplate):
                 
             vector = vector.to(device).to(config.adapter_dtype)
             
-            # Use the specified target layer
-            sv_weights = {target_layer: vector}
+            sv_weights = {}
+            #support steering vectors of shape [n_layers, d_model]
+            if vector.dim()==2:
+                num_layers_in_file = vector.shape[0]
+                for target_layer in target_layers:
+                    if target_layer < num_layers_in_file:
+                        sv_weights[target_layer] = vector[target_layer]
+            else:
+                #if single steering vector in file: apply to first target layer only
+                num_layers_in_file=1
+                sv_weights[target_layers[0]] = vector
             
             return {"layer_payloads": sv_weights}
             
