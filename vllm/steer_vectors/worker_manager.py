@@ -70,16 +70,56 @@ class WorkerSteerVectorManager:
         """
         try:
             if not steer_vector_request.is_multi_vector:
-                # Single-vector mode: extract parameters and call from_local_checkpoint
-                steer_vector = self._steer_vector_model_cls.from_local_checkpoint(
-                    steer_vector_model_path=steer_vector_request.local_path,
-                    steer_vector_id=steer_vector_request.steer_vector_id,
-                    config=self.steer_vector_config,
-                    device=str(self.device),
-                    scale_factor=steer_vector_request.scale,
-                    algorithm=steer_vector_request.algorithm,
-                    target_layers=steer_vector_request.target_layers,
-                )
+                # Check if this is MoE router algorithm WITHOUT a config file path
+                if (steer_vector_request.algorithm == "moe_router" and 
+                    not steer_vector_request.local_path):
+                    # MoE router: create model directly from request parameters
+                    # No need to load from file - parameters come from request
+                    if steer_vector_request.moe_expert_ids is None:
+                        raise ValueError("moe_router algorithm requires moe_expert_ids parameter")
+                    
+                    # Build layer payloads from request MoE parameters
+                    layer_payloads = {}
+                    target_layers = steer_vector_request.target_layers or []
+                    
+                    for layer_id in target_layers:
+                        payload = {
+                            'expert_ids': steer_vector_request.moe_expert_ids,
+                            'mode': steer_vector_request.moe_mode,  # 'boost', 'suppress', or 'soft'
+                        }
+                        # Add lambda parameter for 'soft' mode
+                        if steer_vector_request.moe_mode == 'soft':
+                            payload['lambda'] = steer_vector_request.moe_lambda
+                        layer_payloads[layer_id] = payload
+                    
+                    steer_vector = self._steer_vector_model_cls(
+                        steer_vector_id=steer_vector_request.steer_vector_id,
+                        layer_payloads=layer_payloads,
+                        scale_factor=1.0,
+                        algorithm="moe_router",
+                    )
+                else:
+                    # Single-vector mode: extract parameters and call from_local_checkpoint
+                    # This includes moe_router with a config file path
+                    
+                    # Build kwargs for algorithm-specific parameters
+                    load_kwargs = {}
+                    if steer_vector_request.algorithm == "moe_router":
+                        # Pass moe_mode, moe_lambda and moe_topk for moe_router algorithm
+                        load_kwargs['moe_mode'] = steer_vector_request.moe_mode
+                        load_kwargs['moe_lambda'] = steer_vector_request.moe_lambda
+                        load_kwargs['moe_topk'] = steer_vector_request.moe_topk
+                    
+                    steer_vector = self._steer_vector_model_cls.from_local_checkpoint(
+                        steer_vector_model_path=steer_vector_request.local_path,
+                        steer_vector_id=steer_vector_request.steer_vector_id,
+                        config=self.steer_vector_config,
+                        device=str(self.device),
+                        scale_factor=steer_vector_request.scale,
+                        algorithm=steer_vector_request.algorithm,
+                        target_layers=steer_vector_request.target_layers,
+                        **load_kwargs,
+                    )
             else:
                 # Multi-vector mode: load each vector individually and assemble
                 multi_vector_data = []
@@ -107,6 +147,8 @@ class WorkerSteerVectorManager:
                             'prefill_exclude_tokens': vector_config.prefill_exclude_tokens,
                             'prefill_exclude_positions': vector_config.prefill_exclude_positions,
                             'generate_trigger_tokens': vector_config.generate_trigger_tokens,
+                            'generate_first_k_tokens': vector_config.generate_first_k_tokens,
+                            'generate_after_k_tokens': vector_config.generate_after_k_tokens,
                             'algorithm': vector_config.algorithm,
                             'path': vector_config.path,
                             'normalize': vector_config.normalize,
@@ -213,6 +255,8 @@ class WorkerSteerVectorManager:
                 prefill_exclude_tokens=adapter_request.prefill_exclude_tokens,
                 prefill_exclude_positions=adapter_request.prefill_exclude_positions,
                 generate_trigger_tokens=adapter_request.generate_trigger_tokens,
+                generate_first_k_tokens=adapter_request.generate_first_k_tokens,
+                generate_after_k_tokens=adapter_request.generate_after_k_tokens,
                 debug=adapter_request.debug,
                 normalize=adapter_request.normalize
             )
@@ -351,6 +395,8 @@ class LRUCacheWorkerSteerVectorManager(WorkerSteerVectorManager):
                 prefill_exclude_tokens=steer_vector_request.prefill_exclude_tokens,
                 prefill_exclude_positions=steer_vector_request.prefill_exclude_positions,
                 generate_trigger_tokens=steer_vector_request.generate_trigger_tokens,
+                generate_first_k_tokens=steer_vector_request.generate_first_k_tokens,
+                generate_after_k_tokens=steer_vector_request.generate_after_k_tokens,
                 debug=steer_vector_request.debug,
                 normalize=steer_vector_request.normalize
             )

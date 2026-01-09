@@ -12,4 +12,8 @@ from .direct import DirectAlgorithm
 from .loreft import LoReFTAlgorithm
 from .multi_vector import MultiVectorAlgorithm
 from .linear import LinearTransformAlgorithm
-from .lm_steer import LMSteerAlgorithm 
+from .lm_steer import LMSteerAlgorithm
+from .moe_router import MoERouterAlgorithm
+from .replace import ReplaceAlgorithm
+from .erase import EraseAlgorithm
+from .concept_replace import ConceptReplaceAlgorithm

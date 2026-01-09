@@ -220,6 +220,14 @@ class ForwardContext:
       when prefix caching is enabled
     - Value 0 means no tokens are cached for that request
     """
+    
+    num_output_tokens_cpu: torch.Tensor | None = None
+    """Number of output tokens already generated for each request in the batch.
+    - Shape: (batch_size,)
+    - Used by steer vectors for generate_first_k_tokens and generate_after_k_tokens
+    - Value 0 means this is the first generation token for that request
+    - Only relevant for decode phase requests
+    """
 
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.valid_runtime_modes(), (
@@ -253,6 +261,7 @@ def create_forward_context(
     ubatch_slices: UBatchSlices | None = None,
     current_tokens: torch.Tensor | None = None,
     num_computed_tokens_cpu: torch.Tensor | None = None,
+    num_output_tokens_cpu: torch.Tensor | None = None,
 ):
     return ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
@@ -264,6 +273,7 @@ def create_forward_context(
         ubatch_slices=ubatch_slices,
         current_tokens=current_tokens,
         num_computed_tokens_cpu=num_computed_tokens_cpu,
+        num_output_tokens_cpu=num_output_tokens_cpu,
     )
 
 
@@ -294,6 +304,7 @@ def set_forward_context(
     ubatch_slices: UBatchSlices | None = None,
     current_tokens: torch.Tensor | None = None,
     num_computed_tokens_cpu: torch.Tensor | None = None,
+    num_output_tokens_cpu: torch.Tensor | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -341,6 +352,7 @@ def set_forward_context(
         ubatch_slices,
         current_tokens,
         num_computed_tokens_cpu,
+        num_output_tokens_cpu,
     )
 
     try:

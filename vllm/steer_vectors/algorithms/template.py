@@ -112,7 +112,11 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
         """
         pass
     
-    def apply_intervention(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def apply_intervention(
+        self, 
+        hidden_states: torch.Tensor,
+        context_info: Optional[tuple] = None
+    ) -> torch.Tensor:
         """
         Unified intervention application logic.
         
@@ -120,6 +124,13 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
         1. Get algorithm parameters
         2. Delegate to parameter controller to find intervention positions
         3. Apply transformations at those positions
+        
+        Args:
+            hidden_states: Input tensor to transform
+            context_info: Optional tuple of (current_tokens, samples_info).
+                         If provided, use this instead of fetching from forward context.
+                         This is useful for components like MoE routers where context
+                         may not be available at the component level.
         """
         # Skip if no triggers configured
         if not self.params.has_any_triggers():
@@ -154,12 +165,20 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
             original_dtype = hidden_states.dtype
             return self._transform(hidden_states, algo_params).to(original_dtype)
 
-        # Get forward context and samples info using helper
-        ctx_info = self._get_forward_context_and_samples(hidden_states)
-        if ctx_info is None:
-            return hidden_states
-        
-        forward_ctx, samples_info, current_tokens = ctx_info
+        # ========== Normal Path: Token-Level Control ==========
+        # Get context information - either from provided context_info or fetch from forward context
+        if context_info is not None:
+            # Use provided context (e.g., from MoE layer wrapper)
+            current_tokens, samples_info = context_info
+            if self.params.debug:
+                print(f"[{self.__class__.__name__}] Using provided context info")
+        else:
+            # Try to fetch context ourselves (backward compatible)
+            ctx_info = self._get_forward_context_and_samples(hidden_states)
+            if ctx_info is None:
+                return hidden_states
+            
+            forward_ctx, samples_info, current_tokens = ctx_info
         
         # Debug: Show batch composition using helper
         if self.params.debug:

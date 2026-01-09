@@ -154,7 +154,7 @@ from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
-from vllm.v1.worker.hidden_states_model_runner_mixin import HiddenStatesModelRunnerMixin
+from vllm.v1.worker.capture_model_runner_mixin import CaptureModelRunnerMixin
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.steer_vector_model_runner_mixin import SteerVectorModelRunnerMixin
@@ -269,7 +269,7 @@ class ExecuteModelState(NamedTuple):
 
 
 class GPUModelRunner(
-    HiddenStatesModelRunnerMixin,
+    CaptureModelRunnerMixin,  # Unified capture mixin (hidden states, MoE router logits, etc.)
     SteerVectorModelRunnerMixin,
     LoRAModelRunnerMixin,
     KVConnectorModelRunnerMixin,
@@ -3112,6 +3112,27 @@ class GPUModelRunner(
         if hasattr(self.input_batch, "num_computed_tokens_cpu"):
             num_reqs = self.input_batch.num_reqs
             num_computed_tokens_cpu_tensor = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        
+        # Extract num_output_tokens for generation position control in steer vectors
+        num_output_tokens_cpu_tensor = None
+        try:
+            if self.input_batch.num_reqs > 0:
+                # Collect num_output_tokens for each request in the batch
+                # The order must match the order in input_batch (by req_index)
+                num_output_tokens_list = [0] * self.input_batch.num_reqs
+                for req_id, req_index in self.input_batch.req_id_to_index.items():
+                    req_state = self.requests.get(req_id)
+                    if req_state is not None:
+                        num_output_tokens_list[req_index] = len(req_state.output_token_ids)
+                
+                num_output_tokens_cpu_tensor = torch.tensor(
+                    num_output_tokens_list,
+                    dtype=torch.int32,
+                    device='cpu',
+                    pin_memory=self.pin_memory
+                )
+        except Exception:
+            num_output_tokens_cpu_tensor = None
 
         with (
             set_forward_context(
@@ -3124,6 +3145,7 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 current_tokens=current_tokens_tensor,
                 num_computed_tokens_cpu=num_computed_tokens_cpu_tensor,
+                num_output_tokens_cpu=num_output_tokens_cpu_tensor,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
@@ -3633,6 +3655,8 @@ class GPUModelRunner(
                 self.model = self._wrap_model_with_steer_vectors(self.model)
                 # Wrap model for hidden states capture
                 self.model = self._wrap_model_for_hidden_states(self.model)
+                # Wrap model for MoE router logits capture
+                self.model = self._wrap_model_for_moe_capture(self.model)
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     self.drafter.load_model(self.model)

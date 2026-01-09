@@ -41,6 +41,9 @@ def extract_samples_info(attn_metadata) -> Optional[Dict[str, torch.Tensor]]:
     # Extract num_computed_tokens_cpu for prefix cache support
     num_computed_tokens_cpu = get_num_computed_tokens(attn_metadata)
     
+    # Extract num_output_tokens for generation position control
+    num_output_tokens_cpu = get_num_output_tokens(attn_metadata)
+    
     # Calculate sample lengths
     starts = query_start_loc[:-1]  # [num_samples]
     ends = query_start_loc[1:]      # [num_samples]
@@ -54,7 +57,8 @@ def extract_samples_info(attn_metadata) -> Optional[Dict[str, torch.Tensor]]:
     return {
         'query_start_loc': query_start_loc,       # [num_samples+1] on GPU
         'num_computed': num_computed_tokens_cpu,  # [num_samples] on GPU or None
-        'is_decode_mask': is_decode_mask          # [num_samples] on GPU
+        'is_decode_mask': is_decode_mask,         # [num_samples] on GPU
+        'num_output_tokens': num_output_tokens_cpu  # [num_samples] on GPU or None
     }
 
 
@@ -105,4 +109,30 @@ def get_num_computed_tokens(attn_metadata) -> Optional[torch.Tensor]:
             return getattr(first_layer_metadata, 'num_computed_tokens_cpu', None)
         else:
             return getattr(attn_metadata, 'num_computed_tokens_cpu', None) if attn_metadata else None
+
+
+def get_num_output_tokens(attn_metadata) -> Optional[torch.Tensor]:
+    """
+    Extract num_output_tokens_cpu for generation position control.
+    
+    V1 stores num_output_tokens_cpu in forward_context.
+    
+    Args:
+        attn_metadata: Attention metadata from forward context
+        
+    Returns:
+        num_output_tokens_cpu tensor or None if not available
+    """
+    try:
+        if get_forward_context is None:
+            return None
+        forward_context = get_forward_context()
+        return forward_context.num_output_tokens_cpu
+    except Exception:
+        # Fallback: try to extract from attn_metadata
+        if isinstance(attn_metadata, dict) and attn_metadata:
+            first_layer_metadata = next(iter(attn_metadata.values()))
+            return getattr(first_layer_metadata, 'num_output_tokens_cpu', None)
+        else:
+            return getattr(attn_metadata, 'num_output_tokens_cpu', None) if attn_metadata else None
 

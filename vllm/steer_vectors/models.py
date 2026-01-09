@@ -37,6 +37,10 @@ from vllm.steer_vectors.layers import (
     SteerVectorMapping,
     extract_layer_id_from_module_name,
 )
+from vllm.steer_vectors.moe_layers import (
+    MoELayerWithSteerVector,
+    extract_moe_layer_id_from_name,
+)
 from vllm.utils.cache import LRUCache
 
 logger = logging.getLogger(__name__)
@@ -87,6 +91,8 @@ for wrapper_type, config in WRAPPER_REGISTRY.items():
     if config.get("enabled", False):
         if wrapper_type == "decoder_layer":
             _all_sv_classes[wrapper_type] = DecoderLayerWithSteerVector
+        elif wrapper_type == "moe_layer":
+            _all_sv_classes[wrapper_type] = MoELayerWithSteerVector
         # Future wrapper types can be added here:
         # elif wrapper_type == "attention":
         #     from vllm.steer_vectors.layers import AttentionWithSteerVector
@@ -147,6 +153,7 @@ class SteerVectorModel:
         scale_factor: float = 1.0,
         algorithm: str = "direct",
         target_layers: Optional[list[int]] = None,
+        **kwargs,  # Accept additional algorithm-specific parameters (e.g., moe_lambda)
     ) -> "SteerVectorModel":
         """Load a steer vector from a local checkpoint or HuggingFace Hub.
         
@@ -189,8 +196,9 @@ class SteerVectorModel:
             algo_class = ALGORITHM_REGISTRY[algorithm]
 
             # Delegate loading to the algorithm's class method
+            # Pass kwargs to support algorithm-specific parameters (e.g., moe_lambda)
             loaded_params = algo_class.load_from_path(
-                file_path, device, config=config, target_layers=target_layers
+                file_path, device, config=config, target_layers=target_layers, **kwargs
             )
             
             # Create SteerVectorModel instance from loaded parameters
@@ -268,6 +276,8 @@ class SteerVectorModelManager:
         prefill_exclude_tokens: Optional[list[int]] = None,
         prefill_exclude_positions: Optional[list[int]] = None,
         generate_trigger_tokens: Optional[list[int]] = None,
+        generate_first_k_tokens: Optional[int] = None,
+        generate_after_k_tokens: Optional[int] = None,
         debug: bool = False,
         conflict_resolution: str = "priority",
         normalize: bool = False,
@@ -282,6 +292,8 @@ class SteerVectorModelManager:
             prefill_exclude_tokens: Tokens to exclude from intervention
             prefill_exclude_positions: Positions to exclude from intervention
             generate_trigger_tokens: Tokens that trigger intervention in generation
+            generate_first_k_tokens: Only intervene on first k generated tokens
+            generate_after_k_tokens: Start intervening from k-th generated token
             debug: Enable debug output
             conflict_resolution: Strategy for multi-vector conflicts
             normalize: Whether to normalize vectors
@@ -314,6 +326,8 @@ class SteerVectorModelManager:
             "prefill_exclude_tokens": prefill_exclude_tokens,
             "prefill_exclude_positions": prefill_exclude_positions,
             "generate_trigger_tokens": generate_trigger_tokens,
+            "generate_first_k_tokens": generate_first_k_tokens,
+            "generate_after_k_tokens": generate_after_k_tokens,
             "debug": debug,
             "normalize": normalize,
         }
@@ -322,10 +336,11 @@ class SteerVectorModelManager:
         if steer_vector_model.is_multi_vector:
             self._activate_multi_vector_adapter(index, steer_vector_model, debug, conflict_resolution)
         elif steer_vector_model.layer_payloads:
+            target_wrapper_type = self._resolve_wrapper_type(steer_vector_model.algorithm)
             for layer_idx, payload in steer_vector_model.layer_payloads.items():
                 if target_layers and layer_idx not in target_layers:
                     continue
-                for module in self._get_modules_for_layer(layer_idx):
+                for module in self._get_modules_for_layer(layer_idx, target_wrapper_type):
                     module.set_steer_vector(index, payload=payload, **params)
         else:
             # Fallback for models without payloads
@@ -442,9 +457,18 @@ class SteerVectorModelManager:
                 new_module = self.replace_submodule(
                     self.model,
                     module_name,
-                    wrapper_class(module)  # Generic wrapper creation!
+                    wrapper_class(module, layer_name=module_name) if wrapper_type == "moe_layer" else wrapper_class(module)
                 )
-                new_module.set_layer_id(extract_layer_id_from_module_name(module_name))
+                
+                # Extract layer ID based on wrapper type
+                if wrapper_type == "moe_layer":
+                    layer_id = extract_moe_layer_id_from_name(module_name)
+                else:
+                    layer_id = extract_layer_id_from_module_name(module_name)
+                
+                if layer_id is not None:
+                    new_module.set_layer_id(layer_id)
+                
                 self.register_module(module_name, new_module)
                 wrapped_count += 1
                 logger.debug(f"Wrapped {wrapper_type}: {module_name}")
@@ -485,7 +509,15 @@ class SteerVectorModelManager:
 
         # 2. Configure algorithm for each layer
         for layer_idx, vectors_for_layer in layer_to_vectors.items():
-            for module in self._get_modules_for_layer(layer_idx):
+            # Determine the wrapper type based on algorithms used
+            # If any vector uses moe_router, use moe_layer; otherwise use decoder_layer
+            has_moe_router = any(
+                vec_data.get('algorithm') == 'moe_router' 
+                for _, vec_data in vectors_for_layer
+            )
+            target_wrapper_type = "moe_layer" if has_moe_router else "decoder_layer"
+            
+            for module in self._get_modules_for_layer(layer_idx, target_wrapper_type):
                 if len(vectors_for_layer) == 1:
                     # Single vector: degrade to single-vector mode
                     _, vector_data = vectors_for_layer[0]
@@ -517,11 +549,26 @@ class SteerVectorModelManager:
                             **add_kwargs
                         )
 
-    def _get_modules_for_layer(self, layer_idx: int) -> List[nn.Module]:
+    def _resolve_wrapper_type(self, algorithm_name: str) -> str:
+        """Determine which wrapper type should receive a given algorithm."""
+        if algorithm_name == "moe_router":
+            return "moe_layer"
+        return "decoder_layer"
+
+    def _get_modules_for_layer(
+        self,
+        layer_idx: int,
+        wrapper_type: Optional[str] = None
+    ) -> List[nn.Module]:
         """Get all modules for the specified layer."""
         modules = []
+        target_class = None
+        if wrapper_type:
+            target_class = _all_sv_classes.get(wrapper_type)
         for module_name, module in self.modules.items():
             if extract_layer_id_from_module_name(module_name) == layer_idx:
+                if target_class is not None and not isinstance(module, target_class):
+                    continue
                 modules.append(module)
         return modules
 
@@ -657,6 +704,8 @@ class LRUCacheSteerVectorModelManager(SteerVectorModelManager):
         prefill_exclude_tokens: Optional[list[int]] = None,
         prefill_exclude_positions: Optional[list[int]] = None,
         generate_trigger_tokens: Optional[list[int]] = None,
+        generate_first_k_tokens: Optional[int] = None,
+        generate_after_k_tokens: Optional[int] = None,
         debug: bool = False,
         conflict_resolution: str = "priority",
         normalize: bool = False,
@@ -677,6 +726,8 @@ class LRUCacheSteerVectorModelManager(SteerVectorModelManager):
             prefill_exclude_tokens,
             prefill_exclude_positions,
             generate_trigger_tokens,
+            generate_first_k_tokens,
+            generate_after_k_tokens,
             debug,
             conflict_resolution,
             normalize
@@ -720,4 +771,3 @@ def create_sv_manager(
         steer_vector_config=steer_vector_config
     )
     return steer_vector_manager
-

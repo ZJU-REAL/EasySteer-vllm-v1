@@ -83,23 +83,39 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
         if vector_idx in self.vector_scales:
             del self.vector_scales[vector_idx]
 
-    def apply_intervention(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def apply_intervention(
+        self, 
+        hidden_states: torch.Tensor,
+        context_info: Optional[Tuple[torch.Tensor, dict]] = None
+    ) -> torch.Tensor:
         """Apply multi-vector intervention.
         
         In V1 continuous batching, a batch may contain both decode and prefill samples.
         We need to handle them separately based on their individual lengths (not batch-level phase).
+        
+        Args:
+            hidden_states: Input tensor to transform
+            context_info: Optional tuple of (current_tokens, samples_info).
+                         If provided, use this instead of fetching from forward context.
         """
         if not self.vector_algorithms:
             return hidden_states
 
-        # Get forward context and samples info using helper from template
-        # Use the first algorithm's helper method (they all inherit from template)
-        first_algo = next(iter(self.vector_algorithms.values()))
-        ctx_info = first_algo._get_forward_context_and_samples(hidden_states)
-        if ctx_info is None:
-            return hidden_states
-        
-        forward_ctx, samples_info, current_tokens = ctx_info
+        # Get context information - either from provided context_info or fetch from forward context
+        if context_info is not None:
+            # Use provided context (e.g., from MoE layer wrapper)
+            current_tokens, samples_info = context_info
+            if self.params.debug:
+                print(f"[MultiVector] Using provided context info")
+        else:
+            # Get forward context and samples info using helper from template
+            # Use the first algorithm's helper method (they all inherit from template)
+            first_algo = next(iter(self.vector_algorithms.values()))
+            ctx_info = first_algo._get_forward_context_and_samples(hidden_states)
+            if ctx_info is None:
+                return hidden_states
+            
+            forward_ctx, samples_info, current_tokens = ctx_info
         
         # Debug: Show batch composition using helper
         # Note: multi_vector has its own params controller, so use self._debug_print_batch_info

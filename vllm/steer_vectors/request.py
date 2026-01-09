@@ -29,6 +29,10 @@ class VectorConfig(
                                   Supports negative indexing. Exclude has higher priority than trigger positions.
         generate_trigger_tokens: List of token IDs that trigger vector application in generate phase.
                                 Use [-1] to apply to ALL tokens in generate phase.
+        generate_first_k_tokens: Only apply to the first k generated tokens (0-indexed: tokens 0, 1, ..., k-1).
+                                Mutually exclusive with generate_after_k_tokens.
+        generate_after_k_tokens: Start applying from the k-th generated token onwards (skip first k tokens).
+                                Mutually exclusive with generate_first_k_tokens.
         algorithm: Vector algorithm to use: 'direct' (default) or 'loreft'
         normalize: Whether to normalize the vector (default: False, only applies to 'direct' algorithm)
     """
@@ -40,6 +44,8 @@ class VectorConfig(
     prefill_exclude_tokens: List[int] | None = None
     prefill_exclude_positions: List[int] | None = None
     generate_trigger_tokens: List[int] | None = None
+    generate_first_k_tokens: int | None = None
+    generate_after_k_tokens: int | None = None
     algorithm: str = "direct"
     normalize: bool = False
 
@@ -72,6 +78,10 @@ class SteerVectorRequest(
         prefill_exclude_tokens: List of token IDs to exclude from steer vector application in prefill phase.
         prefill_exclude_positions: List of token positions to exclude from steer vector application in prefill phase.
         generate_trigger_tokens: List of token IDs that trigger steer vector application in generate phase.
+        generate_first_k_tokens: Only apply to the first k generated tokens (0-indexed: tokens 0, 1, ..., k-1).
+                                Mutually exclusive with generate_after_k_tokens.
+        generate_after_k_tokens: Start applying from the k-th generated token onwards (skip first k tokens).
+                                Mutually exclusive with generate_first_k_tokens.
         algorithm: Steer vector algorithm to use: 'direct' (default) or 'loreft'
         normalize: Whether to normalize the steer vector (default: False, only applies to 'direct' algorithm)
         
@@ -93,11 +103,19 @@ class SteerVectorRequest(
     prefill_exclude_tokens: List[int] | None = None
     prefill_exclude_positions: List[int] | None = None
     generate_trigger_tokens: List[int] | None = None
+    generate_first_k_tokens: int | None = None
+    generate_after_k_tokens: int | None = None
     algorithm: str = "direct"
     normalize: bool = False
     
     # === Multi-vector mode ===
     vector_configs: List[VectorConfig] | None = None
+    
+    # === MoE-specific parameters (for moe_router algorithm) ===
+    moe_expert_ids: List[int] | None = None  # Expert IDs to intervene
+    moe_mode: str = "boost"                   # Intervention mode: 'boost', 'suppress', 'soft', or 'soft_topk'
+    moe_lambda: float = 0.5                   # Lambda parameter for 'soft' modes (z'_k = z_k + lambda * std(z))
+    moe_topk: int = 8                         # Top-K parameter for 'soft_topk' mode (only intervene if expert is in top-k)
 
     def __post_init__(self):
         """Validate configuration consistency."""
@@ -111,6 +129,23 @@ class SteerVectorRequest(
                 f"conflict_resolution must be 'error', 'priority', or 'sequential', "
                 f"got '{self.conflict_resolution}'"
             )
+        
+        # Validate generate position control parameters
+        if self.generate_first_k_tokens is not None and self.generate_after_k_tokens is not None:
+            raise ValueError(
+                "Cannot specify both generate_first_k_tokens and generate_after_k_tokens. "
+                "They are mutually exclusive."
+            )
+        
+        if self.generate_first_k_tokens is not None and self.generate_first_k_tokens < 0:
+            raise ValueError(
+                f"generate_first_k_tokens must be >= 0, got {self.generate_first_k_tokens}"
+            )
+        
+        if self.generate_after_k_tokens is not None and self.generate_after_k_tokens < 0:
+            raise ValueError(
+                f"generate_after_k_tokens must be >= 0, got {self.generate_after_k_tokens}"
+            )
             
         if self.is_multi_vector:
             if self.steer_vector_local_path:
@@ -122,9 +157,12 @@ class SteerVectorRequest(
                     "vector_configs cannot be empty in multi-vector mode"
                 )
         else:
-            if not self.steer_vector_local_path:
+            # Special case: moe_router algorithm can work without a file path
+            # It uses moe_expert_ids, moe_scale, moe_mode from the request directly
+            if self.algorithm != "moe_router" and not self.steer_vector_local_path:
                 raise ValueError(
-                    "Must specify steer_vector_local_path in single-vector mode"
+                    "Must specify steer_vector_local_path in single-vector mode "
+                    "(except for moe_router algorithm)"
                 )
 
     @property

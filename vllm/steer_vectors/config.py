@@ -157,6 +157,53 @@ SUPPORTED_DECODER_LAYERS: List[str] = [
 
 
 # ============================================================================
+# Supported MoE Layer Class Names
+# ============================================================================
+# List of MoE layer class names for automatic recognition
+
+SUPPORTED_MOE_LAYERS: List[str] = [
+    # Qwen family
+    "Qwen2MoeSparseMoeBlock",
+    "Qwen3MoeSparseMoeBlock",
+    "Qwen3NextSparseMoeBlock",
+    "QwenMoE",
+    "Qwen2MoE",
+    # Mixtral / Llama family
+    "MixtralMoE",
+    "Llama4MoE",
+    "PhiMoE",
+    # DeepSeek family
+    "DeepseekMoE",
+    "DeepseekV2MoE",
+    # Kimi
+    "KimiMoE",
+    # GLM
+    "Glm4MoE",
+    "GLMMoE",
+    # Ernie
+    "Ernie4MoE",
+    "Ernie4_5_MoeMoE",
+    "Ernie4_5_VLMoeMoE",
+    # Others
+    "DbrxExperts",
+    "DbrxMoE",
+    "ArcticMoE",
+    "JambaMoE",
+    "Grok1MoE",
+    "GraniteMoeMoE",
+    "MiniMaxText01MoE",
+    "MiniMaxM2MoE",
+    "MiniCPMMoE",
+    "OlmoeMoE",
+    "FlexOlmoMoE",
+    "NemotronHMoE",
+    "BailingMoE",
+    "Dots1MoE",
+    "NomicMoE",
+]
+
+
+# ============================================================================
 # Wrapper Registry Configuration
 # ============================================================================
 # Registry for different intervention granularities
@@ -169,6 +216,14 @@ WRAPPER_REGISTRY: Dict[str, Dict[str, Any]] = {
         "target_modules": SUPPORTED_DECODER_LAYERS,
         "enabled": True,
         "description": "Full decoder layer intervention on complete hidden states",
+    },
+    
+    # MoE-level intervention (router logits)
+    "moe_layer": {
+        "wrapper_class": "MoELayerWithSteerVector",
+        "target_modules": SUPPORTED_MOE_LAYERS,
+        "enabled": True,
+        "description": "MoE router logits intervention for expert selection control",
     },
     
     # Future extension examples (currently disabled):

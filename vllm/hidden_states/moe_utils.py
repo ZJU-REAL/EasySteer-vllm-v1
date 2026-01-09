@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Utility functions for Hidden States Capture
+Utility functions for MoE Router Logits Capture
 """
 
 import torch
@@ -8,9 +8,9 @@ import numpy as np
 from typing import Dict, Any
 
 
-def deserialize_hidden_states(serialized_data: Dict[int, Dict[str, Any]]) -> Dict[int, torch.Tensor]:
+def deserialize_moe_router_logits(serialized_data: Dict[int, Dict[str, Any]]) -> Dict[int, torch.Tensor]:
     """
-    Deserialize hidden states from RPC-transferred format back to tensors.
+    Deserialize MoE router logits from RPC-transferred format back to tensors.
     
     Args:
         serialized_data: Dictionary mapping layer_id to serialized tensor info:
@@ -24,10 +24,10 @@ def deserialize_hidden_states(serialized_data: Dict[int, Dict[str, Any]]) -> Dic
         Dictionary mapping layer_id to torch.Tensor with original dtype
     
     Example:
-        >>> results = llm.llm_engine.engine_core.collective_rpc("get_captured_hidden_states")
+        >>> results = llm.llm_engine.engine_core.collective_rpc("get_moe_router_logits")
         >>> serialized = results[0]
-        >>> hidden_states = deserialize_hidden_states(serialized)
-        >>> # Now hidden_states[layer_id] is a real tensor with correct dtype
+        >>> router_logits = deserialize_moe_router_logits(serialized)
+        >>> # Now router_logits[layer_id] is a real tensor with correct dtype
     """
     tensors = {}
     
@@ -64,16 +64,17 @@ def deserialize_hidden_states(serialized_data: Dict[int, Dict[str, Any]]) -> Dic
     return tensors
 
 
-def print_hidden_states_summary(hidden_states: Dict[int, torch.Tensor]):
+def print_moe_router_logits_summary(router_logits: Dict[int, torch.Tensor]):
     """
-    Print a summary of captured hidden states.
+    Print a summary of captured MoE router logits.
     
     Args:
-        hidden_states: Dictionary mapping layer_id to torch.Tensor
+        router_logits: Dictionary mapping layer_id to torch.Tensor
     """
-    print(f"📊 Captured {len(hidden_states)} layers:")
-    for layer_id in sorted(hidden_states.keys()):
-        tensor = hidden_states[layer_id]
-        print(f"  Layer {layer_id:2d}: shape {tuple(tensor.shape)}, "
+    print(f"📊 Captured {len(router_logits)} MoE layers:")
+    for layer_id in sorted(router_logits.keys()):
+        tensor = router_logits[layer_id]
+        num_tokens, n_experts = tensor.shape
+        print(f"  Layer {layer_id:2d}: {num_tokens} tokens × {n_experts} experts, "
               f"dtype {tensor.dtype}, device {tensor.device}")
 

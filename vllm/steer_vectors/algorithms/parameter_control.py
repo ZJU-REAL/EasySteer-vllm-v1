@@ -30,6 +30,8 @@ class InterventionController:
         self.prefill_exclude_tokens: Optional[set[int]] = None
         self.prefill_exclude_positions: Optional[list[int]] = None
         self.generate_trigger_tokens: Optional[set[int]] = None
+        self.generate_first_k_tokens: Optional[int] = None
+        self.generate_after_k_tokens: Optional[int] = None
         
         # Debug mode
         self.debug: bool = False
@@ -60,6 +62,14 @@ class InterventionController:
         """Set trigger tokens for generation phase."""
         self.generate_trigger_tokens = set(token_ids) if token_ids is not None else None
     
+    def set_generate_first_k_tokens(self, k: Optional[int]) -> None:
+        """Set to intervene only on first k generated tokens."""
+        self.generate_first_k_tokens = k
+    
+    def set_generate_after_k_tokens(self, k: Optional[int]) -> None:
+        """Set to intervene starting from (k+1)-th generated token."""
+        self.generate_after_k_tokens = k
+    
     def configure_from_dict(self, config: dict) -> None:
         """
         Batch configure intervention parameters from a dictionary.
@@ -82,6 +92,10 @@ class InterventionController:
             self.set_prefill_exclude_positions(config["prefill_exclude_positions"])
         if "generate_trigger_tokens" in config:
             self.set_generate_trigger_tokens(config["generate_trigger_tokens"])
+        if "generate_first_k_tokens" in config:
+            self.set_generate_first_k_tokens(config["generate_first_k_tokens"])
+        if "generate_after_k_tokens" in config:
+            self.set_generate_after_k_tokens(config["generate_after_k_tokens"])
         if "debug" in config:
             self.set_debug(config["debug"])
     
@@ -104,7 +118,9 @@ class InterventionController:
         """Check if any triggers are configured."""
         return (self.prefill_trigger_tokens is not None or 
                 self.generate_trigger_tokens is not None or
-                self.prefill_trigger_positions is not None)
+                self.prefill_trigger_positions is not None or
+                self.generate_first_k_tokens is not None or
+                self.generate_after_k_tokens is not None)
     
     def is_global_only_config(self) -> bool:
         """
@@ -190,6 +206,8 @@ class InterventionController:
             prefill_exclude_tokens=self.prefill_exclude_tokens,
             prefill_exclude_positions=self.prefill_exclude_positions,
             generate_trigger_tokens=self.generate_trigger_tokens,
+            generate_first_k_tokens=self.generate_first_k_tokens,
+            generate_after_k_tokens=self.generate_after_k_tokens,
             has_prefill_triggers=self.has_prefill_triggers()
         )
 
@@ -489,6 +507,64 @@ def get_prefill_mask_gpu(
     return mask
 
 
+def filter_by_generate_position(
+    position_mask: torch.Tensor,
+    sample_ids: torch.Tensor,
+    is_decode_mask: torch.Tensor,
+    num_output_tokens: torch.Tensor,
+    generate_first_k: Optional[int],
+    generate_after_k: Optional[int],
+    device: torch.device
+) -> torch.Tensor:
+    """
+    Filter decode positions based on generation position (first k or after k).
+    
+    Args:
+        position_mask: [total_tokens] boolean tensor
+        sample_ids: [total_tokens] sample ID for each token
+        is_decode_mask: [num_samples] boolean tensor (True for decode samples)
+        num_output_tokens: [num_samples] number of tokens already generated for each sample
+        generate_first_k: Only intervene on first k generated tokens, or None
+        generate_after_k: Start intervening from (k+1)-th token, or None
+        device: Device to create tensors on
+    
+    Returns:
+        filtered_mask: Updated boolean tensor
+    """
+    # Get decode sample IDs
+    decode_sample_ids = torch.nonzero(is_decode_mask, as_tuple=False).squeeze(-1)
+    
+    if decode_sample_ids.numel() == 0:
+        return position_mask
+    
+    # Ensure num_output_tokens is on the same device as sample_ids
+    if num_output_tokens.device != device:
+        num_output_tokens = num_output_tokens.to(device)
+    
+    # Expand num_output_tokens to per-token
+    # num_output_tokens[i] is the number of tokens already generated for sample i
+    # The current token being processed is the (num_output_tokens[i])-th generated token (0-indexed)
+    token_gen_counts = num_output_tokens[sample_ids]  # [total_tokens]
+    
+    # Create decode token mask
+    is_decode_token = torch.isin(sample_ids, decode_sample_ids)
+    
+    if generate_first_k is not None:
+        # Only keep tokens where gen_count < k (0-indexed: 0, 1, ..., k-1)
+        # If current token is the gen_count-th token, we apply if gen_count < k
+        valid_gen_position = token_gen_counts < generate_first_k
+        # Keep all prefill tokens unchanged, only filter decode tokens
+        position_mask = position_mask & (~is_decode_token | valid_gen_position)
+    
+    elif generate_after_k is not None:
+        # Only keep tokens where gen_count >= k (skip first k tokens: 0, 1, ..., k-1)
+        valid_gen_position = token_gen_counts >= generate_after_k
+        # Keep all prefill tokens unchanged, only filter decode tokens
+        position_mask = position_mask & (~is_decode_token | valid_gen_position)
+    
+    return position_mask
+
+
 def collect_positions_gpu_batch(
     hidden_states: torch.Tensor,
     current_tokens: torch.Tensor,
@@ -498,6 +574,8 @@ def collect_positions_gpu_batch(
     prefill_exclude_tokens: Optional[set],
     prefill_exclude_positions: Optional[list],
     generate_trigger_tokens: Optional[set],
+    generate_first_k_tokens: Optional[int],
+    generate_after_k_tokens: Optional[int],
     has_prefill_triggers: bool
 ) -> Optional[torch.Tensor]:
     """
@@ -514,6 +592,8 @@ def collect_positions_gpu_batch(
         prefill_exclude_tokens: Set of token IDs to exclude or None
         prefill_exclude_positions: List of positions to exclude or None
         generate_trigger_tokens: Set of trigger token IDs for generation phase or None
+        generate_first_k_tokens: Only intervene on first k generated tokens, or None
+        generate_after_k_tokens: Start intervening from k-th token onwards, or None
         has_prefill_triggers: Whether prefill triggers are configured
         
     Returns:
@@ -546,13 +626,28 @@ def collect_positions_gpu_batch(
     # Step 3: Initialize position mask for collecting trigger positions
     position_mask = torch.zeros(total_tokens, dtype=torch.bool, device=device)
     
+    # Determine if decode samples should be processed
+    # Either: explicit generate_trigger_tokens, or position-based control (first_k/after_k)
+    has_decode_triggers = (
+        generate_trigger_tokens is not None or
+        generate_first_k_tokens is not None or
+        generate_after_k_tokens is not None
+    )
+    
     # Step 4: Handle decode samples
-    if generate_trigger_tokens is not None and torch.any(is_decode_mask):
+    if has_decode_triggers and torch.any(is_decode_mask):
+        # When generate_first_k_tokens or generate_after_k_tokens is set without
+        # explicit generate_trigger_tokens, treat it as applying to all decode tokens
+        # (the actual filtering by position happens in Step 6)
+        effective_generate_trigger_tokens = generate_trigger_tokens
+        if effective_generate_trigger_tokens is None and (generate_first_k_tokens is not None or generate_after_k_tokens is not None):
+            effective_generate_trigger_tokens = {-1}  # -1 means all tokens
+        
         decode_mask = get_decode_mask_gpu(
             current_tokens=current_tokens,
             sample_ids=sample_ids,
             is_decode_mask=is_decode_mask,
-            generate_trigger_tokens=generate_trigger_tokens,
+            generate_trigger_tokens=effective_generate_trigger_tokens,
             device=device
         )
         position_mask |= decode_mask
@@ -574,7 +669,23 @@ def collect_positions_gpu_batch(
         )
         position_mask |= prefill_mask
     
-    # Step 6: Extract final positions from mask
+    # Step 6: Apply generate position filtering (if configured)
+    if generate_first_k_tokens is not None or generate_after_k_tokens is not None:
+        # Extract num_output_tokens from samples_info
+        num_output_tokens = samples_info.get('num_output_tokens')
+        
+        if num_output_tokens is not None:
+            position_mask = filter_by_generate_position(
+                position_mask=position_mask,
+                sample_ids=sample_ids,
+                is_decode_mask=is_decode_mask,
+                num_output_tokens=num_output_tokens,
+                generate_first_k=generate_first_k_tokens,
+                generate_after_k=generate_after_k_tokens,
+                device=device
+            )
+    
+    # Step 7: Extract final positions from mask
     positions_tensor = torch.nonzero(position_mask, as_tuple=False).squeeze(-1)
     
     if positions_tensor.numel() == 0:
