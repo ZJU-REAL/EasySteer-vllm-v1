@@ -156,8 +156,8 @@ class CaptureModelRunnerMixin:
             for layer_id, tensor in self.hidden_states_store.hidden_states.items():
                 cpu_tensor = tensor.cpu() if tensor.device.type != 'cpu' else tensor
                 
-                # Convert bfloat16 to float32 for numpy compatibility
-                if cpu_tensor.dtype == torch.bfloat16:
+                # Convert bfloat16/float16 to float32 for numpy compatibility and consistent serialization
+                if cpu_tensor.dtype in (torch.bfloat16, torch.float16):
                     cpu_tensor = cpu_tensor.to(torch.float32)
                 
                 np_array = cpu_tensor.numpy()
@@ -300,8 +300,8 @@ class CaptureModelRunnerMixin:
             for layer_id, tensor in self.moe_router_logits_store.router_logits.items():
                 cpu_tensor = tensor.cpu() if tensor.device.type != 'cpu' else tensor
                 
-                # Convert bfloat16 to float32 for numpy compatibility
-                if cpu_tensor.dtype == torch.bfloat16:
+                # Convert bfloat16/float16 to float32 for numpy compatibility and consistent serialization
+                if cpu_tensor.dtype in (torch.bfloat16, torch.float16):
                     cpu_tensor = cpu_tensor.to(torch.float32)
                 
                 np_array = cpu_tensor.numpy()
