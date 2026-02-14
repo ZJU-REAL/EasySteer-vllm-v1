@@ -3134,6 +3134,13 @@ class GPUModelRunner(
         except Exception:
             num_output_tokens_cpu_tensor = None
 
+        # Prepare query_start_loc for steer vectors (backend-agnostic sample boundaries)
+        query_start_loc_tensor = None
+        try:
+            query_start_loc_tensor = self.query_start_loc.gpu[: num_reqs + 1]
+        except Exception:
+            query_start_loc_tensor = None
+
         with (
             set_forward_context(
                 attn_metadata,
@@ -3146,6 +3153,7 @@ class GPUModelRunner(
                 current_tokens=current_tokens_tensor,
                 num_computed_tokens_cpu=num_computed_tokens_cpu_tensor,
                 num_output_tokens_cpu=num_output_tokens_cpu_tensor,
+                query_start_loc=query_start_loc_tensor,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
@@ -4281,6 +4289,13 @@ class GPUModelRunner(
                 num_reqs = num_reqs  # Already defined earlier in this function
                 num_computed_tokens_cpu_tensor = self.input_batch.num_computed_tokens_cpu[:num_reqs]
 
+            # Prepare query_start_loc for steer vectors (CUDA graph path)
+            query_start_loc_tensor = None
+            try:
+                query_start_loc_tensor = self.query_start_loc.gpu[: num_reqs + 1]
+            except Exception:
+                query_start_loc_tensor = None
+
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
                 set_forward_context(
@@ -4293,6 +4308,7 @@ class GPUModelRunner(
                     ubatch_slices=ubatch_slices_padded,
                     current_tokens=current_tokens_tensor,
                     num_computed_tokens_cpu=num_computed_tokens_cpu_tensor,
+                    query_start_loc=query_start_loc_tensor,
                 ),
             ):
                 outputs = self.model(

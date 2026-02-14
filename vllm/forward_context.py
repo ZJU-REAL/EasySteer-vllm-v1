@@ -228,6 +228,15 @@ class ForwardContext:
     - Value 0 means this is the first generation token for that request
     - Only relevant for decode phase requests
     """
+    
+    query_start_loc: torch.Tensor | None = None
+    """Sample boundary offsets for the current batch.
+    - Shape: (num_samples + 1,) - cumulative token counts per sample
+    - Used by steer vectors to determine per-sample token boundaries
+      for position-based triggers (e.g. prefill_trigger_positions)
+    - Backend-agnostic: stored here to avoid relying on per-layer
+      attention metadata which varies across backends
+    """
 
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.valid_runtime_modes(), (
@@ -262,6 +271,7 @@ def create_forward_context(
     current_tokens: torch.Tensor | None = None,
     num_computed_tokens_cpu: torch.Tensor | None = None,
     num_output_tokens_cpu: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
 ):
     return ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
@@ -274,6 +284,7 @@ def create_forward_context(
         current_tokens=current_tokens,
         num_computed_tokens_cpu=num_computed_tokens_cpu,
         num_output_tokens_cpu=num_output_tokens_cpu,
+        query_start_loc=query_start_loc,
     )
 
 
@@ -305,6 +316,7 @@ def set_forward_context(
     current_tokens: torch.Tensor | None = None,
     num_computed_tokens_cpu: torch.Tensor | None = None,
     num_output_tokens_cpu: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -353,6 +365,7 @@ def set_forward_context(
         current_tokens,
         num_computed_tokens_cpu,
         num_output_tokens_cpu,
+        query_start_loc,
     )
 
     try:

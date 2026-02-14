@@ -64,9 +64,12 @@ def extract_samples_info(attn_metadata) -> Optional[Dict[str, torch.Tensor]]:
 
 def get_query_start_loc(attn_metadata) -> Optional[torch.Tensor]:
     """
-    Extract query_start_loc from attention metadata.
+    Extract query_start_loc (sample boundary offsets).
     
-    V1 uses dict format with 'query_start_loc' field.
+    Primary path: read from ForwardContext.query_start_loc which is
+    backend-agnostic (works with FlashInfer, FlashAttn, Triton, etc.).
+    Fallback: read from per-layer attention metadata (only works for
+    backends that store query_start_loc directly, e.g. FlashAttn).
     
     Args:
         attn_metadata: Attention metadata from forward context
@@ -74,8 +77,18 @@ def get_query_start_loc(attn_metadata) -> Optional[torch.Tensor]:
     Returns:
         query_start_loc tensor or None if not available
     """
+    # Primary: backend-agnostic path via ForwardContext
+    try:
+        if get_forward_context is not None:
+            forward_ctx = get_forward_context()
+            if forward_ctx is not None and forward_ctx.query_start_loc is not None:
+                return forward_ctx.query_start_loc
+    except Exception:
+        pass
+    
+    # Fallback: read from per-layer attention metadata
     if isinstance(attn_metadata, dict):
-        # V1: dict format (primary path)
+        # V1: dict format
         if attn_metadata:
             first_layer_metadata = next(iter(attn_metadata.values()))
             return getattr(first_layer_metadata, 'query_start_loc', None)
