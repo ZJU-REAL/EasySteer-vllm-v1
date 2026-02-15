@@ -165,6 +165,12 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
 
         algo = self._get_or_create_algorithm(algorithm_name, **init_kwargs)
 
+        # Always update normalize on the algorithm instance, even if it already existed.
+        # _get_or_create_algorithm only passes init_kwargs on first creation;
+        # subsequent calls with a different normalize value would be silently ignored.
+        if "normalize" in kwargs:
+            algo.normalize = kwargs["normalize"]
+
         # 2. Set core vector parameters (payload) and other runtime parameters
         # Pass all remaining kwargs to set_steer_vector
         algo.set_steer_vector(index, **kwargs)
