@@ -9,6 +9,7 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.inputs.data import PromptType
 from vllm.lora.request import LoRARequest
 from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.plugins.io_processors import IOProcessor
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -51,6 +52,7 @@ class EngineClient(ABC):
         *,
         prompt_text: str | None = None,
         lora_request: LoRARequest | None = None,
+        steer_vector_request: SteerVectorRequest | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,

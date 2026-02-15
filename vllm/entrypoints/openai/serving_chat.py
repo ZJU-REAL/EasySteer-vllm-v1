@@ -189,6 +189,7 @@ class OpenAIServingChat(OpenAIServing):
             lora_request = self._maybe_get_adapters(
                 request, supports_default_mm_loras=True
             )
+            steer_vector_request = self._maybe_get_steer_vector(request)
 
             model_name = self.models.model_name(lora_request)
 
@@ -330,6 +331,7 @@ class OpenAIServingChat(OpenAIServing):
                         engine_prompt,
                         sampling_params,
                         lora_request=lora_request,
+                        steer_vector_request=steer_vector_request,
                         trace_headers=trace_headers,
                         priority=request.priority,
                     )

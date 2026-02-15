@@ -617,6 +617,20 @@ class VllmConfig:
                 "precision for chunked prefill triton kernels."
             )
 
+        # Steer vectors wrap decoder layers and modify module state
+        # (e.g. algorithm dicts) during forward, which is incompatible
+        # with torch.compile / CUDA graphs.  Auto-enable eager mode.
+        if (
+            self.steer_vector_config is not None
+            and self.model_config is not None
+            and not self.model_config.enforce_eager
+        ):
+            logger.warning(
+                "Steer vectors are not compatible with torch.compile / "
+                "CUDA graphs. Setting enforce_eager=True automatically."
+            )
+            self.model_config.enforce_eager = True
+
         if (
             self.optimization_level > OptimizationLevel.O0
             and self.model_config is not None

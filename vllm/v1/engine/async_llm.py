@@ -21,6 +21,7 @@ from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
@@ -276,6 +277,7 @@ class AsyncLLM(EngineClient):
         params: SamplingParams | PoolingParams,
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
+        steer_vector_request: SteerVectorRequest | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
@@ -301,12 +303,13 @@ class AsyncLLM(EngineClient):
                 request_id,
                 prompt,
                 params,
-                arrival_time,
-                lora_request,
-                tokenization_kwargs,
-                trace_headers,
-                priority,
-                data_parallel_rank,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                steer_vector_request=steer_vector_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
             )
             if isinstance(prompt, str):
                 prompt_text = prompt
@@ -365,6 +368,7 @@ class AsyncLLM(EngineClient):
         *,
         prompt_text: str | None = None,
         lora_request: LoRARequest | None = None,
+        steer_vector_request: SteerVectorRequest | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
@@ -420,6 +424,7 @@ class AsyncLLM(EngineClient):
                 prompt,
                 sampling_params,
                 lora_request=lora_request,
+                steer_vector_request=steer_vector_request,
                 tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers,
                 priority=priority,

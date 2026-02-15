@@ -85,6 +85,91 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 
 logger = init_logger(__name__)
 
+# --- Steer Vector Request Params (for OpenAI-compatible API) ---
+
+# Global counter for auto-generating steer vector IDs
+_steer_vector_id_counter = 0
+
+
+def _next_steer_vector_id() -> int:
+    """Generate a unique positive integer ID for steer vectors."""
+    global _steer_vector_id_counter
+    _steer_vector_id_counter += 1
+    if _steer_vector_id_counter > 2147483647:
+        _steer_vector_id_counter = 1
+    return _steer_vector_id_counter
+
+
+class VectorConfigParam(BaseModel):
+    """Configuration for a single vector in multi-vector mode."""
+    path: str
+    scale: float = 1.0
+    target_layers: list[int] | None = None
+    prefill_trigger_tokens: list[int] | None = None
+    prefill_trigger_positions: list[int] | None = None
+    prefill_exclude_tokens: list[int] | None = None
+    prefill_exclude_positions: list[int] | None = None
+    generate_trigger_tokens: list[int] | None = None
+    generate_first_k_tokens: int | None = None
+    generate_after_k_tokens: int | None = None
+    algorithm: str = "direct"
+    normalize: bool = False
+
+
+class SteerVectorRequestParam(BaseModel):
+    """
+    Steer Vector request parameters for OpenAI-compatible API.
+
+    Supports both single-vector mode and multi-vector mode.
+
+    Single-vector mode example:
+        {
+            "steer_vector_local_path": "/path/to/vector.safetensors",
+            "scale": 1.5,
+            "target_layers": [10, 11, 12],
+            "algorithm": "direct"
+        }
+
+    Multi-vector mode example:
+        {
+            "vector_configs": [
+                {"path": "/path/to/v1.safetensors", "scale": 1.0,
+                 "target_layers": [10]},
+                {"path": "/path/to/v2.safetensors", "scale": -1.0,
+                 "target_layers": [12]}
+            ]
+        }
+    """
+    # Optional: auto-generated if not provided
+    steer_vector_name: str | None = None
+    steer_vector_int_id: int | None = None
+
+    steer_vector_local_path: str = ""
+    debug: bool = False
+    conflict_resolution: str = "priority"
+
+    # Single-vector mode
+    scale: float = 1.0
+    target_layers: list[int] | None = None
+    prefill_trigger_tokens: list[int] | None = None
+    prefill_trigger_positions: list[int] | None = None
+    prefill_exclude_tokens: list[int] | None = None
+    prefill_exclude_positions: list[int] | None = None
+    generate_trigger_tokens: list[int] | None = None
+    generate_first_k_tokens: int | None = None
+    generate_after_k_tokens: int | None = None
+    algorithm: str = "direct"
+    normalize: bool = False
+
+    # Multi-vector mode
+    vector_configs: list[VectorConfigParam] | None = None
+
+    # MoE-specific parameters
+    moe_expert_ids: list[int] | None = None
+    moe_mode: str = "boost"
+    moe_lambda: float = 0.5
+    moe_topk: int = 8
+
 _LONG_INFO = torch.iinfo(torch.long)
 
 
@@ -720,6 +805,19 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    steer_vector_request: SteerVectorRequestParam | None = Field(
+        default=None,
+        description=(
+            "Steer vector request for activation steering. "
+            "Requires the server to be started with --enable-steer-vector. "
+            "Supports single-vector mode (specify steer_vector_local_path, "
+            "scale, target_layers, algorithm) and multi-vector mode "
+            "(specify vector_configs list). "
+            "steer_vector_name and steer_vector_int_id are auto-generated "
+            "if not provided."
+        ),
+    )
+
     # --8<-- [end:chat-completion-extra-params]
 
     # Default sampling parameters for chat completion requests
@@ -1137,6 +1235,19 @@ class CompletionRequest(OpenAIBaseModel):
         description=(
             "Additional request parameters with string or "
             "numeric values, used by custom extensions."
+        ),
+    )
+
+    steer_vector_request: SteerVectorRequestParam | None = Field(
+        default=None,
+        description=(
+            "Steer vector request for activation steering. "
+            "Requires the server to be started with --enable-steer-vector. "
+            "Supports single-vector mode (specify steer_vector_local_path, "
+            "scale, target_layers, algorithm) and multi-vector mode "
+            "(specify vector_configs list). "
+            "steer_vector_name and steer_vector_int_id are auto-generated "
+            "if not provided."
         ),
     )
 

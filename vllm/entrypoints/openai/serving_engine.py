@@ -51,12 +51,14 @@ from vllm.entrypoints.openai.protocol import (
     FunctionDefinition,
     ResponseInputOutputItem,
     ResponsesRequest,
+    SteerVectorRequestParam,
     TokenizeChatRequest,
     TokenizeCompletionRequest,
     TokenizeResponse,
     TranscriptionRequest,
     TranscriptionResponse,
     TranslationRequest,
+    _next_steer_vector_id,
 )
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
 from vllm.entrypoints.pooling.classify.protocol import (
@@ -96,6 +98,7 @@ from vllm.logger import init_logger
 from vllm.logprobs import Logprob, PromptLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MultiModalDataDict
+from vllm.steer_vectors.request import SteerVectorRequest, VectorConfig
 from vllm.outputs import CompletionOutput, PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
@@ -871,6 +874,70 @@ class OpenAIServing:
         # if _check_model has been called earlier, this will be unreachable
         raise ValueError(f"The model `{request.model}` does not exist.")
 
+    @staticmethod
+    def _maybe_get_steer_vector(
+        request: AnyRequest,
+    ) -> SteerVectorRequest | None:
+        """Convert SteerVectorRequestParam from the API request to a
+        SteerVectorRequest object for the engine.
+
+        Returns None if no steer_vector_request is specified in the request.
+        """
+        param: SteerVectorRequestParam | None = getattr(
+            request, "steer_vector_request", None
+        )
+        if param is None:
+            return None
+
+        # Auto-generate name and ID if not provided
+        steer_name = param.steer_vector_name or f"sv_{random_uuid()[:8]}"
+        steer_id = param.steer_vector_int_id or _next_steer_vector_id()
+
+        # Convert VectorConfigParam list to VectorConfig list
+        vector_configs = None
+        if param.vector_configs is not None:
+            vector_configs = [
+                VectorConfig(
+                    path=vc.path,
+                    scale=vc.scale,
+                    target_layers=vc.target_layers,
+                    prefill_trigger_tokens=vc.prefill_trigger_tokens,
+                    prefill_trigger_positions=vc.prefill_trigger_positions,
+                    prefill_exclude_tokens=vc.prefill_exclude_tokens,
+                    prefill_exclude_positions=vc.prefill_exclude_positions,
+                    generate_trigger_tokens=vc.generate_trigger_tokens,
+                    generate_first_k_tokens=vc.generate_first_k_tokens,
+                    generate_after_k_tokens=vc.generate_after_k_tokens,
+                    algorithm=vc.algorithm,
+                    normalize=vc.normalize,
+                )
+                for vc in param.vector_configs
+            ]
+
+        return SteerVectorRequest(
+            steer_vector_name=steer_name,
+            steer_vector_int_id=steer_id,
+            steer_vector_local_path=param.steer_vector_local_path,
+            debug=param.debug,
+            conflict_resolution=param.conflict_resolution,
+            scale=param.scale,
+            target_layers=param.target_layers,
+            prefill_trigger_tokens=param.prefill_trigger_tokens,
+            prefill_trigger_positions=param.prefill_trigger_positions,
+            prefill_exclude_tokens=param.prefill_exclude_tokens,
+            prefill_exclude_positions=param.prefill_exclude_positions,
+            generate_trigger_tokens=param.generate_trigger_tokens,
+            generate_first_k_tokens=param.generate_first_k_tokens,
+            generate_after_k_tokens=param.generate_after_k_tokens,
+            algorithm=param.algorithm,
+            normalize=param.normalize,
+            vector_configs=vector_configs,
+            moe_expert_ids=param.moe_expert_ids,
+            moe_mode=param.moe_mode,
+            moe_lambda=param.moe_lambda,
+            moe_topk=param.moe_topk,
+        )
+
     def _get_message_types(self, request: AnyRequest) -> set[str]:
         """Retrieve the set of types from message content dicts up
         until `_`; we use this to match potential multimodal data
@@ -1229,6 +1296,7 @@ class OpenAIServing:
         params: SamplingParams | PoolingParams,
         *,
         lora_request: LoRARequest | None,
+        steer_vector_request: SteerVectorRequest | None = None,
         trace_headers: Mapping[str, str] | None,
         priority: int,
     ) -> tuple[EngineCoreRequest, dict[str, Any]]:
@@ -1243,6 +1311,7 @@ class OpenAIServing:
             engine_prompt,
             params,
             lora_request=lora_request,
+            steer_vector_request=steer_vector_request,
             tokenization_kwargs=tokenization_kwargs,
             trace_headers=trace_headers,
             priority=priority,
