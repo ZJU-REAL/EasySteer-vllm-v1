@@ -83,6 +83,17 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
         if vector_idx in self.vector_scales:
             del self.vector_scales[vector_idx]
 
+    def _all_vectors_global(self) -> bool:
+        """Check if all sub-vectors are globally configured (both phases use -1 trigger).
+        
+        When True, the fast path can be used: apply _transform directly on the full
+        hidden_states tensor without any index_select/index_copy or GPU-CPU sync.
+        """
+        return all(
+            algo.params.is_global_only_config()
+            for algo in self.vector_algorithms.values()
+        )
+
     def apply_intervention(
         self, 
         hidden_states: torch.Tensor,
@@ -101,6 +112,28 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
         if not self.vector_algorithms:
             return hidden_states
 
+        # ========== Fast Path: All vectors are globally configured ==========
+        # When all sub-vectors use prefill_trigger_tokens=[-1] AND generate_trigger_tokens=[-1]
+        # with no exclusions, we can apply each _transform directly on the full tensor.
+        # This matches the single-vector fast path: zero GPU-CPU sync, no index ops.
+        if self._all_vectors_global():
+            if self.params.debug:
+                print(f"[MultiVector] ✨ Fast Path: All {len(self.vector_algorithms)} vectors "
+                      f"are globally configured, applying direct transforms to ALL "
+                      f"{hidden_states.shape[0]} tokens")
+            original_dtype = hidden_states.dtype
+            for vector_idx in sorted(self.vector_algorithms.keys()):
+                algo = self.vector_algorithms[vector_idx]
+                algo.set_active_tensor(0)
+                params = algo._get_params()
+                if algo._is_valid(params):
+                    hidden_states = algo._transform(hidden_states, params).to(original_dtype)
+                    if self.params.debug:
+                        scale = self.vector_scales.get(vector_idx, 1.0)
+                        print(f"[MultiVector]   Applied vector {vector_idx} (scale={scale})")
+            return hidden_states
+
+        # ========== Normal Path: Token-Level Control ==========
         # Get context information - either from provided context_info or fetch from forward context
         if context_info is not None:
             # Use provided context (e.g., from MoE layer wrapper)
@@ -122,12 +155,12 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
         if self.params.debug:
             self._debug_print_batch_info(samples_info, class_name="MultiVector")
         
-        # ========== Step 1: Collect all target positions for each vector ==========
-        # Use GPU-optimized position collection from each algorithm
-        vector_to_positions: Dict[int, Set[int]] = {}
-        position_to_vectors: Dict[int, List[int]] = {}  # For conflict detection
+        # ========== Step 1: Collect all target positions for each vector (GPU tensors) ==========
+        # Keep positions as GPU tensors to avoid GPU-CPU sync in this step.
+        sorted_vector_indices = sorted(self.vector_algorithms.keys())
+        vector_to_positions_tensor: Dict[int, torch.Tensor] = {}
 
-        for vector_idx in sorted(self.vector_algorithms.keys()):
+        for vector_idx in sorted_vector_indices:
             algo = self.vector_algorithms[vector_idx]
             
             # Prepare algorithm parameters
@@ -136,71 +169,75 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
             if not algo._is_valid(params):
                 continue
             
-            # 🚀 Use parameter controller to collect intervention positions
+            # Collect intervention positions - result stays on GPU
             positions_tensor = algo.params.collect_intervention_positions(
                 hidden_states=hidden_states,
                 current_tokens=current_tokens,
                 samples_info=samples_info
             )
             
-            # Single GPU↔CPU sync per vector
             if positions_tensor is not None and positions_tensor.numel() > 0:
-                positions_list = positions_tensor.tolist()
-                vector_to_positions[vector_idx] = set(positions_list)
-                
-                # Build position->vectors mapping for conflict detection
-                for pos in positions_list:
-                    if pos not in position_to_vectors:
-                        position_to_vectors[pos] = []
-                    position_to_vectors[pos].append(vector_idx)
-        
+                vector_to_positions_tensor[vector_idx] = positions_tensor
+
         # ========== Step 2: Conflict resolution ==========
         if self.conflict_resolution == "error":
-            # Check for conflicts and raise error
-            for pos, vec_list in position_to_vectors.items():
-                if len(vec_list) > 1:
-                    raise ValueError(
-                        f"Multiple vectors conflict at position {pos}: vectors {vec_list}. "
-                        f"Set conflict_resolution='priority' to use the first vector, "
-                        f"or 'sequential' to apply all vectors in sequence."
-                    )
-        
+            # Check for conflicts using GPU set operations (one sync for reporting only)
+            for i, vi in enumerate(sorted_vector_indices):
+                if vi not in vector_to_positions_tensor:
+                    continue
+                for vj in sorted_vector_indices[i + 1:]:
+                    if vj not in vector_to_positions_tensor:
+                        continue
+                    # GPU intersection check
+                    pi = vector_to_positions_tensor[vi]
+                    pj = vector_to_positions_tensor[vj]
+                    conflicts = torch.isin(pi, pj)
+                    if conflicts.any():
+                        # Sync only to report error (exceptional path)
+                        conflict_positions = pi[conflicts].tolist()
+                        raise ValueError(
+                            f"Multiple vectors conflict at positions {conflict_positions}: "
+                            f"vectors [{vi}, {vj}]. "
+                            f"Set conflict_resolution='priority' to use the first vector, "
+                            f"or 'sequential' to apply all vectors in sequence."
+                        )
+
         elif self.conflict_resolution == "priority":
-            # Only keep the first vector for each conflicted position
-            for pos, vec_list in position_to_vectors.items():
-                if len(vec_list) > 1:
-                    # Remove access to this position from all vectors except the first
-                    for victim_vec_idx in vec_list[1:]:
-                        vector_to_positions[victim_vec_idx].discard(pos)
-                    
-                    if self.params.debug:
-                        print(f"[MultiVector] Conflict at position {pos}: "
-                              f"vectors {vec_list}, using vector {vec_list[0]} (priority mode)")
-        
+            # For each lower-priority vector, remove positions already claimed by
+            # higher-priority vectors. All operations stay on GPU.
+            claimed: Optional[torch.Tensor] = None
+            for vector_idx in sorted_vector_indices:
+                if vector_idx not in vector_to_positions_tensor:
+                    continue
+                positions = vector_to_positions_tensor[vector_idx]
+                if claimed is not None and claimed.numel() > 0:
+                    # Remove positions already claimed by higher-priority vectors
+                    keep_mask = ~torch.isin(positions, claimed)
+                    positions = positions[keep_mask]
+                    if positions.numel() == 0:
+                        del vector_to_positions_tensor[vector_idx]
+                        continue
+                    vector_to_positions_tensor[vector_idx] = positions
+                # Accumulate claimed positions
+                claimed = positions if claimed is None else torch.cat([claimed, positions])
+
+            if self.params.debug and claimed is not None:
+                print(f"[MultiVector] Priority mode: {claimed.numel()} total unique positions claimed")
+
         elif self.conflict_resolution == "sequential":
             # No filtering needed, all vectors will be applied in order
-            if self.params.debug:
-                for pos, vec_list in position_to_vectors.items():
-                    if len(vec_list) > 1:
-                        print(f"[MultiVector] Conflict at position {pos}: "
-                              f"vectors {vec_list}, applying all in sequence (sequential mode)")
+            pass
+
         else:
             raise ValueError(f"Unknown conflict resolution strategy: {self.conflict_resolution}")
         
-        # ========== Step 3: Apply vectors in order (one transform per vector) ==========
-        for vector_idx in sorted(self.vector_algorithms.keys()):
-            if vector_idx not in vector_to_positions:
+        # ========== Step 3: Apply vectors in order (GPU tensors, no sync) ==========
+        for vector_idx in sorted_vector_indices:
+            if vector_idx not in vector_to_positions_tensor:
                 continue
 
-            positions = sorted(vector_to_positions[vector_idx])
-            if not positions:
-                continue
-
+            indices_tensor = vector_to_positions_tensor[vector_idx]
             algo = self.vector_algorithms[vector_idx]
-            scale = self.vector_scales.get(vector_idx, 1.0)
-            
-            # Convert positions to tensor
-            indices_tensor = torch.tensor(positions, device=hidden_states.device, dtype=torch.long)
             
             # Prepare algorithm parameters
             algo.set_active_tensor(0)
@@ -210,7 +247,13 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
                 hidden_states = algo._batch_transform_tensor(hidden_states, indices_tensor, params)
                 
                 if self.params.debug:
-                    print(f"[MultiVector] Applied vector {vector_idx} (scale={scale}) to {len(positions)} positions: {positions[:10]}{'...' if len(positions) > 10 else ''}")
+                    scale = self.vector_scales.get(vector_idx, 1.0)
+                    # Sync only for debug output
+                    num_positions = indices_tensor.numel()
+                    positions_preview = indices_tensor[:10].tolist()
+                    print(f"[MultiVector] Applied vector {vector_idx} (scale={scale}) "
+                          f"to {num_positions} positions: "
+                          f"{positions_preview}{'...' if num_positions > 10 else ''}")
         
         return hidden_states
     
