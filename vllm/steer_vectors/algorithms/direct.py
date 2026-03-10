@@ -20,10 +20,13 @@ class DirectAlgorithm(AlgorithmTemplate):
     def _transform(self, hidden_state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """Apply direct addition: h' = h + vector (with optional normalization)."""
         if self.normalize:
-            norm_pre = torch.norm(hidden_state, dim=-1, keepdim=True)
+            # Compute in float32 to avoid overflow in float16 (max 65504).
+            # hidden state norms can reach ~12000, so the intermediate product
+            # transformed * norm_pre easily exceeds 65504 and produces inf.
+            norm_pre = torch.norm(hidden_state, dim=-1, keepdim=True).float()
             transformed = hidden_state + params
-            norm_post = torch.norm(transformed, dim=-1, keepdim=True)
-            return transformed * norm_pre / norm_post
+            norm_post = torch.norm(transformed, dim=-1, keepdim=True).float()
+            return (transformed.float() * norm_pre / norm_post).to(hidden_state.dtype)
         else:
             return hidden_state + params
 
