@@ -494,6 +494,7 @@ class LLM:
             output_type=RequestOutput,
             use_tqdm=use_tqdm,
             lora_request=lora_request,
+            steer_vector_request=steer_vector_request,
             tokenization_kwargs=tokenization_kwargs,
             priority=priority,
         )
@@ -503,6 +504,7 @@ class LLM:
         prompts: PromptType | Sequence[PromptType],
         sampling_params: SamplingParams | Sequence[SamplingParams] | None = None,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
+        steer_vector_request: Sequence[SteerVectorRequest] | SteerVectorRequest | None = None,
         priority: list[int] | None = None,
         use_tqdm: bool | Callable[..., tqdm] = True,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -1835,6 +1837,7 @@ class LLM:
         *,
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
+        steer_vector_request: Sequence[SteerVectorRequest] | SteerVectorRequest | None = None,
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
     ):
@@ -1843,6 +1846,7 @@ class LLM:
             params=params,
             use_tqdm=use_tqdm,
             lora_request=lora_request,
+            steer_vector_request=steer_vector_request,
             priority=priority,
             tokenization_kwargs=tokenization_kwargs,
         )
