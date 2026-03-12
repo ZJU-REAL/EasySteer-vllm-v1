@@ -182,6 +182,12 @@ class EngineCoreClient(ABC):
     def pin_lora(self, lora_id: int) -> bool:
         raise NotImplementedError
 
+    def add_steer_vector(self, steer_vector_request) -> bool:
+        raise NotImplementedError
+
+    def remove_steer_vector(self, steer_vector_id: int) -> bool:
+        raise NotImplementedError
+
     def save_sharded_state(
         self, path: str, pattern: str | None = None, max_size: int | None = None
     ) -> None:
@@ -251,6 +257,12 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def pin_lora_async(self, lora_id: int) -> bool:
+        raise NotImplementedError
+
+    async def add_steer_vector_async(self, steer_vector_request) -> bool:
+        raise NotImplementedError
+
+    async def remove_steer_vector_async(self, steer_vector_id: int) -> bool:
         raise NotImplementedError
 
     async def save_sharded_state_async(
@@ -342,6 +354,12 @@ class InprocClient(EngineCoreClient):
 
     def pin_lora(self, lora_id: int) -> bool:
         return self.engine_core.pin_lora(lora_id)
+
+    def add_steer_vector(self, steer_vector_request) -> bool:
+        return self.engine_core.add_steer_vector(steer_vector_request)
+
+    def remove_steer_vector(self, steer_vector_id: int) -> bool:
+        return self.engine_core.remove_steer_vector(steer_vector_id)
 
     def save_sharded_state(
         self, path: str, pattern: str | None = None, max_size: int | None = None
@@ -868,6 +886,12 @@ class SyncMPClient(MPClient):
     def pin_lora(self, lora_id: int) -> bool:
         return self.call_utility("pin_lora", lora_id)
 
+    def add_steer_vector(self, steer_vector_request) -> bool:
+        return self.call_utility("add_steer_vector", steer_vector_request)
+
+    def remove_steer_vector(self, steer_vector_id: int) -> bool:
+        return self.call_utility("remove_steer_vector", steer_vector_id)
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         self.call_utility("sleep", level, mode)
 
@@ -1127,6 +1151,12 @@ class AsyncMPClient(MPClient):
 
     async def pin_lora_async(self, lora_id: int) -> bool:
         return await self.call_utility_async("pin_lora", lora_id)
+
+    async def add_steer_vector_async(self, steer_vector_request) -> bool:
+        return await self.call_utility_async("add_steer_vector", steer_vector_request)
+
+    async def remove_steer_vector_async(self, steer_vector_id: int) -> bool:
+        return await self.call_utility_async("remove_steer_vector", steer_vector_id)
 
     async def save_sharded_state_async(
         self, path: str, pattern: str | None = None, max_size: int | None = None

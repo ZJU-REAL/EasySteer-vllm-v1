@@ -42,6 +42,7 @@ from .parallel import ParallelConfig
 from .profiler import ProfilerConfig
 from .scheduler import SchedulerConfig
 from .speculative import EagleModelTypes, SpeculativeConfig
+from .steer_vector import SteerVectorConfig
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config, replace
 from .weight_transfer import WeightTransferConfig
@@ -273,6 +274,8 @@ class VllmConfig:
     """Kernel configuration."""
     lora_config: LoRAConfig | None = None
     """LoRA configuration."""
+    steer_vector_config: SteerVectorConfig | None = None
+    """Steer Vector configuration."""
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
     structured_outputs_config: StructuredOutputsConfig = Field(
@@ -776,6 +779,20 @@ class VllmConfig:
                 "To workaround this limitation, vLLM will set 'ieee' input "
                 "precision for chunked prefill triton kernels."
             )
+
+        # Steer vectors wrap decoder layers and modify module state
+        # (e.g. algorithm dicts) during forward, which is incompatible
+        # with torch.compile / CUDA graphs.  Auto-enable eager mode.
+        if (
+            self.steer_vector_config is not None
+            and self.model_config is not None
+            and not self.model_config.enforce_eager
+        ):
+            logger.warning(
+                "Steer vectors are not compatible with torch.compile / "
+                "CUDA graphs. Setting enforce_eager=True automatically."
+            )
+            self.model_config.enforce_eager = True
 
         if self.model_config is not None and self.model_config.enforce_eager:
             logger.warning(

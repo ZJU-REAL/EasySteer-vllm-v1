@@ -151,6 +151,7 @@ class OpenAIServingCompletion(OpenAIServing):
 
         try:
             lora_request = self._maybe_get_adapters(request)
+            steer_vector_request = self._maybe_get_steer_vector(request)
         except (ValueError, TypeError, RuntimeError) as e:
             logger.exception("Error preparing request components")
             return self.create_error_response(e)
@@ -211,6 +212,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         sampling_params,
                         request_id_item,
                         lora_request=lora_request,
+                        steer_vector_request=steer_vector_request,
                         trace_headers=trace_headers,
                         priority=request.priority,
                         data_parallel_rank=data_parallel_rank,

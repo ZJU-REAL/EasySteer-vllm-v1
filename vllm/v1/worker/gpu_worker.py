@@ -37,6 +37,7 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.weight_transfer import WeightTransferEngineFactory
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -825,6 +826,54 @@ class Worker(WorkerBase):
 
     def pin_lora(self, lora_id: int) -> bool:
         return self.model_runner.pin_lora(lora_id)
+
+    def add_steer_vector(self, steer_vector_request: SteerVectorRequest) -> bool:
+        return self.model_runner.add_steer_vector(steer_vector_request)
+
+    def remove_steer_vector(self, steer_vector_id: int) -> bool:
+        return self.model_runner.remove_steer_vector(steer_vector_id)
+
+    # Hidden States Capture Methods
+    def enable_hidden_states_capture(self) -> None:
+        """Enable hidden states capture in the model runner."""
+        self.model_runner.enable_hidden_states_capture()
+
+    def disable_hidden_states_capture(self) -> None:
+        """Disable hidden states capture in the model runner."""
+        self.model_runner.disable_hidden_states_capture()
+
+    def get_captured_hidden_states(self) -> dict:
+        """Get captured hidden states from the model runner."""
+        return self.model_runner.get_captured_hidden_states()
+
+    def get_hidden_states_debug_info(self) -> dict:
+        """Get debug information about hidden states capture."""
+        return self.model_runner.get_hidden_states_debug_info()
+
+    def clear_hidden_states(self) -> None:
+        """Clear captured hidden states in the model runner."""
+        self.model_runner.clear_hidden_states()
+
+    # MoE Router Logits Capture Methods
+    def enable_moe_router_logits_capture(self) -> None:
+        """Enable MoE router logits capture in the model runner."""
+        self.model_runner.enable_moe_router_logits_capture()
+
+    def disable_moe_router_logits_capture(self) -> None:
+        """Disable MoE router logits capture in the model runner."""
+        self.model_runner.disable_moe_router_logits_capture()
+
+    def get_moe_router_logits(self) -> dict:
+        """Get captured MoE router logits from the model runner."""
+        return self.model_runner.get_moe_router_logits()
+
+    def get_moe_debug_info(self) -> dict:
+        """Get debug information about MoE router logits capture."""
+        return self.model_runner.get_moe_debug_info()
+
+    def clear_moe_router_logits(self) -> None:
+        """Clear captured MoE router logits in the model runner."""
+        self.model_runner.clear_moe_router_logits()
 
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.

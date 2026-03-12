@@ -207,6 +207,39 @@ class ForwardContext:
     batch_descriptor: BatchDescriptor | None = None
 
     ubatch_slices: UBatchSlices | None = None
+    
+    # Steer vector support: current tokens being processed
+    current_tokens: torch.Tensor | None = None
+    """Current batch token IDs being processed.
+    - Shape: (total_tokens,) - concatenated tokens from all samples in the batch
+    - Used by steer vectors for token-based triggers
+    - In V1 continuous batching, contains both decode and prefill tokens concatenated
+    """
+    
+    num_computed_tokens_cpu: torch.Tensor | None = None
+    """Number of cached/computed tokens for each request in the batch.
+    - Shape: (batch_size,)
+    - Used by steer vectors to correctly map prefill_trigger_positions 
+      when prefix caching is enabled
+    - Value 0 means no tokens are cached for that request
+    """
+    
+    num_output_tokens_cpu: torch.Tensor | None = None
+    """Number of output tokens already generated for each request in the batch.
+    - Shape: (batch_size,)
+    - Used by steer vectors for generate_first_k_tokens and generate_after_k_tokens
+    - Value 0 means this is the first generation token for that request
+    - Only relevant for decode phase requests
+    """
+    
+    query_start_loc: torch.Tensor | None = None
+    """Sample boundary offsets for the current batch.
+    - Shape: (num_samples + 1,) - cumulative token counts per sample
+    - Used by steer vectors to determine per-sample token boundaries
+      for position-based triggers (e.g. prefill_trigger_positions)
+    - Backend-agnostic: stored here to avoid relying on per-layer
+      attention metadata which varies across backends
+    """
 
     # If True, bypass the compiled model call, e.g. by using .forward() directly
     skip_compiled: bool = False
@@ -273,6 +306,10 @@ def create_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
+    current_tokens: torch.Tensor | None = None,
+    num_computed_tokens_cpu: torch.Tensor | None = None,
+    num_output_tokens_cpu: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -291,6 +328,10 @@ def create_forward_context(
         ubatch_slices=ubatch_slices,
         skip_compiled=skip_compiled,
         additional_kwargs=additional_kwargs or {},
+        current_tokens=current_tokens,
+        num_computed_tokens_cpu=num_computed_tokens_cpu,
+        num_output_tokens_cpu=num_output_tokens_cpu,
+        query_start_loc=query_start_loc,
     )
 
 
@@ -321,6 +362,10 @@ def set_forward_context(
     ubatch_slices: UBatchSlices | None = None,
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
+    current_tokens: torch.Tensor | None = None,
+    num_computed_tokens_cpu: torch.Tensor | None = None,
+    num_output_tokens_cpu: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -382,6 +427,10 @@ def set_forward_context(
         slot_mapping,
         additional_kwargs,
         skip_compiled,
+        current_tokens,
+        num_computed_tokens_cpu,
+        num_output_tokens_cpu,
+        query_start_loc,
     )
 
     try:

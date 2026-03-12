@@ -57,6 +57,7 @@ class BlockStored(KVCacheEvent):
     Retained for backward compatibility.
     """
 
+    steer_vector_id: int | None
     medium: str | None
     lora_name: str | None
 
