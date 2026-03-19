@@ -227,6 +227,48 @@ Unfortunately, some custom compile passes have to see the whole graph to be effe
 
 Long term, we've added the ability to partition the graph in Inductor instead of right after Dynamo. It can be enabled with `CompilationConfig.use_inductor_graph_partition=True` but is currently experimental and only available with `torch>=2.9`. This also increases compilation time as it has to compile the whole graph and cannot reuse piecewise compilation artifacts. Once vLLM supports 2.9, we plan to make this the default approach as it will also speed up piecewise cudagraph capture.
 
+## Steering Vectors and CUDA Graphs
+
+By default, enabling steering vectors (`--enable-steer-vector`) disables CUDA
+graphs because conditional steering (per-token trigger matching) uses
+data-dependent operations (`torch.isin`, `index_select`) incompatible with
+static graphs.
+
+If your workload only uses **global triggers** (`prefill_trigger_tokens=[-1]`,
+`generate_trigger_tokens=[-1]`), you can re-enable CUDA graphs for ~2x speedup:
+
+    --enable-steer-vector --steer-allow-cuda-graphs
+
+The global trigger path (`is_global_only_config()` fast path in `template.py`)
+applies a static tensor transformation to all tokens, which is CUDA-graph safe.
+Requests with non-global triggers will error loudly if sent while CUDA graphs
+are active.
+
+### How it works (and common pitfalls)
+
+`--steer-allow-cuda-graphs` makes **three** coupled config changes:
+
+1. Keeps `enforce_eager=False` (so CUDA graphs remain possible)
+2. Sets `CompilationMode.NONE` (disables `torch.compile`)
+3. Sets `CUDAGraphMode.FULL_DECODE_ONLY` (only full graphs, no piecewise)
+
+All three are necessary. The steering layer wrappers call
+`.algorithms.update()` during forward, which mutates module state. This is
+incompatible with `torch.compile` (causes `InternalTorchDynamoError` during
+graph tracing). Disabling compilation also means piecewise CUDA graphs are
+unavailable, so only `FULL_DECODE_ONLY` works (full graph capture for decode
+batches, eager for prefill/mixed).
+
+!!! warning "Greedy decoding may diverge between eager and CUDA graph modes"
+    At `temperature=0`, the same steered request may produce different tokens
+    after the first few positions. This is expected: `FULL_DECODE_ONLY`
+    captures decode steps into a static CUDA graph whose kernel fusion can
+    reorder float16 accumulations, changing which token wins the argmax at
+    each step. Both modes steer correctly (verified at `scale=0` where outputs
+    are identical, and at `scale>=4` where both show strong steering effects).
+    At `temperature>0` with sampling, this difference is negligible relative
+    to sampling noise.
+
 ## About the Performance
 
 See the following links for examples:
