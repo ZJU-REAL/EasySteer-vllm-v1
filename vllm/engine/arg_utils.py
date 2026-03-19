@@ -1022,7 +1022,7 @@ class EngineArgs:
             help=(
                 "Allow CUDA graphs when steering is enabled. Only safe when "
                 "all requests use global triggers (trigger_tokens=[-1]). "
-                "Can provide ~2x speedup for global-only steering workloads."
+                "Can provide ~2.6x speedup for global-only steering workloads."
             ),
         )
 

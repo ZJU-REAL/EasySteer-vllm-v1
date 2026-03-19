@@ -235,7 +235,7 @@ data-dependent operations (`torch.isin`, `index_select`) incompatible with
 static graphs.
 
 If your workload only uses **global triggers** (`prefill_trigger_tokens=[-1]`,
-`generate_trigger_tokens=[-1]`), you can re-enable CUDA graphs for ~2x speedup:
+`generate_trigger_tokens=[-1]`), you can re-enable CUDA graphs for ~2.6x speedup:
 
     --enable-steer-vector --steer-allow-cuda-graphs
 
