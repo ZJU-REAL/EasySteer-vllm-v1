@@ -485,6 +485,7 @@ class EngineArgs:
     # Steer Vector fields
     enable_steer_vector: bool = False
     max_steer_vectors: int = 1
+    steer_allow_cuda_graphs: bool = False
 
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
@@ -1014,6 +1015,15 @@ class EngineArgs:
             type=int,
             default=EngineArgs.max_steer_vectors,
             help="Maximum number of steer vectors in a single batch.",
+        )
+        steer_vector_group.add_argument(
+            "--steer-allow-cuda-graphs",
+            action=argparse.BooleanOptionalAction,
+            help=(
+                "Allow CUDA graphs when steering is enabled. Only safe when "
+                "all requests use global triggers (trigger_tokens=[-1]). "
+                "Can provide ~2x speedup for global-only steering workloads."
+            ),
         )
 
         # Observability arguments
@@ -1662,6 +1672,7 @@ class EngineArgs:
         steer_vector_config = (
             SteerVectorConfig(
                 max_steer_vectors=self.max_steer_vectors,
+                allow_cuda_graphs=bool(self.steer_allow_cuda_graphs),
             )
             if self.enable_steer_vector
             else None

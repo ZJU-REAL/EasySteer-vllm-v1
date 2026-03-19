@@ -619,17 +619,40 @@ class VllmConfig:
 
         # Steer vectors wrap decoder layers and modify module state
         # (e.g. algorithm dicts) during forward, which is incompatible
-        # with torch.compile / CUDA graphs.  Auto-enable eager mode.
+        # with torch.compile (piecewise compilation).  However, full
+        # CUDA graph capture (without compilation) works for the
+        # global-only trigger fast path in template.py.
         if (
             self.steer_vector_config is not None
             and self.model_config is not None
             and not self.model_config.enforce_eager
         ):
-            logger.warning(
-                "Steer vectors are not compatible with torch.compile / "
-                "CUDA graphs. Setting enforce_eager=True automatically."
-            )
-            self.model_config.enforce_eager = True
+            if self.steer_vector_config.allow_cuda_graphs:
+                # Disable torch.compile (incompatible with steering
+                # wrappers that mutate module state during forward),
+                # but keep full CUDA graphs for decode batches.
+                # We use FULL_DECODE_ONLY since piecewise CUDA graphs
+                # require compilation, and FULL requires attention
+                # backends to support cudagraphs for all batch types.
+                logger.info(
+                    "Steer vectors enabled with allow_cuda_graphs=True. "
+                    "Disabling torch.compile but keeping CUDA graphs "
+                    "(FULL_DECODE_ONLY). Only global triggers "
+                    "(trigger_tokens=[-1]) are safe in this mode."
+                )
+                self.model_config.enforce_eager = False
+                self.compilation_config.mode = CompilationMode.NONE
+                self.compilation_config.cudagraph_mode = (
+                    CUDAGraphMode.FULL_DECODE_ONLY
+                )
+            else:
+                logger.warning(
+                    "Steer vectors are not compatible with torch.compile / "
+                    "CUDA graphs. Setting enforce_eager=True automatically. "
+                    "Use --steer-allow-cuda-graphs to override if you only "
+                    "use global triggers (trigger_tokens=[-1])."
+                )
+                self.model_config.enforce_eager = True
 
         if (
             self.optimization_level > OptimizationLevel.O0

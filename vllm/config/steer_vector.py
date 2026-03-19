@@ -44,6 +44,13 @@ class SteerVectorConfig:
     steer_vector_dtype: SteerVectorDType = "auto"
     """Data type for steer vectors. If 'auto', will default to base model dtype."""
 
+    allow_cuda_graphs: bool = False
+    """Allow CUDA graphs when steering is enabled. Only safe when all
+    requests use global triggers (prefill_trigger_tokens=[-1],
+    generate_trigger_tokens=[-1]). Requests with non-global triggers will
+    error rather than silently produce wrong results. Default False
+    preserves the current conservative behavior."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -53,6 +60,7 @@ class SteerVectorConfig:
         factors: list[Any] = []
         factors.append(self.max_steer_vectors)
         factors.append(self.steer_vector_dtype)
+        factors.append(self.allow_cuda_graphs)
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False
