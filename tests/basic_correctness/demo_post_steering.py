@@ -11,7 +11,8 @@ A single self-contained script that:
 
 Usage:
     cd EasySteer/vllm-steer
-    CUDA_VISIBLE_DEVICES=0 .venv/bin/python tests/basic_correctness/demo_post_steering.py
+    CUDA_VISIBLE_DEVICES=0 .venv/bin/python \
+        tests/basic_correctness/demo_post_steering.py
 """
 from __future__ import annotations
 
@@ -105,7 +106,10 @@ def get_steering() -> dict:
 def post_steering(scale: float) -> dict:
     r = httpx.post(f"{BASE_URL}/v1/steering", json={"scale": scale}, timeout=30.0)
     if r.status_code != 200:
-        raise RuntimeError(f"POST /v1/steering failed ({r.status_code}): {r.text[:500]}")
+        raise RuntimeError(
+            f"POST /v1/steering failed ({r.status_code}):"
+            f" {r.text[:500]}"
+        )
     return r.json()
 
 
@@ -116,7 +120,7 @@ def start_server() -> subprocess.Popen:
         "--model", MODEL,
         "--steer-vector-path", VECTOR_PATH,
         "--steer-scale", "4.0",
-        "--steer-target-layers", *[str(l) for l in TARGET_LAYERS],
+        "--steer-target-layers", *[str(layer) for layer in TARGET_LAYERS],
         "--steer-normalize",
         "--port", str(PORT),
         "--gpu-memory-utilization", "0.4",
@@ -125,7 +129,7 @@ def start_server() -> subprocess.Popen:
         "--no-enable-chunked-prefill",
     ]
     log_path = "/tmp/vllm_post_steering_test.log"
-    log_file = open(log_path, "w")
+    log_file = open(log_path, "w")  # noqa: SIM115
     print(f"  Starting server (log: {log_path})")
     proc = subprocess.Popen(
         cmd,
@@ -191,7 +195,8 @@ def main() -> None:
         print(f"  Logprobs[:5]: {[f'{lp:.4f}' for lp in lps_s0[:5]]}")
         output_changed = text_s4 != text_s0
         results.append(("scale=0.0 produces different output", output_changed))
-        print(f"  Texts differ: {output_changed} -> {'PASS' if output_changed else 'FAIL'}")
+        status = "PASS" if output_changed else "FAIL"
+        print(f"  Texts differ: {output_changed} -> {status}")
 
         # ── Step 4: POST scale=4.0, verify logprobs restored ─────
         print("\n[Step 4] POST scale=4.0 (restore), then generate")
@@ -203,7 +208,8 @@ def main() -> None:
 
         tokens_match = text_s4 == text_s4b
         results.append(("Restored text matches original", tokens_match))
-        print(f"  Texts match: {tokens_match} -> {'PASS' if tokens_match else 'FAIL'}")
+        tm_status = "PASS" if tokens_match else "FAIL"
+        print(f"  Texts match: {tokens_match} -> {tm_status}")
 
         if lps_s4 and lps_s4b:
             max_diff = max(
@@ -211,7 +217,8 @@ def main() -> None:
             )
             lp_ok = max_diff <= LOGPROB_ATOL
             results.append((f"Restored logprob max_diff={max_diff:.6f}", lp_ok))
-            print(f"  Logprob max diff: {max_diff:.6f} -> {'PASS' if lp_ok else 'FAIL'}")
+            lp_status = "PASS" if lp_ok else "FAIL"
+            print(f"  Logprob max diff: {max_diff:.6f} -> {lp_status}")
 
         # ── Step 5: Per-request steering is rejected ──────────────
         print("\n[Step 5] Per-request steer_vector_request should be rejected")

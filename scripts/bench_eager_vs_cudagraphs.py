@@ -66,7 +66,7 @@ def start_server(
         cmd += [
             "--steer-vector-path", vector_path,
             "--steer-scale", str(scale),
-            "--steer-target-layers", *[str(l) for l in TARGET_LAYERS],
+            "--steer-target-layers", *[str(layer) for layer in TARGET_LAYERS],
             "--steer-normalize",
         ]
     else:
@@ -77,9 +77,12 @@ def start_server(
     mode = "server-level + CUDA graphs" if server_level else "per-request + eager"
     log = f"/tmp/vllm_bench_{'cg' if server_level else 'eager'}.log"
     print(f"  Starting {mode} server (log: {log})")
-    f = open(log, "w")
-    proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env={**os.environ})
-    proc._log = f  # type: ignore[attr-defined]
+    log_file = open(log, "w")  # noqa: SIM115
+    proc = subprocess.Popen(
+        cmd, stdout=log_file, stderr=subprocess.STDOUT,
+        env={**os.environ},
+    )
+    proc._log = log_file  # type: ignore[attr-defined]
     return proc
 
 
@@ -186,7 +189,10 @@ def main() -> None:
     proc = start_server(vector_path, args.scale, server_level=False)
     try:
         wait_for_server(PORT)
-        eager = bench(vector_path, args.scale, args.n, args.max_tokens, per_request=True)
+        eager = bench(
+            vector_path, args.scale, args.n, args.max_tokens,
+            per_request=True,
+        )
     finally:
         stop_server(proc)
     print(f"  {eager}")
@@ -204,18 +210,44 @@ def main() -> None:
     print()
 
     # ── Summary ──────────────────────────────────────────────────
-    speedup = eager["elapsed_s"] / cg["elapsed_s"] if cg["elapsed_s"] > 0 else float("inf")
-    tps_speedup = cg["tokens_per_sec"] / eager["tokens_per_sec"] if eager["tokens_per_sec"] > 0 else float("inf")
+    speedup = (
+        eager["elapsed_s"] / cg["elapsed_s"]
+        if cg["elapsed_s"] > 0
+        else float("inf")
+    )
+    tps_speedup = (
+        cg["tokens_per_sec"] / eager["tokens_per_sec"]
+        if eager["tokens_per_sec"] > 0
+        else float("inf")
+    )
 
     print("=" * 60)
     print("RESULTS")
     print("=" * 60)
-    print(f"  {'':>25} {'Eager':>12} {'CUDA graphs':>12} {'Speedup':>10}")
+    hdr = f"  {'':>25} {'Eager':>12} {'CUDA graphs':>12}"
+    print(f"{hdr} {'Speedup':>10}")
     print(f"  {'-'*60}")
-    print(f"  {'Tokens':>25} {eager['total_tokens']:>12} {cg['total_tokens']:>12}")
-    print(f"  {'Wall time':>25} {eager['elapsed_s']:>11.1f}s {cg['elapsed_s']:>11.1f}s {speedup:>9.2f}x")
-    print(f"  {'Throughput (tok/s)':>25} {eager['tokens_per_sec']:>12.1f} {cg['tokens_per_sec']:>12.1f} {tps_speedup:>9.2f}x")
-    print(f"  {'Avg latency (ms)':>25} {eager['avg_latency_ms']:>12.1f} {cg['avg_latency_ms']:>12.1f}")
+    e_tok = eager['total_tokens']
+    c_tok = cg['total_tokens']
+    print(f"  {'Tokens':>25} {e_tok:>12} {c_tok:>12}")
+    e_t = eager['elapsed_s']
+    c_t = cg['elapsed_s']
+    print(
+        f"  {'Wall time':>25} {e_t:>11.1f}s"
+        f" {c_t:>11.1f}s {speedup:>9.2f}x"
+    )
+    e_tps = eager['tokens_per_sec']
+    c_tps = cg['tokens_per_sec']
+    print(
+        f"  {'Throughput (tok/s)':>25} {e_tps:>12.1f}"
+        f" {c_tps:>12.1f} {tps_speedup:>9.2f}x"
+    )
+    e_lat = eager['avg_latency_ms']
+    c_lat = cg['avg_latency_ms']
+    print(
+        f"  {'Avg latency (ms)':>25}"
+        f" {e_lat:>12.1f} {c_lat:>12.1f}"
+    )
 
 
 if __name__ == "__main__":

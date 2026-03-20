@@ -31,10 +31,10 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from pathlib import Path
 
 import torch
+
 from vllm import LLM, SamplingParams
 from vllm.steer_vectors.request import SteerVectorRequest
 
@@ -119,7 +119,7 @@ def compare(
         )
         global_max = max(global_max, max_diff)
 
-    if expect_same:
+    if expect_same:  # noqa: SIM108
         passed = all_match and global_max <= LOGPROB_ATOL
     else:
         passed = not all_match  # at least one prompt should differ
@@ -174,7 +174,11 @@ def run_check(
         detail = f"max_diff={max_diff:.6f} (tol={LOGPROB_ATOL})"
     else:
         status = "PASS" if passed else "FAIL"
-        detail = "outputs differ" if passed else "outputs are IDENTICAL (steering had no effect!)"
+        detail = (
+            "outputs differ"
+            if passed
+            else "outputs are IDENTICAL (steering had no effect!)"
+        )
     print(f"  [{status}] {name}: {detail}")
     return passed
 
@@ -196,8 +200,14 @@ def main() -> None:
         "--target-layers", type=int, nargs="+", required=True,
         help="Layer indices to steer",
     )
-    parser.add_argument("--scale", type=float, default=4.0, help="Steering scale for comparison")
-    parser.add_argument("--max-tokens", type=int, default=40, help="Tokens to generate per prompt")
+    parser.add_argument(
+        "--scale", type=float, default=4.0,
+        help="Steering scale for comparison",
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=40,
+        help="Tokens to generate per prompt",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.4)
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--no-normalize", dest="normalize", action="store_false")
@@ -230,13 +240,15 @@ def main() -> None:
     print("[1/5] Plain vLLM, chunked_prefill=True")
     llm = make_llm(**common, chunked_prefill=True)
     plain_chunked = generate(llm, prompts, args.max_tokens)
-    del llm; torch.cuda.empty_cache()
+    del llm
+    torch.cuda.empty_cache()
 
     # ── 2. Plain chunked OFF ─────────────────────────────────────
     print("[2/5] Plain vLLM, chunked_prefill=False")
     llm = make_llm(**common, chunked_prefill=False)
     plain_nochunk = generate(llm, prompts, args.max_tokens)
-    del llm; torch.cuda.empty_cache()
+    del llm
+    torch.cuda.empty_cache()
 
     # ── 3. Steered scale=0, eager ────────────────────────────────
     print("[3/5] Steered vLLM, scale=0, eager")
@@ -245,7 +257,8 @@ def main() -> None:
         target_layers=args.target_layers, normalize=args.normalize,
     )
     steered_s0 = generate(llm, prompts, args.max_tokens)
-    del llm; torch.cuda.empty_cache()
+    del llm
+    torch.cuda.empty_cache()
 
     # ── 4. Steered scale=N, eager ────────────────────────────────
     print(f"[4/5] Steered vLLM, scale={args.scale}, eager")
@@ -254,7 +267,8 @@ def main() -> None:
         target_layers=args.target_layers, normalize=args.normalize,
     )
     steered_eager = generate(llm, prompts, args.max_tokens)
-    del llm; torch.cuda.empty_cache()
+    del llm
+    torch.cuda.empty_cache()
 
     # ── 5. Steered scale=N, CUDA graphs ──────────────────────────
     print(f"[5/5] Steered vLLM, scale={args.scale}, CUDA graphs")
@@ -264,7 +278,8 @@ def main() -> None:
         target_layers=args.target_layers, normalize=args.normalize,
     )
     steered_cg = generate(llm, prompts, args.max_tokens)
-    del llm; torch.cuda.empty_cache()
+    del llm
+    torch.cuda.empty_cache()
 
     # ── Results ──────────────────────────────────────────────────
     print()

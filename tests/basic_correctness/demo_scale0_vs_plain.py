@@ -6,14 +6,15 @@ setting is introducing numerical differences.
 
 Usage:
     cd EasySteer/vllm-steer
-    CUDA_VISIBLE_DEVICES=0 .venv/bin/python tests/basic_correctness/demo_scale0_vs_plain.py
+    CUDA_VISIBLE_DEVICES=0 .venv/bin/python \
+        tests/basic_correctness/demo_scale0_vs_plain.py
 """
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 import torch
+
 from vllm import LLM, SamplingParams
 
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
@@ -170,7 +171,12 @@ def compare(
         ok = match and max_diff <= LOGPROB_ATOL
         if not ok:
             all_pass = False
-        print(f"{i:6d} {len(toks_a):7d} {'yes' if match else 'NO':>6} {max_diff:12.6f}{'  ***' if not ok else ''}")
+        flag = "  ***" if not ok else ""
+        match_s = "yes" if match else "NO"
+        print(
+            f"{i:6d} {len(toks_a):7d} {match_s:>6}"
+            f" {max_diff:12.6f}{flag}"
+        )
 
     print(f"Global max diff: {global_max:.6f} (tol={LOGPROB_ATOL})")
     return all_pass

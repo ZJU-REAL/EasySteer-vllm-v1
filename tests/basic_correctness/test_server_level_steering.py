@@ -10,7 +10,6 @@ Run with:
 from __future__ import annotations
 
 import torch
-import pytest
 
 # ── SteerVectorConfig tests ──────────────────────────────────────────
 
@@ -99,7 +98,8 @@ class _DummyAlgorithm:
     """Minimal concrete subclass for testing AlgorithmTemplate."""
 
     def __new__(cls):
-        from typing import Any, Dict
+        from typing import Any
+
         from vllm.steer_vectors.algorithms.template import AlgorithmTemplate
 
         class _Impl(AlgorithmTemplate):
@@ -111,14 +111,14 @@ class _DummyAlgorithm:
             @classmethod
             def load_from_path(
                 cls, path: str, device: str, **kwargs: Any
-            ) -> Dict[str, Any]:
+            ) -> dict[str, Any]:
                 return {"payload": torch.zeros(10)}
 
         return _Impl(layer_id=0)
 
 
 class TestTemplateBufferReuse:
-    """Tests for the in-place buffer strategy in set_steer_vector / set_active_tensor."""
+    """Tests for in-place buffer strategy in set_steer_vector."""
 
     def test_first_load_creates_buffer(self) -> None:
         algo = _DummyAlgorithm()

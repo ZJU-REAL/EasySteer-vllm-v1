@@ -3,7 +3,6 @@
 
 """Mixin for SteerVector support in V1 GPUModelRunner."""
 
-import logging
 from typing import TYPE_CHECKING
 
 import torch.nn as nn
@@ -13,7 +12,6 @@ from vllm.steer_vectors.request import SteerVectorRequest
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.steer_vectors.worker_manager import WorkerSteerVectorManager
 
 logger = init_logger(__name__)
 
@@ -120,6 +118,7 @@ class SteerVectorModelRunnerMixin:
         # Handle msgspec deserialization - convert list back to SteerVectorRequest
         if isinstance(steer_vector_request, (list, tuple)):
             import msgspec
+
             from vllm.steer_vectors.request import SteerVectorRequest as SVR
             steer_vector_request = msgspec.convert(steer_vector_request, type=SVR)
         
@@ -151,12 +150,15 @@ class SteerVectorModelRunnerMixin:
         and stays active. No per-request vectors should arrive (rejected upstream).
 
         Args:
-            steer_vector_requests: Set of SteerVectorRequest objects for the current batch
+            steer_vector_requests: Set of SteerVectorRequest objects
+                for the current batch.
         """
-        if not hasattr(self, "steer_vector_manager") or self.steer_vector_manager is None:
+        mgr = getattr(self, "steer_vector_manager", None)
+        if mgr is None:
             if steer_vector_requests:
                 raise RuntimeError(
-                    "SteerVector is not enabled. Use --enable-steer-vector to enable SteerVector."
+                    "SteerVector is not enabled. Use"
+                    " --enable-steer-vector to enable it."
                 )
             return
 

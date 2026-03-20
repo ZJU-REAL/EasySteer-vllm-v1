@@ -19,11 +19,11 @@ Usage:
 """
 from __future__ import annotations
 
-import math
 import time
 from pathlib import Path
 
 import torch
+
 from vllm import LLM, SamplingParams
 from vllm.steer_vectors.request import SteerVectorRequest
 
@@ -120,7 +120,10 @@ def run_old_way(prompts: list[str]) -> tuple[list, float]:
     )
 
     t0 = time.perf_counter()
-    outputs = llm.generate(prompts, sampling_params=sampling, steer_vector_request=steer_req)
+    outputs = llm.generate(
+        prompts, sampling_params=sampling,
+        steer_vector_request=steer_req,
+    )
     elapsed = time.perf_counter() - t0
 
     results = extract_logprobs(outputs)
@@ -218,13 +221,20 @@ def compare(
         if not tokens_match or max_diff > LOGPROB_ATOL:
             all_pass = False
 
-        print(f"{i:5d} {n_tokens:7d} {'yes' if tokens_match else 'NO':>6} {max_diff:10.6f} {status:>8}")
+        match_s = "yes" if tokens_match else "NO"
+        print(
+            f"{i:5d} {n_tokens:7d} {match_s:>6}"
+            f" {max_diff:10.6f} {status:>8}"
+        )
 
     # Show first prompt detail as a spot check
     print(f"\nSpot check — Prompt 0: {PROMPTS[0]!r}")
     old_tokens, old_lps = old_results[0]
     new_tokens, new_lps = new_results[0]
-    print(f"  {'pos':>4} {'old_tok':>16} {'old_lp':>10} {'new_tok':>16} {'new_lp':>10} {'diff':>8}")
+    print(
+        f"  {'pos':>4} {'old_tok':>16} {'old_lp':>10}"
+        f" {'new_tok':>16} {'new_lp':>10} {'diff':>8}"
+    )
     print(f"  {'-'*66}")
     for j in range(min(10, len(old_lps))):
         diff = abs(old_lps[j] - new_lps[j])
@@ -241,7 +251,7 @@ def compare(
     new_tps = total_tokens / new_time
 
     print(f"\n{'='*70}")
-    print(f"SUMMARY")
+    print("SUMMARY")
     print(f"{'='*70}")
     print(f"  Prompts:          {len(old_results)}")
     print(f"  Tokens/prompt:    {MAX_TOKENS}")
@@ -252,9 +262,10 @@ def compare(
     print(f"  Speedup:          {speedup:.2f}x")
 
     if all_pass:
-        print(f"\n*** ALL {len(old_results)} PROMPTS PASSED — logprobs are allclose ***")
+        n = len(old_results)
+        print(f"\n*** ALL {n} PROMPTS PASSED -- logprobs allclose ***")
     else:
-        print(f"\n*** SOME CHECKS FAILED — see table above ***")
+        print("\n*** SOME CHECKS FAILED — see table above ***")
 
 
 def main() -> None:
