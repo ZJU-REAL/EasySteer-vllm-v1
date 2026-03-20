@@ -234,8 +234,51 @@ graphs because conditional steering (per-token trigger matching) uses
 data-dependent operations (`torch.isin`, `index_select`) incompatible with
 static graphs.
 
+### Server-level steering (recommended)
+
+The simplest way to use steering with CUDA graphs is **server-level steering**:
+configure the steering vector at server startup so every request is steered
+identically.  The vector loads *before* CUDA graph capture, so graphs record
+the steered forward path.
+
+```bash
+vllm serve Qwen/Qwen2.5-1.5B-Instruct \
+  --steer-vector-path vectors/happy.gguf \
+  --steer-scale 4.0 \
+  --steer-target-layers 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 \
+  --steer-normalize
+```
+
+`--steer-vector-path` implies `--enable-steer-vector` and
+`--steer-allow-cuda-graphs`.  Requests need no `steer_vector_request` — steering
+is applied server-side.  Per-request `steer_vector_request` is **rejected** to
+prevent silent config conflicts.
+
+#### Runtime reconfiguration
+
+The `scale` can be changed at runtime via the admin endpoint:
+
+```bash
+# Change scale
+curl -X POST http://localhost:8017/v1/steering \
+  -d '{"scale": 2.0}'
+
+# Disable steering (scale=0 is a no-op)
+curl -X POST http://localhost:8017/v1/steering \
+  -d '{"scale": 0.0}'
+
+# Check current config
+curl http://localhost:8017/v1/steering
+```
+
+Only `scale` changes are supported without CUDA graph re-capture.  Structural
+changes (different vector path, layers, algorithm) require a server restart.
+
+### Per-request steering with CUDA graphs (advanced)
+
 If your workload only uses **global triggers** (`prefill_trigger_tokens=[-1]`,
-`generate_trigger_tokens=[-1]`), you can re-enable CUDA graphs for ~2.6x speedup:
+`generate_trigger_tokens=[-1]`), you can re-enable CUDA graphs for ~2.6x speedup
+without server-level steering:
 
     --enable-steer-vector --steer-allow-cuda-graphs
 
@@ -246,7 +289,8 @@ are active.
 
 ### How it works (and common pitfalls)
 
-`--steer-allow-cuda-graphs` makes **three** coupled config changes:
+Both `--steer-vector-path` and `--steer-allow-cuda-graphs` make **three**
+coupled config changes:
 
 1. Keeps `enforce_eager=False` (so CUDA graphs remain possible)
 2. Sets `CompilationMode.NONE` (disables `torch.compile`)
@@ -259,15 +303,42 @@ graph tracing). Disabling compilation also means piecewise CUDA graphs are
 unavailable, so only `FULL_DECODE_ONLY` works (full graph capture for decode
 batches, eager for prefill/mixed).
 
-!!! warning "Greedy decoding may diverge between eager and CUDA graph modes"
-    At `temperature=0`, the same steered request may produce different tokens
-    after the first few positions. This is expected: `FULL_DECODE_ONLY`
-    captures decode steps into a static CUDA graph whose kernel fusion can
-    reorder float16 accumulations, changing which token wins the argmax at
-    each step. Both modes steer correctly (verified at `scale=0` where outputs
-    are identical, and at `scale>=4` where both show strong steering effects).
-    At `temperature>0` with sampling, this difference is negligible relative
-    to sampling noise.
+For server-level steering, the vector is loaded during model initialization
+(in `_wrap_model_with_steer_vectors()`) before any CUDA graph capture.
+The `AlgorithmTemplate.set_steer_vector()` uses an in-place buffer strategy
+so that runtime scale changes via `POST /v1/steering` can `copy_()` into the
+same tensor address without invalidating captured graphs.
+
+!!! tip "Run the verification script before experiments"
+    Before running any experiments that depend on steering correctness,
+    verify your model/hardware combination:
+
+        CUDA_VISIBLE_DEVICES=0 python scripts/verify_steering_correctness.py \
+            --model Qwen/Qwen2.5-1.5B-Instruct \
+            --vector vectors/happy_diffmean.gguf \
+            --target-layers 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25
+
+    This checks: (1) disabling chunked prefill is safe, (2) scale=0 steering
+    is transparent, (3) CUDA graphs match eager mode, (4) steering actually
+    changes output.  All four must pass.
+
+!!! danger "Chunked prefill and prefix caching MUST be disabled with steering"
+    When steering is enabled, `enable_chunked_prefill` and
+    `enable_prefix_caching` are automatically forced to `False`.
+    Chunked prefill is not supported by the steering wrappers.
+    Prefix caching keys on `steer_vector_name` but NOT on `scale` —
+    reusing KV states across different scales silently disables steering.
+    This caused a real data-invalidation bug (commit `9b999cb`).  The
+    vLLM config validation now enforces this automatically, but you should
+    still set the flags explicitly for clarity.
+
+!!! success "Greedy decoding is bit-identical between eager and CUDA graph modes"
+    With server-level steering and the mandatory settings (chunked prefill
+    and prefix caching disabled), eager and CUDA graph modes produce
+    **identical logprobs** (diff = 0.000000) at `temperature=0`.  Earlier
+    observations of divergence were caused by prefix caching silently
+    reusing KV states across different steering scales (fixed in commit
+    `9b999cb`), not by float precision differences in CUDA graph capture.
 
 ## About the Performance
 

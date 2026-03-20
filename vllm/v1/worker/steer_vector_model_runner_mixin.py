@@ -37,19 +37,72 @@ class SteerVectorModelRunnerMixin:
 
     def _wrap_model_with_steer_vectors(self, model: nn.Module) -> nn.Module:
         """Wrap the model to support steer vectors.
-        
+
         This should be called in load_model() after the model is loaded.
+        If server-level steering is configured, also loads and activates
+        the steering vector so it is baked in before CUDA graph capture.
         """
         # Lazy initialization: check if steer_vector_config is enabled
         if not hasattr(self, 'steer_vector_manager'):
             self.steer_vector_manager = None
             if hasattr(self, 'vllm_config') and self.vllm_config.steer_vector_config:  # type: ignore
                 self._init_steer_vector_manager(self.vllm_config)  # type: ignore
-        
+
         if self.steer_vector_manager is not None:
             logger.info("Wrapping model with steer vector support")
             model = self.steer_vector_manager.create_steer_vector_manager(model)
+            # If server-level steering is configured, load the vector now
+            # (before CUDA graph capture) so graphs record the steered path.
+            self._maybe_load_server_steer_vector()
         return model
+
+    def _maybe_load_server_steer_vector(self) -> None:
+        """Load and activate the server-level steering vector if configured.
+
+        This must run after create_steer_vector_manager() wraps the model
+        but before CUDA graph capture, so graphs record the steered forward
+        path rather than the identity path.
+        """
+        if self.steer_vector_manager is None:
+            return
+        steer_config = getattr(self, 'vllm_config', None)
+        if steer_config is None:
+            return
+        steer_config = steer_config.steer_vector_config  # type: ignore
+        if steer_config is None or not steer_config.has_server_config:
+            return
+
+        logger.info(
+            "Loading server-level steering vector: path=%s, scale=%s, "
+            "layers=%s, algorithm=%s, normalize=%s",
+            steer_config.server_vector_path,
+            steer_config.server_scale,
+            steer_config.server_target_layers,
+            steer_config.server_algorithm,
+            steer_config.server_normalize,
+        )
+
+        # Build a SteerVectorRequest from the server config
+        server_request = SteerVectorRequest(
+            steer_vector_name="__server__",
+            steer_vector_int_id=1,
+            steer_vector_local_path=steer_config.server_vector_path,
+            scale=steer_config.server_scale,
+            target_layers=steer_config.server_target_layers,
+            algorithm=steer_config.server_algorithm,
+            normalize=steer_config.server_normalize,
+            # Global triggers — required for CUDA graph safety
+            prefill_trigger_tokens=[-1],
+            generate_trigger_tokens=[-1],
+        )
+
+        success = self.steer_vector_manager.add_adapter(server_request)
+        if not success:
+            raise RuntimeError(
+                f"Failed to load server-level steering vector: "
+                f"{steer_config.server_vector_path}"
+            )
+        logger.info("Server-level steering vector loaded and active")
 
     def add_steer_vector(self, steer_vector_request: SteerVectorRequest) -> bool:
         """Add a steer vector to the model.
@@ -90,10 +143,13 @@ class SteerVectorModelRunnerMixin:
         self, steer_vector_requests: set[SteerVectorRequest]
     ) -> None:
         """Set active steer vectors for the current batch.
-        
+
         This method is called during execute_model to activate the steer vectors
         needed for the current batch of requests (lazy loading).
-        
+
+        When server-level steering is active, the server vector is already loaded
+        and stays active. No per-request vectors should arrive (rejected upstream).
+
         Args:
             steer_vector_requests: Set of SteerVectorRequest objects for the current batch
         """
@@ -103,11 +159,11 @@ class SteerVectorModelRunnerMixin:
                     "SteerVector is not enabled. Use --enable-steer-vector to enable SteerVector."
                 )
             return
-        
+
         # For each steer vector request, add and activate if not already loaded
         for steer_vector_request in steer_vector_requests:
             steer_vector_id = steer_vector_request.steer_vector_int_id
-            
+
             # Check if already loaded
             if steer_vector_id not in self.steer_vector_manager.list_adapters():
                 # Load the steer vector (LRU cache will handle eviction if needed)

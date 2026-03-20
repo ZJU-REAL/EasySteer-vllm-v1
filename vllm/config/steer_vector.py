@@ -51,6 +51,28 @@ class SteerVectorConfig:
     error rather than silently produce wrong results. Default False
     preserves the current conservative behavior."""
 
+    # Server-level steering: configure steering at startup instead of per-request.
+    # When set, CUDA graphs are safe because every batch uses the same config.
+    server_vector_path: str | None = None
+    """Path to a steering vector file to load at startup."""
+
+    server_scale: float = 1.0
+    """Scaling factor for the server-level steering vector."""
+
+    server_target_layers: list[int] | None = None
+    """Which layers to steer. If None, the vector file determines layers."""
+
+    server_algorithm: str = "direct"
+    """Algorithm for server-level steering."""
+
+    server_normalize: bool = True
+    """Whether to normalize the server-level steering vector."""
+
+    @property
+    def has_server_config(self) -> bool:
+        """True when server-level steering is configured."""
+        return self.server_vector_path is not None
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -61,6 +83,11 @@ class SteerVectorConfig:
         factors.append(self.max_steer_vectors)
         factors.append(self.steer_vector_dtype)
         factors.append(self.allow_cuda_graphs)
+        factors.append(self.server_vector_path)
+        factors.append(self.server_scale)
+        factors.append(self.server_target_layers)
+        factors.append(self.server_algorithm)
+        factors.append(self.server_normalize)
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

@@ -874,18 +874,38 @@ class OpenAIServing:
         # if _check_model has been called earlier, this will be unreachable
         raise ValueError(f"The model `{request.model}` does not exist.")
 
-    @staticmethod
     def _maybe_get_steer_vector(
+        self,
         request: AnyRequest,
     ) -> SteerVectorRequest | None:
         """Convert SteerVectorRequestParam from the API request to a
         SteerVectorRequest object for the engine.
 
         Returns None if no steer_vector_request is specified in the request.
+
+        Raises ValueError if per-request steering is rejected because
+        server-level steering is active (callers already catch ValueError).
         """
         param: SteerVectorRequestParam | None = getattr(
             request, "steer_vector_request", None
         )
+
+        # When server-level steering is active, reject per-request steering
+        # to prevent silent config conflicts.
+        steer_vector_config = getattr(
+            self.engine_client.vllm_config, "steer_vector_config", None
+        )
+        if (
+            steer_vector_config is not None
+            and steer_vector_config.has_server_config
+            and param is not None
+        ):
+            raise ValueError(
+                "Per-request steer_vector_request is not allowed when "
+                "server-level steering is active (--steer-vector-path). "
+                "Use POST /v1/steering to change the server steering config."
+            )
+
         if param is None:
             return None
 

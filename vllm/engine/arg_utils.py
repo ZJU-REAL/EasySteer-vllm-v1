@@ -486,6 +486,11 @@ class EngineArgs:
     enable_steer_vector: bool = False
     max_steer_vectors: int = 1
     steer_allow_cuda_graphs: bool = False
+    steer_vector_path: str | None = None
+    steer_scale: float = 1.0
+    steer_target_layers: list[int] | None = None
+    steer_algorithm: str = "direct"
+    steer_normalize: bool = True
 
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
@@ -1024,6 +1029,42 @@ class EngineArgs:
                 "all requests use global triggers (trigger_tokens=[-1]). "
                 "Can provide ~2.6x speedup for global-only steering workloads."
             ),
+        )
+        steer_vector_group.add_argument(
+            "--steer-vector-path",
+            type=str,
+            default=None,
+            help=(
+                "Path to a steering vector file (.gguf) to load at server "
+                "startup. Enables server-level steering: every request is "
+                "steered with this vector, and per-request steer_vector_request "
+                "is rejected. Implies --enable-steer-vector and enables CUDA "
+                "graphs for ~2.6x speedup."
+            ),
+        )
+        steer_vector_group.add_argument(
+            "--steer-scale",
+            type=float,
+            default=1.0,
+            help="Scaling factor for server-level steering vector.",
+        )
+        steer_vector_group.add_argument(
+            "--steer-target-layers",
+            type=int,
+            nargs="+",
+            default=None,
+            help="Target layer indices for server-level steering.",
+        )
+        steer_vector_group.add_argument(
+            "--steer-algorithm",
+            type=str,
+            default="direct",
+            help="Algorithm for server-level steering (default: direct).",
+        )
+        steer_vector_group.add_argument(
+            "--steer-normalize",
+            action=argparse.BooleanOptionalAction,
+            help="Whether to normalize the server-level steering vector.",
         )
 
         # Observability arguments
@@ -1669,12 +1710,23 @@ class EngineArgs:
 
         # Steer Vector configuration
         from vllm.config.steer_vector import SteerVectorConfig
+        # --steer-vector-path implies --enable-steer-vector
+        enable_steer = self.enable_steer_vector or self.steer_vector_path is not None
+        # Server-level steering implies CUDA graphs are safe
+        allow_cuda = bool(self.steer_allow_cuda_graphs) or self.steer_vector_path is not None
         steer_vector_config = (
             SteerVectorConfig(
                 max_steer_vectors=self.max_steer_vectors,
-                allow_cuda_graphs=bool(self.steer_allow_cuda_graphs),
+                allow_cuda_graphs=allow_cuda,
+                server_vector_path=self.steer_vector_path,
+                server_scale=self.steer_scale,
+                server_target_layers=self.steer_target_layers,
+                server_algorithm=self.steer_algorithm,
+                server_normalize=bool(self.steer_normalize)
+                if self.steer_normalize is not None
+                else True,
             )
-            if self.enable_steer_vector
+            if enable_steer
             else None
         )
 

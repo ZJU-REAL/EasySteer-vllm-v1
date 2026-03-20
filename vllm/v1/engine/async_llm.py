@@ -781,6 +781,14 @@ class AsyncLLM(EngineClient):
         """Prevent an adapter from being evicted."""
         return await self.engine_core.pin_lora_async(lora_id)
 
+    async def add_steer_vector(
+        self, steer_vector_request: SteerVectorRequest
+    ) -> bool:
+        """Load (or reload) a steer vector on all workers."""
+        return await self.engine_core.add_steer_vector_async(
+            steer_vector_request
+        )
+
     async def collective_rpc(
         self,
         method: str,
