@@ -48,34 +48,64 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
     def set_steer_vector(self, index: int, **kwargs) -> None:
         """
         Universal implementation: Store payload of any type.
-        
+
+        For Tensor payloads, uses an in-place buffer strategy so the tensor
+        address stays constant across reloads.  This is critical for CUDA
+        graph replay: the graph captures the buffer address, so ``copy_()``
+        into the same buffer lets us change the scale at runtime without
+        graph re-capture.
+
         Algorithms don't need to override this - just define what payload format
         they need in load_from_path, and use it in _transform.
         """
         payload = kwargs.get("payload")
         scale_factor = kwargs.get("scale_factor", 1.0)
-        
+
         if payload is None:
             raise ValueError(f"{self.__class__.__name__} requires 'payload' in kwargs")
-        
+
         # Handle scale_factor for different payload types
         if isinstance(payload, torch.Tensor):
-            # For Tensor payload: apply scale_factor directly
-            payload = payload * scale_factor
+            scaled = payload * scale_factor
+            # Reuse existing buffer if shapes match (CUDA graph safe)
+            existing = self._payloads.get(index)
+            if (
+                isinstance(existing, torch.Tensor)
+                and existing.shape == scaled.shape
+                and existing.dtype == scaled.dtype
+                and existing.device == scaled.device
+            ):
+                existing.copy_(scaled)
+                return  # buffer address unchanged — graph replay safe
+            # First load or shape mismatch: allocate a new contiguous buffer
+            payload = scaled.clone()
         elif isinstance(payload, dict):
             # For dict payload: add scale_factor to the dict
             payload = {**payload, "scale_factor": scale_factor}
         # For other types: store as-is (algorithms handle scaling themselves)
-        
+
         self._payloads[index] = payload
     
     def set_active_tensor(self, index: int) -> None:
         """
         Universal implementation: Activate stored payload.
-        
+
+        When the payload is a Tensor and the active buffer already has the
+        right shape, copies into the existing buffer (CUDA graph safe).
         Algorithms don't need to override this.
         """
-        self._active_payload = self._payloads.get(index)
+        new_payload = self._payloads.get(index)
+        # In-place copy when both are compatible tensors (preserves address)
+        if (
+            isinstance(new_payload, torch.Tensor)
+            and isinstance(self._active_payload, torch.Tensor)
+            and new_payload.shape == self._active_payload.shape
+            and new_payload.dtype == self._active_payload.dtype
+            and new_payload.device == self._active_payload.device
+        ):
+            self._active_payload.copy_(new_payload)
+        else:
+            self._active_payload = new_payload
     
     def reset_steer_vector(self, index: int) -> None:
         """

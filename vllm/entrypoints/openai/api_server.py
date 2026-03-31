@@ -238,6 +238,8 @@ def build_app(
 
         register_pooling_api_routers(app, supported_tasks)
 
+    _register_steering_endpoints(app)
+
     app.root_path = args.root_path
     app.add_middleware(
         CORSMiddleware,
@@ -459,6 +461,106 @@ def setup_server(args):
         host_part = f"[{addr}]" if is_valid_ipv6_address(addr) else addr or "0.0.0.0"
         listen_address = f"http{'s' if is_ssl else ''}://{host_part}:{port}"
     return listen_address, sock
+
+
+##########################################################################
+# Server-level steering admin endpoints
+##########################################################################
+
+import asyncio
+import json as _json
+
+_steering_update_lock = asyncio.Lock()
+
+
+def _register_steering_endpoints(app: FastAPI) -> None:
+    """Register GET/POST /v1/steering endpoints on the app."""
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    @app.get("/v1/steering")
+    async def get_steering_config(raw_request: Request):
+        """Return the current server-level steering configuration."""
+        vllm_config = raw_request.app.state.vllm_config
+        steer_config = vllm_config.steer_vector_config
+        if steer_config is None or not steer_config.has_server_config:
+            return JSONResponse(content={"active": False})
+        return JSONResponse(content={
+            "active": True,
+            "vector_path": steer_config.server_vector_path,
+            "scale": steer_config.server_scale,
+            "target_layers": steer_config.server_target_layers,
+            "algorithm": steer_config.server_algorithm,
+            "normalize": steer_config.server_normalize,
+        })
+
+    @app.post("/v1/steering")
+    async def update_steering_config(raw_request: Request):
+        """Update server-level steering at runtime.
+
+        Only ``scale`` can be changed without CUDA graph re-capture.
+        Structural changes (different vector path, layers, algorithm) would
+        require graph re-capture and are rejected in this first version.
+        """
+        vllm_config = raw_request.app.state.vllm_config
+        steer_config = vllm_config.steer_vector_config
+        if steer_config is None or not steer_config.has_server_config:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Server-level steering is not configured. "
+                         "Start the server with --steer-vector-path to enable."},
+            )
+
+        try:
+            body = await raw_request.json()
+        except _json.JSONDecodeError as e:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Invalid JSON: {e}"},
+            )
+
+        structural_keys = {"vector_path", "target_layers", "algorithm",
+                           "normalize"}
+        requested_structural = structural_keys & set(body.keys())
+        if requested_structural:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": f"Changing {requested_structural} requires CUDA "
+                             "graph re-capture, which is not supported yet. "
+                             "Only 'scale' can be changed at runtime."
+                },
+            )
+
+        new_scale = body.get("scale")
+        if new_scale is not None:
+            async with _steering_update_lock:
+                object.__setattr__(steer_config, "server_scale",
+                                   float(new_scale))
+
+                from vllm.steer_vectors.request import SteerVectorRequest
+                server_request = SteerVectorRequest(
+                    steer_vector_name="__server__",
+                    steer_vector_int_id=1,
+                    steer_vector_local_path=steer_config.server_vector_path,
+                    scale=float(new_scale),
+                    target_layers=steer_config.server_target_layers,
+                    algorithm=steer_config.server_algorithm,
+                    normalize=steer_config.server_normalize,
+                    prefill_trigger_tokens=[-1],
+                    generate_trigger_tokens=[-1],
+                )
+                engine_client = raw_request.app.state.engine_client
+                await engine_client.add_steer_vector(server_request)
+
+        return JSONResponse(content={
+            "active": True,
+            "vector_path": steer_config.server_vector_path,
+            "scale": steer_config.server_scale,
+            "target_layers": steer_config.server_target_layers,
+            "algorithm": steer_config.server_algorithm,
+            "normalize": steer_config.server_normalize,
+        })
 
 
 async def run_server(args, **uvicorn_kwargs) -> None:

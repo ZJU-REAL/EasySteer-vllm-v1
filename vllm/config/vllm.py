@@ -780,19 +780,67 @@ class VllmConfig:
                 "precision for chunked prefill triton kernels."
             )
 
+        # Steer vectors are incompatible with chunked prefill and
+        # prefix caching.  Raise hard errors rather than silently
+        # fixing — these cause subtle correctness bugs that are
+        # extremely difficult to diagnose (see commit 9b999cb for
+        # the prefix cache collision bug that invalidated an entire
+        # experiment run).
+        if self.steer_vector_config is not None:
+            if self.scheduler_config.enable_chunked_prefill:
+                raise ValueError(
+                    "Steer vectors are incompatible with chunked prefill. "
+                    "Set --no-enable-chunked-prefill or "
+                    "enable_chunked_prefill=False when using steering."
+                )
+            if (
+                self.cache_config is not None
+                and self.cache_config.enable_prefix_caching
+            ):
+                raise ValueError(
+                    "Steer vectors are incompatible with prefix caching. "
+                    "Prefix cache keys ignore steering scale, so KV states "
+                    "are silently reused across different scales, disabling "
+                    "steering entirely. Set --no-enable-prefix-caching or "
+                    "enable_prefix_caching=False when using steering."
+                )
+
         # Steer vectors wrap decoder layers and modify module state
         # (e.g. algorithm dicts) during forward, which is incompatible
-        # with torch.compile / CUDA graphs.  Auto-enable eager mode.
+        # with torch.compile (piecewise compilation).  However, full
+        # CUDA graph capture (without compilation) works for the
+        # global-only trigger fast path in template.py.
         if (
             self.steer_vector_config is not None
             and self.model_config is not None
             and not self.model_config.enforce_eager
         ):
-            logger.warning(
-                "Steer vectors are not compatible with torch.compile / "
-                "CUDA graphs. Setting enforce_eager=True automatically."
-            )
-            self.model_config.enforce_eager = True
+            if self.steer_vector_config.allow_cuda_graphs:
+                # Disable torch.compile (incompatible with steering
+                # wrappers that mutate module state during forward),
+                # but keep full CUDA graphs for decode batches.
+                # We use FULL_DECODE_ONLY since piecewise CUDA graphs
+                # require compilation, and FULL requires attention
+                # backends to support cudagraphs for all batch types.
+                logger.info(
+                    "Steer vectors enabled with allow_cuda_graphs=True. "
+                    "Disabling torch.compile but keeping CUDA graphs "
+                    "(FULL_DECODE_ONLY). Only global triggers "
+                    "(trigger_tokens=[-1]) are safe in this mode."
+                )
+                self.model_config.enforce_eager = False
+                self.compilation_config.mode = CompilationMode.NONE
+                self.compilation_config.cudagraph_mode = (
+                    CUDAGraphMode.FULL_DECODE_ONLY
+                )
+            else:
+                logger.warning(
+                    "Steer vectors are not compatible with torch.compile / "
+                    "CUDA graphs. Setting enforce_eager=True automatically. "
+                    "Use --steer-allow-cuda-graphs to override if you only "
+                    "use global triggers (trigger_tokens=[-1])."
+                )
+                self.model_config.enforce_eager = True
 
         if self.model_config is not None and self.model_config.enforce_eager:
             logger.warning(
