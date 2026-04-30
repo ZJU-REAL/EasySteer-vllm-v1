@@ -618,6 +618,23 @@ class Scheduler(SchedulerInterface):
                     skipped_waiting_requests.prepend_request(request)
                     continue
 
+                # Do not mix requests with different steer vectors in the same batch.
+                # _active_payload is a single global pointer — if two requests with
+                # different vectors share a batch, one receives the wrong steering.
+                # Instead, defer mismatched requests to a later batch.
+                if (
+                    self.steer_vector_config
+                    and len(scheduled_steer_vectors) > 0
+                    and (
+                        not request.steer_vector_request
+                        or request.steer_vector_request.steer_vector_int_id
+                            not in scheduled_steer_vectors
+                    )
+                ):
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
+
                 num_external_computed_tokens = 0
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0

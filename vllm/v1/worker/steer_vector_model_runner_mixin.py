@@ -162,6 +162,24 @@ class SteerVectorModelRunnerMixin:
                 )
             return
 
+        # --- Patch 1: Fix steer vector persistence ---
+        # Step 1: Deactivate adapters no longer in current batch.
+        current_ids = {r.steer_vector_int_id for r in steer_vector_requests}
+        for adapter_id in list(mgr.list_adapters()):
+            if adapter_id not in current_ids:
+                mgr.remove_adapter(adapter_id)
+
+        # Step 2: When batch has no steer vectors, also clear _active_payload
+        # on all wrapped modules. remove_adapter() clears _payloads but
+        # _active_payload holds a separate Python reference — it must be
+        # explicitly set to None to stop intervention in forward().
+        if not steer_vector_requests:
+            adapter_mgr = mgr._adapter_manager
+            if hasattr(adapter_mgr, 'modules'):
+                for module in adapter_mgr.modules.values():
+                    for algo in module.algorithms.values():
+                        algo._active_payload = None
+
         # For each steer vector request, add and activate if not already loaded
         for steer_vector_request in steer_vector_requests:
             steer_vector_id = steer_vector_request.steer_vector_int_id
