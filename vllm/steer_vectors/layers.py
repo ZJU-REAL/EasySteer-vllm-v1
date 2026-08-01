@@ -125,11 +125,17 @@ def _reconstruct_output(modified_hidden_states, residual, other_outputs, origina
 
 class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
     """
-    Generic DecoderLayer wrapper that supports intervention on full hidden states.
+    Generic DecoderLayer intervention controller for full hidden states.
     Uses lazy loading mechanism to create algorithm instances only when needed, saving memory.
+
+    Preferred usage is hook-based: the controller stays outside the model
+    tree and `process_output_hook` is registered as a forward hook on the
+    original decoder layer, so module names, classes and state-dict keys
+    are untouched (safe for FSDP/checkpointing, e.g. VERL). Wrapping a
+    layer as a submodule (`base_layer`) is kept for backward compatibility.
     """
 
-    def __init__(self, base_layer) -> None:
+    def __init__(self, base_layer=None) -> None:
         super().__init__()
         self.base_layer = base_layer
         self.active_algorithm_name: str = "direct"
@@ -192,12 +198,19 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         algo.set_active_tensor(index)
 
     def forward(self, *args, **kwargs):
-        """Wrap the forward method of DecoderLayer."""
+        """Wrap the forward method of DecoderLayer (legacy wrapper mode)."""
         output = self.base_layer(*args, **kwargs)
+        return self.process_output(output)
 
+    def process_output_hook(self, module, args, output):
+        """torch forward-hook entry point: intervene on the layer output."""
+        return self.process_output(output)
+
+    def process_output(self, output):
+        """Apply the active steering algorithm to a decoder layer output."""
         # Dynamically get the currently active algorithm and apply intervention
         active_algo = self._get_or_create_algorithm(self.active_algorithm_name)
-        
+
         # Extract hidden_states and residual from decoder layer output
         hidden_states, residual, other_outputs, original_format = _extract_hidden_states_and_residual(output)
 

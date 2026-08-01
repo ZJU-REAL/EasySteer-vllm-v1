@@ -247,6 +247,8 @@ class SteerVectorModelManager:
         self.model.steer_vector_manager = self
         self.steer_vector_index_to_id: list[Optional[int]] = [None] * self.adapter_slots
         self.modules: dict[str, nn.Module] = {}
+        self._hook_handles: list = []
+        self._hooked_modules: set[str] = set()
         self._create_sv_modules()
 
     # ------------------------------------------------------------------------
@@ -446,29 +448,51 @@ class SteerVectorModelManager:
         for module_name, module in self.model.named_modules():
             # Check if this module should be wrapped
             if any(
-                class_name in module.__class__.__name__ 
+                class_name in module.__class__.__name__
                 for class_name in target_modules
             ):
                 # Skip if already wrapped
                 if isinstance(module, wrapper_class):
                     continue
-                
-                # Create wrapper using registry (dynamic instantiation)
+
+                if wrapper_type == "decoder_layer":
+                    # Hook-based interception: the original module stays in
+                    # the tree (module names, classes and state-dict keys are
+                    # untouched, keeping FSDP/checkpointing consumers such as
+                    # VERL working); the controller lives outside the model.
+                    if module_name in self._hooked_modules:
+                        continue
+                    controller = wrapper_class()
+                    layer_id = extract_layer_id_from_module_name(module_name)
+                    if layer_id is not None:
+                        controller.set_layer_id(layer_id)
+                    handle = module.register_forward_hook(
+                        controller.process_output_hook
+                    )
+                    self._hook_handles.append(handle)
+                    self._hooked_modules.add(module_name)
+                    self.register_module(module_name, controller)
+                    wrapped_count += 1
+                    logger.debug(f"Hooked {wrapper_type}: {module_name}")
+                    continue
+
+                # Other wrapper types (moe_layer) still use in-place module
+                # replacement until they are ported to hooks.
                 new_module = self.replace_submodule(
                     self.model,
                     module_name,
                     wrapper_class(module, layer_name=module_name) if wrapper_type == "moe_layer" else wrapper_class(module)
                 )
-                
+
                 # Extract layer ID based on wrapper type
                 if wrapper_type == "moe_layer":
                     layer_id = extract_moe_layer_id_from_name(module_name)
                 else:
                     layer_id = extract_layer_id_from_module_name(module_name)
-                
+
                 if layer_id is not None:
                     new_module.set_layer_id(layer_id)
-                
+
                 self.register_module(module_name, new_module)
                 wrapped_count += 1
                 logger.debug(f"Wrapped {wrapper_type}: {module_name}")
@@ -641,6 +665,13 @@ class SteerVectorModelManager:
     def register_module(self, module_name: str, module: nn.Module):
         """Register a wrapped module."""
         self.modules[module_name] = module
+
+    def remove_hooks(self):
+        """Detach all forward hooks registered on the model."""
+        for handle in self._hook_handles:
+            handle.remove()
+        self._hook_handles.clear()
+        self._hooked_modules.clear()
 
 
 # ============================================================================
