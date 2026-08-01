@@ -36,11 +36,6 @@ def extract_layer_id_from_module_name(module_name: str) -> Optional[int]:
     return None
 
 
-@dataclass
-class SteerVectorMapping:
-    layer_mapping: dict[int, torch.Tensor]
-
-
 class BaseLayerWithSteerVector(nn.Module):
     pass
 

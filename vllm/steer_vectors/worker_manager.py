@@ -196,27 +196,6 @@ class WorkerSteerVectorManager:
         
         return steer_vector
 
-    def add_dummy_steer_vector(
-        self,
-        steer_vector_request: SteerVectorRequest
-    ) -> bool:
-        """Add a dummy steer vector (placeholder for future use)."""
-        return True
-
-    def pin_adapter(self, adapter_id: int) -> bool:
-        """Pin an adapter (not supported for steer vectors)."""
-        if self._adapter_manager is None:
-            return False
-        return self._adapter_manager.pin_adapter(adapter_id)
-
-    def set_active_adapters(self, requests: Set[Any]) -> None:
-        """Set the active adapters based on requests."""
-        # Simplified implementation for V1
-        # In V1, we don't use the complex set_adapter_mapping from V0
-        for request in requests:
-            if request is not None:
-                self.add_adapter(request)
-
     def add_adapter(self, adapter_request: SteerVectorRequest) -> bool:
         """Add a steer vector adapter."""
         if self._adapter_manager is None:
@@ -263,23 +242,6 @@ class WorkerSteerVectorManager:
         
         return True
 
-    def _apply_adapters(self, adapter_requests: Set[Any]) -> None:
-        """Apply adapters to the model."""
-        if self._adapter_manager is None:
-            return
-        
-        # Remove adapters that are no longer requested
-        current_ids = {req.steer_vector_id for req in adapter_requests if req is not None}
-        registered_ids = set(self.list_adapters())
-        
-        for adapter_id in registered_ids - current_ids:
-            self.remove_adapter(adapter_id)
-        
-        # Add new adapters
-        for request in adapter_requests:
-            if request is not None:
-                self.add_adapter(request)
-
     def remove_adapter(self, adapter_id: int) -> bool:
         """Remove a steer vector adapter."""
         if self._adapter_manager is None:
@@ -324,31 +286,6 @@ class LRUCacheWorkerSteerVectorManager(WorkerSteerVectorManager):
             steer_vector_manager
         )
         return steer_vector_manager.model
-
-    def _apply_adapters(
-        self,
-        steer_vector_requests: Set[SteerVectorRequest]
-    ) -> None:
-        """Apply adapters with LRU caching."""
-        steer_vectors_map = {
-            steer_vector_request.steer_vector_id: steer_vector_request
-            for steer_vector_request in steer_vector_requests
-            if steer_vector_request
-        }
-        
-        if self._adapter_manager is None:
-            return
-        
-        if len(steer_vectors_map) > self._adapter_manager.adapter_slots:
-            raise RuntimeError(
-                f"Number of requested steer vectors "
-                f"({len(steer_vectors_map)}) is greater "
-                "than the number of GPU steer vector slots "
-                f"({self._adapter_manager.adapter_slots})."
-            )
-        
-        for steer_vector in steer_vectors_map.values():
-            self.add_adapter(steer_vector)
 
     def add_adapter(
         self,

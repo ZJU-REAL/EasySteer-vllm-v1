@@ -34,7 +34,6 @@ from vllm.steer_vectors.algorithms.factory import ALGORITHM_REGISTRY
 from vllm.steer_vectors.config import WRAPPER_REGISTRY, get_target_modules
 from vllm.steer_vectors.layers import (
     DecoderLayerWithSteerVector,
-    SteerVectorMapping,
     extract_layer_id_from_module_name,
 )
 from vllm.steer_vectors.moe_layers import (
@@ -73,6 +72,67 @@ def get_steer_vector_id() -> int:
     global _GLOBAL_STEER_VECTOR_ID
     _GLOBAL_STEER_VECTOR_ID += 1
     return _GLOBAL_STEER_VECTOR_ID
+
+
+def find_decoder_layers_structurally(model: nn.Module) -> dict[str, nn.Module]:
+    """Find decoder-layer modules without relying on class-name lists.
+
+    Matches the direct children of any ModuleList that contain a
+    KV-cache-backed attention layer (AttentionLayerBase). Vision towers and
+    other encoder stacks use plain attention modules, so this anchors on the
+    decoder stack only. Used as a fallback for model families that are not
+    in the per-family class-name lists.
+    """
+    from vllm.model_executor.layers.attention_layer_base import (
+        AttentionLayerBase,
+    )
+
+    matches: dict[str, nn.Module] = {}
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.ModuleList):
+            continue
+        for child_name, child in module.named_children():
+            if any(isinstance(m, AttentionLayerBase) for m in child.modules()):
+                matches[f"{name}.{child_name}" if name else child_name] = child
+    # Drop outer matches that merely contain other matches (nested stacks).
+    inner_only = {
+        name: module
+        for name, module in matches.items()
+        if not any(
+            other != name and other.startswith(f"{name}.") for other in matches
+        )
+    }
+    return inner_only
+
+
+def find_moe_blocks_structurally(model: nn.Module) -> dict[str, nn.Module]:
+    """Find sparse-MoE block modules by their fused-MoE child.
+
+    Fallback for model families not covered by the class-name lists: a MoE
+    block is a module with a direct fused-MoE child (the gate + experts
+    runner). Since vLLM 0.22 `FusedMoE(...)` is a factory returning a
+    MoERunner, so we anchor on MoERunnerInterface, with a class-name check
+    as a safety net for older/newer layouts.
+    """
+    try:
+        from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (  # noqa: E501
+            MoERunnerInterface,
+        )
+    except ImportError:
+        MoERunnerInterface = None
+
+    def is_moe_child(child: nn.Module) -> bool:
+        if MoERunnerInterface is not None and isinstance(
+            child, MoERunnerInterface
+        ):
+            return True
+        return type(child).__name__ in ("FusedMoE", "MoERunner", "SharedFusedMoE")
+
+    matches: dict[str, nn.Module] = {}
+    for name, module in model.named_modules():
+        if any(is_moe_child(c) for c in module.children()):
+            matches[name] = module
+    return matches
 
 
 # ============================================================================
@@ -243,7 +303,6 @@ class SteerVectorModelManager:
         self._registered_adapters: Dict[int, SteerVectorModel] = {}
         self._active_adapters: Dict[int, Any] = {}
         self.steer_vector_config = steer_vector_config
-        self._last_mapping = None
         self.model.steer_vector_manager = self
         self.steer_vector_index_to_id: list[Optional[int]] = [None] * self.adapter_slots
         self.modules: dict[str, nn.Module] = {}
@@ -395,17 +454,6 @@ class SteerVectorModelManager:
         """Get a specific adapter."""
         return self._registered_adapters.get(adapter_id)
 
-    def pin_adapter(self, adapter_id: int) -> bool:
-        """Pin an adapter (not implemented for steer vectors)."""
-        raise NotImplementedError(
-            "Pinning is not supported for steer vectors"
-        )
-
-    def set_adapter_mapping(self, mapping: SteerVectorMapping) -> None:
-        """Set the adapter mapping (for compatibility)."""
-        # Simplified implementation for V1
-        pass
-
     # ------------------------------------------------------------------------
     # Wrapper Management (Configuration-Driven)
     # ------------------------------------------------------------------------
@@ -442,60 +490,78 @@ class SteerVectorModelManager:
         except ValueError as e:
             logger.warning(f"Failed to get target modules for {wrapper_type}: {e}")
             return
-        
-        # Wrap matching modules
-        wrapped_count = 0
-        for module_name, module in self.model.named_modules():
-            # Check if this module should be wrapped
+
+        # Primary: per-family class-name lists (explicit override).
+        matches = {
+            module_name: module
+            for module_name, module in self.model.named_modules()
             if any(
                 class_name in module.__class__.__name__
                 for class_name in target_modules
-            ):
-                # Skip if already wrapped
-                if isinstance(module, wrapper_class):
-                    continue
-
-                if wrapper_type == "decoder_layer":
-                    # Hook-based interception: the original module stays in
-                    # the tree (module names, classes and state-dict keys are
-                    # untouched, keeping FSDP/checkpointing consumers such as
-                    # VERL working); the controller lives outside the model.
-                    if module_name in self._hooked_modules:
-                        continue
-                    controller = wrapper_class()
-                    layer_id = extract_layer_id_from_module_name(module_name)
-                    if layer_id is not None:
-                        controller.set_layer_id(layer_id)
-                    handle = module.register_forward_hook(
-                        controller.process_output_hook
-                    )
-                    self._hook_handles.append(handle)
-                    self._hooked_modules.add(module_name)
-                    self.register_module(module_name, controller)
-                    wrapped_count += 1
-                    logger.debug(f"Hooked {wrapper_type}: {module_name}")
-                    continue
-
-                # Other wrapper types (moe_layer) still use in-place module
-                # replacement until they are ported to hooks.
-                new_module = self.replace_submodule(
-                    self.model,
-                    module_name,
-                    wrapper_class(module, layer_name=module_name) if wrapper_type == "moe_layer" else wrapper_class(module)
+            )
+        }
+        # Fallback: structural discovery for families not in the lists.
+        if not matches:
+            if wrapper_type == "decoder_layer":
+                matches = find_decoder_layers_structurally(self.model)
+            elif wrapper_type == "moe_layer":
+                matches = find_moe_blocks_structurally(self.model)
+            if matches:
+                logger.info(
+                    "Structurally detected %d %s modules (e.g. %s); "
+                    "add the class name to steer_vectors/config.py to "
+                    "override.",
+                    len(matches), wrapper_type, next(iter(matches)),
                 )
 
-                # Extract layer ID based on wrapper type
-                if wrapper_type == "moe_layer":
-                    layer_id = extract_moe_layer_id_from_name(module_name)
-                else:
-                    layer_id = extract_layer_id_from_module_name(module_name)
+        # Wrap matching modules
+        wrapped_count = 0
+        for module_name, module in matches.items():
+            # Skip if already wrapped
+            if isinstance(module, wrapper_class):
+                continue
 
+            if wrapper_type == "decoder_layer":
+                # Hook-based interception: the original module stays in
+                # the tree (module names, classes and state-dict keys are
+                # untouched, keeping FSDP/checkpointing consumers such as
+                # VERL working); the controller lives outside the model.
+                if module_name in self._hooked_modules:
+                    continue
+                controller = wrapper_class()
+                layer_id = extract_layer_id_from_module_name(module_name)
                 if layer_id is not None:
-                    new_module.set_layer_id(layer_id)
-
-                self.register_module(module_name, new_module)
+                    controller.set_layer_id(layer_id)
+                handle = module.register_forward_hook(
+                    controller.process_output_hook
+                )
+                self._hook_handles.append(handle)
+                self._hooked_modules.add(module_name)
+                self.register_module(module_name, controller)
                 wrapped_count += 1
-                logger.debug(f"Wrapped {wrapper_type}: {module_name}")
+                logger.debug(f"Hooked {wrapper_type}: {module_name}")
+                continue
+
+            # Other wrapper types (moe_layer) still use in-place module
+            # replacement until they are ported to hooks.
+            new_module = self.replace_submodule(
+                self.model,
+                module_name,
+                wrapper_class(module, layer_name=module_name) if wrapper_type == "moe_layer" else wrapper_class(module)
+            )
+
+            # Extract layer ID based on wrapper type
+            if wrapper_type == "moe_layer":
+                layer_id = extract_moe_layer_id_from_name(module_name)
+            else:
+                layer_id = extract_layer_id_from_module_name(module_name)
+
+            if layer_id is not None:
+                new_module.set_layer_id(layer_id)
+
+            self.register_module(module_name, new_module)
+            wrapped_count += 1
+            logger.debug(f"Wrapped {wrapper_type}: {module_name}")
         
         # Log summary
         if wrapped_count > 0:
@@ -699,12 +765,11 @@ class LRUCacheSteerVectorModelManager(SteerVectorModelManager):
         steer_vector_config: SteerVectorConfig,
     ):
         super().__init__(model, steer_vector_config)
-        # Replace simple dicts with LRU caches
+        # LRU-cached registry; eviction deactivates the adapter. Activation
+        # recency is tracked by _active_adapters insertion order (a plain
+        # dict), so a second LRU cache is unnecessary.
         self._registered_adapters: SteerVectorLRUCache = SteerVectorLRUCache(
             self.capacity, self.deactivate_adapter
-        )
-        self._active_adapters: SteerVectorLRUCache = SteerVectorLRUCache(
-            self.adapter_slots, self._deactivate_adapter
         )
 
     def list_adapters(self) -> dict[int, SteerVectorModel]:
@@ -742,12 +807,15 @@ class LRUCacheSteerVectorModelManager(SteerVectorModelManager):
         normalize: bool = False,
     ) -> bool:
         """Activate adapter with automatic LRU eviction."""
-        # Automatically evict oldest active adapter if at capacity
+        # Automatically evict the least recently activated adapter if at
+        # capacity (dict insertion order == activation recency, since
+        # re-activation removes and re-inserts the id).
         if (
             steer_vector_id not in self._active_adapters
             and len(self._active_adapters) >= self.adapter_slots
         ):
-            self._active_adapters.remove_oldest()
+            oldest_id = next(iter(self._active_adapters))
+            self.deactivate_adapter(oldest_id)
         
         result = super().activate_adapter(
             steer_vector_id,
@@ -763,8 +831,8 @@ class LRUCacheSteerVectorModelManager(SteerVectorModelManager):
             conflict_resolution,
             normalize
         )
-        # We always touch to update the LRU cache order
-        self._active_adapters.touch(steer_vector_id)
+        # Activation recency is dict insertion order; the base activate
+        # already removed and re-inserted the id, so no extra touch needed.
         return result
 
     def remove_oldest_adapter(self) -> bool:

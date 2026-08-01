@@ -6,7 +6,7 @@ This module provides runtime intervention capabilities for LLMs through
 steer vectors, allowing dynamic control over model behavior.
 """
 
-from vllm.steer_vectors.layers import DecoderLayerWithSteerVector, SteerVectorMapping
+from vllm.steer_vectors.layers import DecoderLayerWithSteerVector
 from vllm.steer_vectors.models import (
     SteerVectorModel,
     SteerVectorModelManager,
@@ -24,7 +24,6 @@ from vllm.steer_vectors import config
 __all__ = [
     # Layers
     "DecoderLayerWithSteerVector",
-    "SteerVectorMapping",
     # Models
     "SteerVectorModel",
     "SteerVectorModelManager",
