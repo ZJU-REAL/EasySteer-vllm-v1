@@ -163,10 +163,13 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         server-level steering is active (callers already catch ValueError).
         """
         from vllm.steer_vectors.request import (
+            STEER_APPLY_FIELDS,
+            STEER_MOE_FIELDS,
             SteerVectorRequest,
             SteerVectorRequestParam,
             VectorConfig,
             _next_steer_vector_id,
+            steer_params_dict,
         )
         from vllm.utils import random_uuid
 
@@ -199,20 +202,7 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         vector_configs = None
         if param.vector_configs is not None:
             vector_configs = [
-                VectorConfig(
-                    path=vc.path,
-                    scale=vc.scale,
-                    target_layers=vc.target_layers,
-                    prefill_trigger_tokens=vc.prefill_trigger_tokens,
-                    prefill_trigger_positions=vc.prefill_trigger_positions,
-                    prefill_exclude_tokens=vc.prefill_exclude_tokens,
-                    prefill_exclude_positions=vc.prefill_exclude_positions,
-                    generate_trigger_tokens=vc.generate_trigger_tokens,
-                    generate_first_k_tokens=vc.generate_first_k_tokens,
-                    generate_after_k_tokens=vc.generate_after_k_tokens,
-                    algorithm=vc.algorithm,
-                    normalize=vc.normalize,
-                )
+                VectorConfig(path=vc.path, **steer_params_dict(vc))
                 for vc in param.vector_configs
             ]
 
@@ -222,22 +212,8 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
             steer_vector_local_path=param.steer_vector_local_path,
             debug=param.debug,
             conflict_resolution=param.conflict_resolution,
-            scale=param.scale,
-            target_layers=param.target_layers,
-            prefill_trigger_tokens=param.prefill_trigger_tokens,
-            prefill_trigger_positions=param.prefill_trigger_positions,
-            prefill_exclude_tokens=param.prefill_exclude_tokens,
-            prefill_exclude_positions=param.prefill_exclude_positions,
-            generate_trigger_tokens=param.generate_trigger_tokens,
-            generate_first_k_tokens=param.generate_first_k_tokens,
-            generate_after_k_tokens=param.generate_after_k_tokens,
-            algorithm=param.algorithm,
-            normalize=param.normalize,
             vector_configs=vector_configs,
-            moe_expert_ids=param.moe_expert_ids,
-            moe_mode=param.moe_mode,
-            moe_lambda=param.moe_lambda,
-            moe_topk=param.moe_topk,
+            **steer_params_dict(param, STEER_APPLY_FIELDS + STEER_MOE_FIELDS),
         )
 
     def create_streaming_error_response(

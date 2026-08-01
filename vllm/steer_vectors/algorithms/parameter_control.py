@@ -36,69 +36,33 @@ class InterventionController:
         # Debug mode
         self.debug: bool = False
     
-    # ========== Parameter Setters ==========
-    
+    # ========== Parameter Configuration ==========
+
     def set_debug(self, debug: bool) -> None:
         """Set debug mode."""
         self.debug = debug
-    
-    def set_prefill_trigger_tokens(self, token_ids: Optional[list[int]]) -> None:
-        """Set trigger tokens for prefill phase."""
-        self.prefill_trigger_tokens = set(token_ids) if token_ids is not None else None
-    
-    def set_prefill_trigger_positions(self, positions: Optional[list[int]]) -> None:
-        """Set trigger positions for prefill phase."""
-        self.prefill_trigger_positions = positions
-    
-    def set_prefill_exclude_tokens(self, token_ids: Optional[list[int]]) -> None:
-        """Set tokens to exclude during prefill phase."""
-        self.prefill_exclude_tokens = set(token_ids) if token_ids is not None else None
-    
-    def set_prefill_exclude_positions(self, positions: Optional[list[int]]) -> None:
-        """Set positions to exclude during prefill phase."""
-        self.prefill_exclude_positions = positions
-    
-    def set_generate_trigger_tokens(self, token_ids: Optional[list[int]]) -> None:
-        """Set trigger tokens for generation phase."""
-        self.generate_trigger_tokens = set(token_ids) if token_ids is not None else None
-    
-    def set_generate_first_k_tokens(self, k: Optional[int]) -> None:
-        """Set to intervene only on first k generated tokens."""
-        self.generate_first_k_tokens = k
-    
-    def set_generate_after_k_tokens(self, k: Optional[int]) -> None:
-        """Set to intervene starting from (k+1)-th generated token."""
-        self.generate_after_k_tokens = k
-    
+
     def configure_from_dict(self, config: dict) -> None:
         """
         Batch configure intervention parameters from a dictionary.
-        
-        This method provides a unified interface for setting all intervention parameters,
-        eliminating the need for wrapper layers to know individual parameter names.
-        Only processes intervention-related parameters (triggers, exclusions, debug),
-        ignoring algorithm-specific parameters.
-        
-        Args:
-            config: Dictionary containing intervention parameters
+
+        Driven by the canonical field registry: trigger fields present in
+        the dict are applied (token-id lists become sets), everything
+        else (payloads, algorithm parameters) is ignored.
         """
-        if "prefill_trigger_tokens" in config:
-            self.set_prefill_trigger_tokens(config["prefill_trigger_tokens"])
-        if "prefill_trigger_positions" in config:
-            self.set_prefill_trigger_positions(config["prefill_trigger_positions"])
-        if "prefill_exclude_tokens" in config:
-            self.set_prefill_exclude_tokens(config["prefill_exclude_tokens"])
-        if "prefill_exclude_positions" in config:
-            self.set_prefill_exclude_positions(config["prefill_exclude_positions"])
-        if "generate_trigger_tokens" in config:
-            self.set_generate_trigger_tokens(config["generate_trigger_tokens"])
-        if "generate_first_k_tokens" in config:
-            self.set_generate_first_k_tokens(config["generate_first_k_tokens"])
-        if "generate_after_k_tokens" in config:
-            self.set_generate_after_k_tokens(config["generate_after_k_tokens"])
-        if "debug" in config:
-            self.set_debug(config["debug"])
-    
+        from vllm.steer_vectors.request import (
+            STEER_TOKEN_SET_FIELDS,
+            STEER_TRIGGER_FIELDS,
+        )
+
+        for name in STEER_TRIGGER_FIELDS + ("debug",):
+            if name not in config:
+                continue
+            value = config[name]
+            if name in STEER_TOKEN_SET_FIELDS and value is not None:
+                value = set(value)
+            setattr(self, name, value)
+
     # ========== Parameter Queries ==========
     
     def should_apply_to_all_prefill_tokens(self) -> bool:

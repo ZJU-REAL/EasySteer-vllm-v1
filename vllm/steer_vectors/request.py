@@ -7,6 +7,75 @@ from typing import Optional, List
 
 from pydantic import BaseModel
 
+# --- Canonical steering parameter schema ---
+#
+# Single source of truth for "what configures how a vector is applied".
+# The API models and engine structs below must declare these fields
+# (enforced by _assert_schema_complete at import time), and every
+# conversion/copy site iterates these tuples instead of spelling the
+# fields out. To add a parameter: add it here, add the field to the four
+# schema classes, and consume it where needed — nothing else to keep in
+# sync.
+
+STEER_TRIGGER_FIELDS: tuple[str, ...] = (
+    "prefill_trigger_tokens",
+    "prefill_trigger_positions",
+    "prefill_exclude_tokens",
+    "prefill_exclude_positions",
+    "generate_trigger_tokens",
+    "generate_first_k_tokens",
+    "generate_after_k_tokens",
+)
+
+STEER_APPLY_FIELDS: tuple[str, ...] = (
+    "scale",
+    "target_layers",
+    *STEER_TRIGGER_FIELDS,
+    "algorithm",
+    "normalize",
+)
+
+STEER_MOE_FIELDS: tuple[str, ...] = (
+    "moe_expert_ids",
+    "moe_mode",
+    "moe_lambda",
+    "moe_topk",
+)
+
+# Trigger fields holding token-id lists; the InterventionController
+# stores these as sets for O(1) membership tests.
+STEER_TOKEN_SET_FIELDS: frozenset[str] = frozenset(
+    ("prefill_trigger_tokens", "prefill_exclude_tokens",
+     "generate_trigger_tokens")
+)
+
+
+def steer_params_dict(obj, fields: tuple = STEER_APPLY_FIELDS) -> dict:
+    """Extract canonical steering parameters from any schema object."""
+    return {name: getattr(obj, name) for name in fields}
+
+
+def layer_apply_kwargs(obj) -> dict:
+    """kwargs for layer-level set_steer_vector() from a request/config.
+
+    The layer API names two fields differently (algorithm_name,
+    scale_factor) and additionally takes the debug flag.
+    """
+    d = steer_params_dict(obj)
+    d["algorithm_name"] = d.pop("algorithm")
+    d["scale_factor"] = d.pop("scale")
+    d["debug"] = getattr(obj, "debug", False)
+    return d
+
+
+def _assert_schema_complete(cls, field_names, required) -> None:
+    missing = set(required) - set(field_names)
+    assert not missing, (
+        f"{cls.__name__} is missing canonical steering fields: "
+        f"{sorted(missing)}"
+    )
+
+
 # --- OpenAI-compatible API parameter types ---
 
 _steer_vector_id_counter = 0
@@ -272,3 +341,21 @@ class SteerVectorRequest(
         identified by their names across engines.
         """
         return hash(self.steer_vector_name)
+
+
+_assert_schema_complete(
+    VectorConfigParam, VectorConfigParam.model_fields, STEER_APPLY_FIELDS
+)
+_assert_schema_complete(
+    SteerVectorRequestParam,
+    SteerVectorRequestParam.model_fields,
+    STEER_APPLY_FIELDS + STEER_MOE_FIELDS,
+)
+_assert_schema_complete(
+    VectorConfig, VectorConfig.__struct_fields__, STEER_APPLY_FIELDS
+)
+_assert_schema_complete(
+    SteerVectorRequest,
+    SteerVectorRequest.__struct_fields__,
+    STEER_APPLY_FIELDS + STEER_MOE_FIELDS,
+)

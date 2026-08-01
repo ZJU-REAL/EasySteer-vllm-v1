@@ -671,17 +671,17 @@ class SteerVectorModelManager:
         layer_idx
     ):
         """Helper method: apply a single vector to a module."""
-        params = {
-            "algorithm_name": vector_data['algorithm'],
-            "scale_factor": vector_data.get('scale', 1.0),
-            "prefill_trigger_tokens": vector_data.get('prefill_trigger_tokens'),
-            "prefill_trigger_positions": vector_data.get('prefill_trigger_positions'),
-            "prefill_exclude_tokens": vector_data.get('prefill_exclude_tokens'),
-            "prefill_exclude_positions": vector_data.get('prefill_exclude_positions'),
-            "generate_trigger_tokens": vector_data.get('generate_trigger_tokens'),
-            "debug": debug,
-            "normalize": vector_data.get('normalize', False),
-        }
+        from vllm.steer_vectors.request import STEER_APPLY_FIELDS
+
+        # Canonical fields (this previously spelled the list out and had
+        # silently dropped generate_first_k/after_k for this path).
+        params = {name: vector_data.get(name) for name in STEER_APPLY_FIELDS}
+        params["algorithm_name"] = params.pop("algorithm") or "direct"
+        scale = params.pop("scale")
+        params["scale_factor"] = 1.0 if scale is None else scale
+        params.pop("target_layers")
+        params["normalize"] = bool(params["normalize"])
+        params["debug"] = debug
         params["payload"] = vector_data['payloads'][layer_idx]
         module.set_steer_vector(index, **params)
 

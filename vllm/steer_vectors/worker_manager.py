@@ -14,7 +14,12 @@ from vllm.steer_vectors.models import (
     LRUCacheSteerVectorModelManager,
     create_sv_manager
 )
-from vllm.steer_vectors.request import SteerVectorRequest
+from vllm.steer_vectors.request import (
+    STEER_APPLY_FIELDS,
+    SteerVectorRequest,
+    layer_apply_kwargs,
+    steer_params_dict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,23 +33,15 @@ def config_fingerprint(request: SteerVectorRequest) -> str:
     """Stable identity of a steering *configuration* (not just the vector).
 
     Requests with the same fingerprint share one layer slot; the vector
-    payload itself is deduplicated separately by the VectorStore.
+    payload itself is deduplicated separately by the VectorStore. Built
+    from the canonical field registry so new parameters participate
+    automatically.
     """
-    return repr((
-        request.local_path,
-        request.scale,
-        tuple(request.target_layers) if request.target_layers else None,
-        request.algorithm,
-        request.normalize,
-        tuple(request.prefill_trigger_tokens or ()),
-        tuple(request.prefill_trigger_positions or ()),
-        tuple(request.prefill_exclude_tokens or ()),
-        tuple(request.prefill_exclude_positions or ()),
-        tuple(request.generate_trigger_tokens or ()),
-        request.generate_first_k_tokens,
-        request.generate_after_k_tokens,
-        request.debug,
-    ))
+    values = [request.local_path, request.debug]
+    for name in STEER_APPLY_FIELDS:
+        value = getattr(request, name)
+        values.append(tuple(value) if isinstance(value, list) else value)
+    return repr(tuple(values))
 
 
 class WorkerSteerVectorManager:
@@ -151,20 +148,8 @@ class WorkerSteerVectorManager:
     ) -> None:
         """Write a config's scaled payload + triggers into layer slot state."""
         assert self._adapter_manager is not None
-        params = {
-            "algorithm_name": request.algorithm,
-            "scale_factor": request.scale,
-            "prefill_trigger_tokens": request.prefill_trigger_tokens,
-            "prefill_trigger_positions": request.prefill_trigger_positions,
-            "prefill_exclude_tokens": request.prefill_exclude_tokens,
-            "prefill_exclude_positions": request.prefill_exclude_positions,
-            "generate_trigger_tokens": request.generate_trigger_tokens,
-            "generate_first_k_tokens": request.generate_first_k_tokens,
-            "generate_after_k_tokens": request.generate_after_k_tokens,
-            "debug": request.debug,
-            "normalize": request.normalize,
-        }
-        target_layers = request.target_layers
+        params = layer_apply_kwargs(request)
+        target_layers = params.pop("target_layers")
         for layer_idx, payload in (model.layer_payloads or {}).items():
             if target_layers and layer_idx not in target_layers:
                 continue
@@ -272,20 +257,11 @@ class WorkerSteerVectorManager:
                         )
                         
                         # Store vector data with its configuration
+                        # (canonical fields + payloads/path extras)
                         vector_data = {
+                            **steer_params_dict(vector_config),
                             'payloads': single_model.layer_payloads,
-                            'scale': vector_config.scale,
-                            'target_layers': vector_config.target_layers,
-                            'prefill_trigger_tokens': vector_config.prefill_trigger_tokens,
-                            'prefill_trigger_positions': vector_config.prefill_trigger_positions,
-                            'prefill_exclude_tokens': vector_config.prefill_exclude_tokens,
-                            'prefill_exclude_positions': vector_config.prefill_exclude_positions,
-                            'generate_trigger_tokens': vector_config.generate_trigger_tokens,
-                            'generate_first_k_tokens': vector_config.generate_first_k_tokens,
-                            'generate_after_k_tokens': vector_config.generate_after_k_tokens,
-                            'algorithm': vector_config.algorithm,
                             'path': vector_config.path,
-                            'normalize': vector_config.normalize,
                         }
                         multi_vector_data.append(vector_data)
                         
