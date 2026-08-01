@@ -551,6 +551,16 @@ class VllmConfig:
 
     @property
     def use_v2_model_runner(self) -> bool:
+        # Steer vector hooks are implemented only in the V1 GPU model runner
+        # (SteerVectorModelRunnerMixin / CaptureModelRunnerMixin). V2 would
+        # silently skip steering, so force V1 whenever steering is enabled.
+        if self.steer_vector_config is not None:
+            logger.warning_once(
+                "Steer vectors are enabled; using the V1 model runner "
+                "(Model Runner V2 does not support steering hooks)."
+            )
+            return False
+
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         if use_v2_model_runner is not None:
             return use_v2_model_runner
