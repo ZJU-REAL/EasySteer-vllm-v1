@@ -24,6 +24,7 @@ from vllm.config.model import (
     str_dtype_to_torch_dtype,
     try_match_architecture_defaults,
 )
+from vllm.config.steer_vector import SteerVectorConfig
 from vllm.config.multimodal import MultiModalConfig
 from vllm.config.observability import ObservabilityConfig
 from vllm.config.offload import (
@@ -94,6 +95,8 @@ __all__ = [
     "iter_architecture_defaults",
     "str_dtype_to_torch_dtype",
     "try_match_architecture_defaults",
+    # From vllm.config.steer_vector
+    "SteerVectorConfig",
     # From vllm.config.multimodal
     "MultiModalConfig",
     # From vllm.config.observability

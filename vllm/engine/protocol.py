@@ -14,6 +14,7 @@ from vllm.distributed.weight_transfer.base import (
 from vllm.inputs import EngineInput, PromptType
 from vllm.lora.request import LoRARequest
 from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
@@ -73,6 +74,7 @@ class EngineClient(ABC):
         *,
         prompt_text: str | None = None,
         lora_request: LoRARequest | None = None,
+        steer_vector_request: SteerVectorRequest | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,

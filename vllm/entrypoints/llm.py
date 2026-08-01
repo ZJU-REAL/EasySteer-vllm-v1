@@ -46,6 +46,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
@@ -415,6 +416,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         *,
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
+        steer_vector_request: Sequence[SteerVectorRequest] | SteerVectorRequest | None = None,
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
@@ -468,6 +470,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             output_type=RequestOutput,
             use_tqdm=use_tqdm,
             lora_request=lora_request,
+            steer_vector_request=steer_vector_request,
             tokenization_kwargs=tokenization_kwargs,
             priority=priority,
             mm_processor_kwargs=mm_processor_kwargs,
@@ -478,6 +481,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         prompts: PromptType | Sequence[PromptType],
         sampling_params: SamplingParams | Sequence[SamplingParams] | None = None,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
+        steer_vector_request: Sequence[SteerVectorRequest] | SteerVectorRequest | None = None,
         priority: list[int] | None = None,
         use_tqdm: bool | Callable[..., tqdm] = True,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -513,6 +517,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             params=sampling_params,
             use_tqdm=use_tqdm,
             lora_request=lora_request,
+            steer_vector_request=steer_vector_request,
             priority=priority,
             tokenization_kwargs=tokenization_kwargs,
             mm_processor_kwargs=mm_processor_kwargs,

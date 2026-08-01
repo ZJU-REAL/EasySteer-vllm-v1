@@ -150,6 +150,96 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
             # Never fail server startup over the fingerprint.
             self.system_fingerprint = None
 
+    def _maybe_get_steer_vector(
+        self,
+        request: AnyRequest,
+    ) -> "SteerVectorRequest | None":
+        """Convert SteerVectorRequestParam from the API request to a
+        SteerVectorRequest object for the engine.
+
+        Returns None if no steer_vector_request is specified in the request.
+
+        Raises ValueError if per-request steering is rejected because
+        server-level steering is active (callers already catch ValueError).
+        """
+        from vllm.steer_vectors.request import (
+            SteerVectorRequest,
+            SteerVectorRequestParam,
+            VectorConfig,
+            _next_steer_vector_id,
+        )
+        from vllm.utils import random_uuid
+
+        param: SteerVectorRequestParam | None = getattr(
+            request, "steer_vector_request", None
+        )
+
+        steer_vector_config = getattr(
+            self.engine_client.vllm_config, "steer_vector_config", None
+        )
+        if (
+            steer_vector_config is not None
+            and steer_vector_config.has_server_config
+            and param is not None
+        ):
+            raise ValueError(
+                "Per-request steer_vector_request is not allowed when "
+                "server-level steering is active (--steer-vector-path). "
+                "Use POST /v1/steering to change the server steering config."
+            )
+
+        if param is None:
+            return None
+
+        # Auto-generate name and ID if not provided
+        steer_name = param.steer_vector_name or f"sv_{random_uuid()[:8]}"
+        steer_id = param.steer_vector_int_id or _next_steer_vector_id()
+
+        # Convert VectorConfigParam list to VectorConfig list
+        vector_configs = None
+        if param.vector_configs is not None:
+            vector_configs = [
+                VectorConfig(
+                    path=vc.path,
+                    scale=vc.scale,
+                    target_layers=vc.target_layers,
+                    prefill_trigger_tokens=vc.prefill_trigger_tokens,
+                    prefill_trigger_positions=vc.prefill_trigger_positions,
+                    prefill_exclude_tokens=vc.prefill_exclude_tokens,
+                    prefill_exclude_positions=vc.prefill_exclude_positions,
+                    generate_trigger_tokens=vc.generate_trigger_tokens,
+                    generate_first_k_tokens=vc.generate_first_k_tokens,
+                    generate_after_k_tokens=vc.generate_after_k_tokens,
+                    algorithm=vc.algorithm,
+                    normalize=vc.normalize,
+                )
+                for vc in param.vector_configs
+            ]
+
+        return SteerVectorRequest(
+            steer_vector_name=steer_name,
+            steer_vector_int_id=steer_id,
+            steer_vector_local_path=param.steer_vector_local_path,
+            debug=param.debug,
+            conflict_resolution=param.conflict_resolution,
+            scale=param.scale,
+            target_layers=param.target_layers,
+            prefill_trigger_tokens=param.prefill_trigger_tokens,
+            prefill_trigger_positions=param.prefill_trigger_positions,
+            prefill_exclude_tokens=param.prefill_exclude_tokens,
+            prefill_exclude_positions=param.prefill_exclude_positions,
+            generate_trigger_tokens=param.generate_trigger_tokens,
+            generate_first_k_tokens=param.generate_first_k_tokens,
+            generate_after_k_tokens=param.generate_after_k_tokens,
+            algorithm=param.algorithm,
+            normalize=param.normalize,
+            vector_configs=vector_configs,
+            moe_expert_ids=param.moe_expert_ids,
+            moe_mode=param.moe_mode,
+            moe_lambda=param.moe_lambda,
+            moe_topk=param.moe_topk,
+        )
+
     def create_streaming_error_response(
         self,
         message: str | Exception,

@@ -24,6 +24,7 @@ from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer, renderer_from_config
 from vllm.sampling_params import SamplingParams
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.tasks import GENERATION_TASKS, POOLING_TASKS, SupportedTask
 from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
@@ -162,6 +163,15 @@ class InputProcessor:
                 "[lora_path]` to use the LoRA tokenizer."
             )
 
+    def _validate_steer_vector(self, steer_vector_request: SteerVectorRequest | None) -> None:
+        if steer_vector_request is None:
+            return
+
+        if not self.vllm_config.steer_vector_config:
+            raise ValueError(
+                f"Got steer_vector_request {steer_vector_request} but SteerVector is not enabled!"
+            )
+
     def _get_mm_identifier(
         self,
         mm_hash: str,
@@ -247,6 +257,7 @@ class InputProcessor:
         supported_tasks: tuple[SupportedTask, ...],
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
+        steer_vector_request: SteerVectorRequest | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
@@ -255,6 +266,7 @@ class InputProcessor:
     ) -> EngineCoreRequest:
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
+        self._validate_steer_vector(steer_vector_request)
 
         parallel_config = self.vllm_config.parallel_config
         dp_size = parallel_config.data_parallel_size
@@ -377,6 +389,7 @@ class InputProcessor:
             pooling_params=pooling_params,
             arrival_time=arrival_time,
             lora_request=lora_request,
+            steer_vector_request=steer_vector_request,
             cache_salt=decoder_inputs.get("cache_salt"),
             priority=priority,
             data_parallel_rank=data_parallel_rank,

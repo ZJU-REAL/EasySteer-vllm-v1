@@ -26,6 +26,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.outputs import STREAM_FINISHED, PoolingRequestOutput, RequestOutput
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import renderer_from_config
 from vllm.renderers.inputs.preprocess import extract_prompt_components
@@ -287,6 +288,7 @@ class AsyncLLM(EngineClient):
         params: SamplingParams | PoolingParams,
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
+        steer_vector_request: SteerVectorRequest | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
@@ -322,12 +324,13 @@ class AsyncLLM(EngineClient):
                 request_id,
                 prompt,
                 params,
-                arrival_time,
-                lora_request,
-                tokenization_kwargs,
-                trace_headers,
-                priority,
-                data_parallel_rank,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                steer_vector_request=steer_vector_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
             )
 
         # Convert Input --> Request.
@@ -353,6 +356,7 @@ class AsyncLLM(EngineClient):
                 supported_tasks=await self.get_supported_tasks(),
                 arrival_time=arrival_time,
                 lora_request=lora_request,
+                steer_vector_request=steer_vector_request,
                 tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers,
                 priority=priority,
@@ -421,6 +425,7 @@ class AsyncLLM(EngineClient):
         sampling_params: SamplingParams | PoolingParams,
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
+        steer_vector_request: SteerVectorRequest | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
@@ -432,6 +437,7 @@ class AsyncLLM(EngineClient):
             supported_tasks=await self.get_supported_tasks(),
             arrival_time=arrival_time,
             lora_request=lora_request,
+            steer_vector_request=steer_vector_request,
             tokenization_kwargs=tokenization_kwargs,
             trace_headers=trace_headers,
             priority=priority,
@@ -532,6 +538,7 @@ class AsyncLLM(EngineClient):
         *,
         prompt_text: str | None = None,
         lora_request: LoRARequest | None = None,
+        steer_vector_request: SteerVectorRequest | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
@@ -561,6 +568,7 @@ class AsyncLLM(EngineClient):
                 prompt,
                 sampling_params,
                 lora_request=lora_request,
+                steer_vector_request=steer_vector_request,
                 tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers,
                 priority=priority,
@@ -960,6 +968,14 @@ class AsyncLLM(EngineClient):
     async def pin_lora(self, lora_id: int) -> bool:
         """Prevent an adapter from being evicted."""
         return await self.engine_core.pin_lora_async(lora_id)
+
+    async def add_steer_vector(
+        self, steer_vector_request: SteerVectorRequest
+    ) -> bool:
+        """Load (or reload) a steer vector on all workers."""
+        return await self.engine_core.add_steer_vector_async(
+            steer_vector_request
+        )
 
     async def collective_rpc(
         self,

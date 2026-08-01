@@ -19,6 +19,7 @@ from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import renderer_from_config
@@ -222,6 +223,7 @@ class LLMEngine:
         params: SamplingParams | PoolingParams,
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
+        steer_vector_request: SteerVectorRequest | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
@@ -254,6 +256,7 @@ class LLMEngine:
                 supported_tasks=self.get_supported_tasks(),
                 arrival_time=arrival_time,
                 lora_request=lora_request,
+                steer_vector_request=steer_vector_request,
                 tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers,
                 priority=priority,
@@ -415,6 +418,14 @@ class LLMEngine:
     def pin_lora(self, lora_id: int) -> bool:
         """Prevent an adapter from being evicted."""
         return self.engine_core.pin_lora(lora_id)
+
+    def add_steer_vector(self, steer_vector_request: SteerVectorRequest) -> bool:
+        """Load a new steer vector into the engine for future requests."""
+        return self.engine_core.add_steer_vector(steer_vector_request)
+
+    def remove_steer_vector(self, steer_vector_id: int) -> bool:
+        """Remove an already loaded steer vector."""
+        return self.engine_core.remove_steer_vector(steer_vector_id)
 
     def collective_rpc(
         self,

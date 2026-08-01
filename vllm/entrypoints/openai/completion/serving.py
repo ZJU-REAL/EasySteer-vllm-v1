@@ -152,6 +152,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
             raw_request.state.request_metadata = request_metadata
 
         lora_request = self._maybe_get_adapters(request)
+        steer_vector_request = self._maybe_get_steer_vector(request)
 
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
@@ -209,6 +210,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     sampling_params,
                     request_id_item,
                     lora_request=lora_request,
+                    steer_vector_request=steer_vector_request,
                     trace_headers=trace_headers,
                     priority=request.priority,
                     data_parallel_rank=data_parallel_rank,
