@@ -111,14 +111,21 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.gpu.steer_vector_utils import (
+    SteerVectorState,
+    make_steer_vector_forward_kwargs,
+)
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.steer_vector_model_runner_mixin import (
+    SteerVectorModelRunnerMixin,
+)
 from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 
 logger = init_logger(__name__)
 
 
-class GPUModelRunner(LoRAModelRunnerMixin):
+class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -243,6 +250,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # LoRA-related workers.
         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
+        self.steer_vector_state = SteerVectorState()
         self.lora_capture_cases = [0]
         if self.lora_config:
             self.lora_capture_cases = get_lora_capture_cases(
@@ -290,6 +298,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.model = self.load_lora_model(
                     self.model, self.vllm_config, self.device
                 )
+            # Wrap model with steer vector support if enabled (in-place
+            # decoder-layer replacement; eager execution only).
+            self.model = self._wrap_model_with_steer_vectors(self.model)
 
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
@@ -765,6 +776,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.prompt_logprobs_worker is not None:
             self.prompt_logprobs_worker.remove_request(req_id)
         self.lora_state.remove_request(req_id)
+        self.steer_vector_state.remove_request(req_id)
         return True
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
@@ -818,6 +830,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 req_index, new_req_data.block_ids, overwrite=True
             )
             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
+            self.steer_vector_state.add_request(
+                req_id, new_req_data.steer_vector_request
+            )
 
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
                 assert self.sampler is not None
@@ -1229,6 +1244,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch.num_scheduled_tokens,
                 )
                 self._set_active_loras(*lora_inputs)
+
+            if self.vllm_config.steer_vector_config is not None:
+                # Hot-swap steer vectors for the current batch.
+                self.set_active_steer_vectors(
+                    self.steer_vector_state.make_steer_vector_inputs()
+                )
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
             input_batch = InputBatch.make_dummy(
@@ -1336,6 +1357,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_active_loras=batch_desc.num_active_loras,
             )
 
+            steer_vector_kwargs = {}
+            if self.vllm_config.steer_vector_config is not None and not dummy_run:
+                if batch_desc.cg_mode != CUDAGraphMode.NONE:
+                    raise RuntimeError(
+                        "Steer vectors on the V2 model runner require eager "
+                        "execution. Launch with enforce_eager=True."
+                    )
+                steer_vector_kwargs = make_steer_vector_forward_kwargs(input_batch)
+
             with set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -1346,6 +1376,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                **steer_vector_kwargs,
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:

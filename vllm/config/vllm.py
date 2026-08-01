@@ -551,15 +551,23 @@ class VllmConfig:
 
     @property
     def use_v2_model_runner(self) -> bool:
-        # Steer vector hooks are implemented only in the V1 GPU model runner
-        # (SteerVectorModelRunnerMixin / CaptureModelRunnerMixin). V2 would
-        # silently skip steering, so force V1 whenever steering is enabled.
+        # The V2 model runner supports steer vectors in eager mode only.
+        # CUDA-graph steering (steer_allow_cuda_graphs) and non-eager
+        # execution are implemented only in the V1 runner, so force V1 for
+        # those rather than silently skipping steering.
         if self.steer_vector_config is not None:
-            logger.warning_once(
-                "Steer vectors are enabled; using the V1 model runner "
-                "(Model Runner V2 does not support steering hooks)."
+            enforce_eager = (
+                self.model_config is not None and self.model_config.enforce_eager
             )
-            return False
+            if self.steer_vector_config.allow_cuda_graphs or not enforce_eager:
+                logger.warning_once(
+                    "Steer vectors with CUDA graphs or compiled execution "
+                    "use the V1 model runner; pass enforce_eager=True to "
+                    "allow the V2 model runner."
+                )
+                return False
+            # Eager-mode steering works on V2; fall through to the default
+            # runner selection.
 
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         if use_v2_model_runner is not None:
