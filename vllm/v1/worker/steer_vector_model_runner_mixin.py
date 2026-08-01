@@ -102,6 +102,18 @@ class SteerVectorModelRunnerMixin:
             )
         logger.info("Server-level steering vector loaded and active")
 
+    def preload_steer_vectors(
+        self, paths: list[str], algorithm: str = "direct"
+    ) -> bool:
+        """Load steering vectors into the worker's vector store ahead of
+        use, so request admission never blocks on disk I/O."""
+        mgr = getattr(self, "steer_vector_manager", None)
+        if mgr is None:
+            logger.warning("SteerVector not enabled, cannot preload vectors")
+            return False
+        mgr.preload_vectors(list(paths), algorithm)
+        return True
+
     def add_steer_vector(self, steer_vector_request: SteerVectorRequest) -> bool:
         """Add a steer vector to the model.
         

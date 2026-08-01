@@ -40,6 +40,10 @@ class BaseLayerWithSteerVector(nn.Module):
     pass
 
 
+# Per-request config slots live above this id; legacy adapter slots below.
+CONFIG_SLOT_BASE = 1000
+
+
 def _extract_hidden_states_and_residual(output):
     """
     Extract hidden_states and residual from DecoderLayer output.
@@ -136,6 +140,9 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         self.active_algorithm_name: str = "direct"
         self.algorithms: Dict[str, BaseSteerVectorAlgorithm] = {}
         self.layer_id: Optional[int] = None
+        # Per-request routing: config slot -> algorithm name for the slots
+        # configured on this layer (slots >= CONFIG_SLOT_BASE).
+        self.slot_algorithms: Dict[int, str] = {}
 
     def _get_or_create_algorithm(self, name: str, **kwargs) -> BaseSteerVectorAlgorithm:
         """Lazy load or get algorithm instance by name."""
@@ -157,7 +164,8 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         """
         # 1. Determine algorithm and extract its unique associated parameters
         algorithm_name = kwargs.pop("algorithm_name", "direct")
-        self.active_algorithm_name = algorithm_name
+        if index < CONFIG_SLOT_BASE:
+            self.active_algorithm_name = algorithm_name
         
         # Extract constructor parameters (e.g., normalize)
         init_kwargs = {}
@@ -177,8 +185,14 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         algo.set_steer_vector(index, **kwargs)
 
         # 3. Set intervention parameters (triggers and debug flags)
-        # Batch configure using InterventionController's unified interface
-        algo.params.configure_from_dict(kwargs)
+        if index >= CONFIG_SLOT_BASE:
+            # Per-request config slot: triggers live in a per-slot
+            # controller and must not disturb the legacy global state.
+            self.slot_algorithms[index] = algorithm_name
+            algo.slot_params(index).configure_from_dict(kwargs)
+        else:
+            # Batch configure using InterventionController's unified interface
+            algo.params.configure_from_dict(kwargs)
 
     def reset_steer_vector(self, index: int):
         """Reset the vector at specified index in all algorithms (or only the currently active one)."""
@@ -203,9 +217,6 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
 
     def process_output(self, output):
         """Apply the active steering algorithm to a decoder layer output."""
-        # Dynamically get the currently active algorithm and apply intervention
-        active_algo = self._get_or_create_algorithm(self.active_algorithm_name)
-
         # Extract hidden_states and residual from decoder layer output
         hidden_states, residual, other_outputs, original_format = _extract_hidden_states_and_residual(output)
 
@@ -215,8 +226,32 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         else:
             complete_hidden_states = hidden_states
 
-        # Apply algorithm transformation
-        modified_complete_hidden_states = active_algo.apply_intervention(complete_hidden_states)
+        # Per-request routing: when the forward context carries a
+        # sample->slot map, apply each batch-active config to its own
+        # requests' tokens only. Otherwise use the legacy global path.
+        ctx = get_forward_context() if get_forward_context is not None else None
+        token_slots = getattr(ctx, "steer_token_slots", None)
+        active_slots = getattr(ctx, "steer_active_slots", None)
+
+        if token_slots is not None and active_slots:
+            modified_complete_hidden_states = complete_hidden_states
+            for slot in active_slots:
+                algo_name = self.slot_algorithms.get(slot)
+                if algo_name is None:
+                    # This layer is not targeted by this config.
+                    continue
+                algo = self._get_or_create_algorithm(algo_name)
+                modified_complete_hidden_states = algo.apply_intervention(
+                    modified_complete_hidden_states,
+                    slot=slot,
+                    token_slots=token_slots,
+                )
+        else:
+            # Dynamically get the currently active algorithm and apply it
+            active_algo = self._get_or_create_algorithm(self.active_algorithm_name)
+            modified_complete_hidden_states = active_algo.apply_intervention(
+                complete_hidden_states
+            )
 
         # Reconstruct output format
         if residual is not None:

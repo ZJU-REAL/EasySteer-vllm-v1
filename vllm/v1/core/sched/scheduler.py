@@ -663,13 +663,16 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Record the SteerVectors in scheduled_running_reqs
-        scheduled_steer_vectors: set[int] = set()
+        # Record the steer vector files used by scheduled_running_reqs.
+        # Capacity is bounded by resident vectors (files), not configs:
+        # any number of configs (scales/triggers) share one loaded vector.
+        scheduled_steer_vectors: set = set()
         if self.steer_vector_config:
             scheduled_steer_vectors = set(
-                req.steer_vector_request.steer_vector_int_id
+                req.steer_vector_request.local_path
+                or req.steer_vector_request.steer_vector_int_id
                 for req in scheduled_running_reqs
-                if req.steer_vector_request and req.steer_vector_request.steer_vector_int_id > 0
+                if req.steer_vector_request
             )
             assert len(scheduled_steer_vectors) <= self.steer_vector_config.max_steer_vectors
 
@@ -725,12 +728,14 @@ class Scheduler(SchedulerInterface):
                     and request.steer_vector_request
                     and (
                         len(scheduled_steer_vectors) == self.steer_vector_config.max_steer_vectors
-                        and request.steer_vector_request.steer_vector_int_id not in scheduled_steer_vectors
+                        and (request.steer_vector_request.local_path
+                             or request.steer_vector_request.steer_vector_int_id)
+                        not in scheduled_steer_vectors
                     )
                 ):
                     # Scheduling would exceed max_steer_vectors, skip.
-                    self.waiting.pop_request()
-                    skipped_waiting_requests.prepend_request(request)
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
                     continue
 
                 num_external_computed_tokens = 0
@@ -1049,7 +1054,9 @@ class Scheduler(SchedulerInterface):
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
                 if self.steer_vector_config and request.steer_vector_request:
-                    scheduled_steer_vectors.add(request.steer_vector_request.steer_vector_int_id)
+                    scheduled_steer_vectors.add(
+                        request.steer_vector_request.local_path
+                        or request.steer_vector_request.steer_vector_int_id)
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
                     request_id
                 )

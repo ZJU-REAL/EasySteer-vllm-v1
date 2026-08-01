@@ -1250,6 +1250,11 @@ class Worker(WorkerBase):
     def add_steer_vector(self, steer_vector_request: SteerVectorRequest) -> bool:
         return self.model_runner.add_steer_vector(steer_vector_request)
 
+    def preload_steer_vectors(
+        self, paths: list[str], algorithm: str = "direct"
+    ) -> bool:
+        return self.model_runner.preload_steer_vectors(paths, algorithm)
+
     def remove_steer_vector(self, steer_vector_id: int) -> bool:
         return self.model_runner.remove_steer_vector(steer_vector_id)
 

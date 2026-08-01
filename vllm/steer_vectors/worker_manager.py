@@ -19,6 +19,34 @@ from vllm.steer_vectors.request import SteerVectorRequest
 logger = logging.getLogger(__name__)
 
 
+# Config slots (per-request routing) are allocated from a separate id range
+# so they never collide with legacy adapter slots (0..capacity).
+from vllm.steer_vectors.layers import CONFIG_SLOT_BASE as _CONFIG_SLOT_BASE
+
+
+def config_fingerprint(request: SteerVectorRequest) -> str:
+    """Stable identity of a steering *configuration* (not just the vector).
+
+    Requests with the same fingerprint share one layer slot; the vector
+    payload itself is deduplicated separately by the VectorStore.
+    """
+    return repr((
+        request.local_path,
+        request.scale,
+        tuple(request.target_layers) if request.target_layers else None,
+        request.algorithm,
+        request.normalize,
+        tuple(request.prefill_trigger_tokens or ()),
+        tuple(request.prefill_trigger_positions or ()),
+        tuple(request.prefill_exclude_tokens or ()),
+        tuple(request.prefill_exclude_positions or ()),
+        tuple(request.generate_trigger_tokens or ()),
+        request.generate_first_k_tokens,
+        request.generate_after_k_tokens,
+        request.debug,
+    ))
+
+
 class WorkerSteerVectorManager:
     """WorkerSteerVectorManager that manages steer vector models on the worker side.
 
@@ -38,6 +66,112 @@ class WorkerSteerVectorManager:
         self._steer_vector_model_cls = steer_vector_model_cls
         self.steer_vector_config = steer_vector_config
         self.device = device
+        from vllm.steer_vectors.store import VectorStore
+        self.vector_store = VectorStore(str(device), steer_vector_config)
+        # Per-request config routing state: fingerprint -> [slot, refcount,
+        # request]; req_id -> fingerprint.
+        self._config_slots: dict[str, list] = {}
+        self._req_fingerprints: dict[str, str] = {}
+        self._free_slots: list[int] = []
+        self._next_slot = _CONFIG_SLOT_BASE
+
+    # ------------------------------------------------------------------
+    # Per-request config routing (Phase C)
+    # ------------------------------------------------------------------
+
+    def preload_vectors(self, paths: list[str], algorithm: str = "direct"):
+        for path in paths:
+            self.vector_store.preload(path, algorithm)
+
+    def acquire_config(
+        self, req_id: str, request: SteerVectorRequest
+    ) -> int | None:
+        """Register a live request's steering config; returns its slot.
+
+        Returns None for configs that cannot be routed per-request yet
+        (multi-vector and moe_router fall back to the legacy global path).
+        """
+        if request.is_multi_vector or request.algorithm == "moe_router":
+            logger.warning(
+                "Per-request routing does not yet support %s configs; "
+                "falling back to globally-activated steering.",
+                "multi-vector" if request.is_multi_vector else "moe_router",
+            )
+            return None
+
+        fp = config_fingerprint(request)
+        entry = self._config_slots.get(fp)
+        if entry is not None:
+            entry[1] += 1
+            self._req_fingerprints[req_id] = fp
+            return entry[0]
+
+        slot = self._free_slots.pop() if self._free_slots else self._next_slot
+        if slot == self._next_slot:
+            self._next_slot += 1
+
+        model = self.vector_store.get(
+            request.local_path, request.algorithm, lazy=True
+        )
+        self._distribute_config(slot, model, request)
+        self._config_slots[fp] = [slot, 1, request]
+        self._req_fingerprints[req_id] = fp
+        logger.debug("Configured steering slot %d for %s", slot, fp)
+        return slot
+
+    def release_config(self, req_id: str) -> None:
+        fp = self._req_fingerprints.pop(req_id, None)
+        if fp is None:
+            return
+        entry = self._config_slots.get(fp)
+        if entry is None:
+            return
+        entry[1] -= 1
+        if entry[1] > 0:
+            return
+        slot = entry[0]
+        del self._config_slots[fp]
+        if self._adapter_manager is not None:
+            for module in self._adapter_manager.modules.values():
+                module.reset_steer_vector(slot)
+                slot_algos = getattr(module, "slot_algorithms", None)
+                if slot_algos is not None:
+                    slot_algos.pop(slot, None)
+        self._free_slots.append(slot)
+
+    def slot_for_request(self, req_id: str) -> int | None:
+        fp = self._req_fingerprints.get(req_id)
+        if fp is None:
+            return None
+        entry = self._config_slots.get(fp)
+        return None if entry is None else entry[0]
+
+    def _distribute_config(
+        self, slot: int, model: SteerVectorModel, request: SteerVectorRequest
+    ) -> None:
+        """Write a config's scaled payload + triggers into layer slot state."""
+        assert self._adapter_manager is not None
+        params = {
+            "algorithm_name": request.algorithm,
+            "scale_factor": request.scale,
+            "prefill_trigger_tokens": request.prefill_trigger_tokens,
+            "prefill_trigger_positions": request.prefill_trigger_positions,
+            "prefill_exclude_tokens": request.prefill_exclude_tokens,
+            "prefill_exclude_positions": request.prefill_exclude_positions,
+            "generate_trigger_tokens": request.generate_trigger_tokens,
+            "generate_first_k_tokens": request.generate_first_k_tokens,
+            "generate_after_k_tokens": request.generate_after_k_tokens,
+            "debug": request.debug,
+            "normalize": request.normalize,
+        }
+        target_layers = request.target_layers
+        for layer_idx, payload in (model.layer_payloads or {}).items():
+            if target_layers and layer_idx not in target_layers:
+                continue
+            for module in self._adapter_manager._get_modules_for_layer(
+                layer_idx, "decoder_layer"
+            ):
+                module.set_steer_vector(slot, payload=payload, **params)
 
     @property
     def is_enabled(self) -> bool:

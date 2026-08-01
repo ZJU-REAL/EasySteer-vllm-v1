@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Content-addressed store of loaded steer vector payloads.
+
+Separates *vector data* (tensors loaded from disk, deduplicated by path)
+from *application config* (scale / triggers / layers, which are per request
+and cost nothing). Loading through the store happens at preload time or at
+request admission — never inside the forward pass.
+"""
+
+import logging
+from collections import OrderedDict
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vllm.config import SteerVectorConfig
+    from vllm.steer_vectors.models import SteerVectorModel
+
+logger = logging.getLogger(__name__)
+
+
+class VectorStore:
+    """LRU cache of loaded steer vector payloads, keyed by (path, algorithm).
+
+    Entries hold unscaled per-layer payload tensors on the target device;
+    per-request scaling is applied when a config is distributed to layer
+    slots, so any number of configs can share one resident entry.
+    """
+
+    def __init__(self, device: str, steer_vector_config: "SteerVectorConfig"):
+        self.device = device
+        self.steer_vector_config = steer_vector_config
+        self.capacity = max(1, steer_vector_config.max_steer_vectors)
+        self._entries: OrderedDict[tuple[str, str], "SteerVectorModel"] = (
+            OrderedDict()
+        )
+        self._warned_lazy: set[str] = set()
+
+    def get(
+        self, path: str, algorithm: str, *, lazy: bool = False
+    ) -> "SteerVectorModel":
+        """Return the loaded entry for (path, algorithm), loading if needed.
+
+        With lazy=True (request admission), a one-time warning recommends
+        preloading. Raises on load failure.
+        """
+        key = (path, algorithm)
+        entry = self._entries.get(key)
+        if entry is not None:
+            self._entries.move_to_end(key)
+            return entry
+
+        if lazy and path not in self._warned_lazy:
+            self._warned_lazy.add(path)
+            logger.warning(
+                "Steer vector %s was not preloaded; loading it now blocks "
+                "request admission once. Use "
+                "LLM.preload_steer_vectors([...]) to avoid this.",
+                path,
+            )
+
+        from vllm.steer_vectors.models import SteerVectorModel
+
+        entry = SteerVectorModel.from_local_checkpoint(
+            steer_vector_model_path=path,
+            steer_vector_id=0,
+            config=self.steer_vector_config,
+            device=self.device,
+            scale_factor=1.0,
+            algorithm=algorithm,
+            target_layers=None,
+        )
+        self._entries[key] = entry
+        logger.info("Loaded steer vector into store: %s (%s)", path, algorithm)
+        while len(self._entries) > self.capacity:
+            evicted_key, _ = self._entries.popitem(last=False)
+            logger.info("Evicted steer vector from store: %s", evicted_key[0])
+        return entry
+
+    def preload(self, path: str, algorithm: str = "direct") -> None:
+        self.get(path, algorithm, lazy=False)
+
+    def unload(self, path: str) -> bool:
+        removed = False
+        for key in [k for k in self._entries if k[0] == path]:
+            del self._entries[key]
+            removed = True
+        return removed
+
+    def resident_paths(self) -> list[str]:
+        return [k[0] for k in self._entries]

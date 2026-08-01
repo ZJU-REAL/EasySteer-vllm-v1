@@ -183,6 +183,14 @@ class ForwardContext:
       attention metadata which varies across backends
     """
 
+    steer_token_slots: torch.Tensor | None = None
+    """Per-request steering routing: [total_tokens] config slot id for each
+    batch token (-1 = unsteered). None when no per-request configs are live.
+    """
+
+    steer_active_slots: list[int] | None = None
+    """Config slots present in the current batch, for layer-side iteration."""
+
     # Boolean mask over the token axis: True for padding rows that are not real
     # tokens. Consumers can use it to skip work for padded tokens. None when
     # the producer does not set it.
@@ -257,6 +265,8 @@ def create_forward_context(
     num_computed_tokens_cpu: torch.Tensor | None = None,
     num_output_tokens_cpu: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    steer_token_slots: torch.Tensor | None = None,
+    steer_active_slots: list[int] | None = None,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -279,6 +289,8 @@ def create_forward_context(
         num_computed_tokens_cpu=num_computed_tokens_cpu,
         num_output_tokens_cpu=num_output_tokens_cpu,
         query_start_loc=query_start_loc,
+        steer_token_slots=steer_token_slots,
+        steer_active_slots=steer_active_slots,
     )
 
 
@@ -313,6 +325,8 @@ def set_forward_context(
     num_computed_tokens_cpu: torch.Tensor | None = None,
     num_output_tokens_cpu: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    steer_token_slots: torch.Tensor | None = None,
+    steer_active_slots: list[int] | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -386,6 +400,8 @@ def set_forward_context(
         num_computed_tokens_cpu=num_computed_tokens_cpu,
         num_output_tokens_cpu=num_output_tokens_cpu,
         query_start_loc=query_start_loc,
+        steer_token_slots=steer_token_slots,
+        steer_active_slots=steer_active_slots,
     )
 
     try:

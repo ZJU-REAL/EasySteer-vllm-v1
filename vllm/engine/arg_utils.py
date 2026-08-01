@@ -605,7 +605,7 @@ class EngineArgs:
     enable_moe_shared_loras: bool = LoRAConfig.enable_moe_shared_loras
     # Steer Vector fields
     enable_steer_vector: bool = False
-    max_steer_vectors: int = 1
+    max_steer_vectors: int = 8
     steer_allow_cuda_graphs: bool = False
     steer_vector_path: str | None = None
     steer_scale: float = 1.0

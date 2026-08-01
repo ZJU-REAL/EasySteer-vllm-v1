@@ -40,9 +40,21 @@ def extract_samples_info(attn_metadata) -> Optional[Dict[str, torch.Tensor]]:
     
     # Extract num_computed_tokens_cpu for prefix cache support
     num_computed_tokens_cpu = get_num_computed_tokens(attn_metadata)
-    
+
     # Extract num_output_tokens for generation position control
     num_output_tokens_cpu = get_num_output_tokens(attn_metadata)
+
+    # Downstream consumers index these with GPU sample ids; the runner
+    # provides CPU tensors, so move them to the batch device here once.
+    device = query_start_loc.device
+    if num_computed_tokens_cpu is not None:
+        num_computed_tokens_cpu = num_computed_tokens_cpu.to(
+            device, non_blocking=True
+        )
+    if num_output_tokens_cpu is not None:
+        num_output_tokens_cpu = num_output_tokens_cpu.to(
+            device, non_blocking=True
+        )
     
     # Calculate sample lengths
     starts = query_start_loc[:-1]  # [num_samples]

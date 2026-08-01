@@ -34,7 +34,7 @@ class SteerVectorConfig:
     control vectors to hidden states at specific layers.
     """
 
-    max_steer_vectors: int = Field(default=1, ge=1)
+    max_steer_vectors: int = Field(default=8, ge=1)
     """Maximum number of steer vectors in a single batch."""
     
     max_cpu_steer_vectors: int | None = None

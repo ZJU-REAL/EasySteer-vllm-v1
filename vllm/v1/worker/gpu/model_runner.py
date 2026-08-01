@@ -776,7 +776,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin):
         if self.prompt_logprobs_worker is not None:
             self.prompt_logprobs_worker.remove_request(req_id)
         self.lora_state.remove_request(req_id)
-        self.steer_vector_state.remove_request(req_id)
+        self.steer_vector_state.remove_request(
+            req_id, getattr(self, "steer_vector_manager", None)
+        )
         return True
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
@@ -831,7 +833,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin):
             )
             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
             self.steer_vector_state.add_request(
-                req_id, new_req_data.steer_vector_request
+                req_id,
+                new_req_data.steer_vector_request,
+                getattr(self, "steer_vector_manager", None),
             )
 
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
@@ -1246,10 +1250,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin):
                 self._set_active_loras(*lora_inputs)
 
             if self.vllm_config.steer_vector_config is not None:
-                # Hot-swap steer vectors for the current batch.
-                self.set_active_steer_vectors(
-                    self.steer_vector_state.make_steer_vector_inputs()
-                )
+                # Routed configs were distributed at request admission;
+                # only legacy-path requests still need global hot-swap.
+                legacy_requests = self.steer_vector_state.legacy_requests()
+                if legacy_requests:
+                    self.set_active_steer_vectors(legacy_requests)
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
             input_batch = InputBatch.make_dummy(
@@ -1364,7 +1369,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin):
                         "Steer vectors on the V2 model runner require eager "
                         "execution. Launch with enforce_eager=True."
                     )
-                steer_vector_kwargs = make_steer_vector_forward_kwargs(input_batch)
+                steer_vector_kwargs = make_steer_vector_forward_kwargs(
+                    input_batch, self.steer_vector_state
+                )
 
             with set_forward_context(
                 attn_metadata,

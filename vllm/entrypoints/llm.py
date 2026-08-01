@@ -838,6 +838,21 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         """
         self.llm_engine.wake_up(tags)
 
+    def preload_steer_vectors(
+        self, paths: list[str], algorithm: str = "direct"
+    ) -> None:
+        """Load steering vectors on all workers ahead of use.
+
+        Preloaded vectors are held in a per-worker LRU store (capacity
+        ``max_steer_vectors``), so subsequent ``generate`` calls with
+        ``steer_vector_request`` configs referencing these paths never
+        block on disk I/O. Any number of configs (e.g. different scales
+        or triggers) share one resident copy of a vector.
+        """
+        self.llm_engine.collective_rpc(
+            "preload_steer_vectors", args=(paths, algorithm)
+        )
+
     def get_metrics(self) -> list["Metric"]:
         """Return a snapshot of aggregated metrics from Prometheus.
 
