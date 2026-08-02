@@ -1181,23 +1181,14 @@ class VllmConfig:
                 and self.model_config is not None
             ):
                 self.steer_vector_config.steer_vector_dtype = self.model_config.dtype
-            # Steer vectors are incompatible with prefix caching: raise a
-            # hard error rather than silently fixing — see commit 9b999cb
-            # for the prefix cache collision bug that invalidated an
-            # entire experiment run. (Chunked prefill is supported: phase
-            # classification and trigger positions come from scheduler
-            # ground truth in the forward context.)
-            if (
-                self.cache_config is not None
-                and self.cache_config.enable_prefix_caching
-            ):
-                raise ValueError(
-                    "Steer vectors are incompatible with prefix caching. "
-                    "Prefix cache keys ignore steering scale, so KV states "
-                    "are silently reused across different scales, disabling "
-                    "steering entirely. Set --no-enable-prefix-caching or "
-                    "enable_prefix_caching=False when using steering."
-                )
+            # Steering is prefix-caching-safe: per-request configs
+            # participate in block hashes via their fingerprint (see
+            # _gen_steer_vector_extra_hash_keys), so KV is only shared
+            # between requests with identical steering; server-level
+            # steering salts every hash with the startup config's
+            # fingerprint, and runtime scale updates reset the prefix
+            # cache (both upstream mechanisms). Commit 9b999cb was the
+            # collision this key design prevents.
 
         # Steering under compiled execution runs through the
         # vllm::steer_apply splitting op: steering executes eagerly between

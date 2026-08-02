@@ -31,6 +31,25 @@ class CaptureModelRunnerMixin:
             self.capture_session = CaptureSession()
         return self.capture_session
 
+    def _check_capture_compatible(self) -> None:
+        """Reject capture on engines where it would be silently incomplete.
+
+        With prefix caching, cache-hit tokens are never recomputed, so
+        their hidden states / router logits cannot be captured (verified:
+        a warm-cache request captures only the uncached suffix).
+        """
+        vllm_config = getattr(self, "vllm_config", None)
+        if (
+            vllm_config is not None
+            and vllm_config.cache_config is not None
+            and vllm_config.cache_config.enable_prefix_caching
+        ):
+            raise RuntimeError(
+                "Capture requires enable_prefix_caching=False: prefix-cache "
+                "hits skip recomputation, so the cached tokens' states "
+                "would be silently missing from the capture."
+            )
+
     def _attach_capture_hooks(self, model: nn.Module) -> nn.Module:
         """Attach capture hooks (once, at load). Model tree is untouched.
 
@@ -70,6 +89,7 @@ class CaptureModelRunnerMixin:
         config_kwargs: layers (list|None), dtype (e.g. 'float16'),
         positions ('all'|'last'|'mean'), max_tokens (int|None).
         """
+        self._check_capture_compatible()
         self._capture_session().enable_stream(stream, **config_kwargs)
         return True
 
@@ -90,6 +110,7 @@ class CaptureModelRunnerMixin:
     # ------------------------------------------------------------------
 
     def enable_hidden_states_capture(self, **config_kwargs):
+        self._check_capture_compatible()
         self._capture_session().enable_stream(HIDDEN_STATES, **config_kwargs)
 
     def disable_hidden_states_capture(self):
@@ -105,6 +126,7 @@ class CaptureModelRunnerMixin:
         return self._capture_session().stream_status(HIDDEN_STATES)
 
     def enable_moe_router_logits_capture(self, **config_kwargs):
+        self._check_capture_compatible()
         self._capture_session().enable_stream(ROUTER_LOGITS, **config_kwargs)
 
     def disable_moe_router_logits_capture(self):

@@ -869,20 +869,20 @@ def _register_steering_endpoints(app: FastAPI) -> None:
                 object.__setattr__(steer_config, "server_scale",
                                    float(new_scale))
 
-                from vllm.steer_vectors.request import SteerVectorRequest
-                server_request = SteerVectorRequest(
-                    steer_vector_name="__server__",
-                    steer_vector_int_id=1,
-                    steer_vector_local_path=steer_config.server_vector_path,
-                    scale=float(new_scale),
-                    target_layers=steer_config.server_target_layers,
-                    algorithm=steer_config.server_algorithm,
-                    normalize=steer_config.server_normalize,
-                    prefill_trigger_tokens=[-1],
-                    generate_trigger_tokens=[-1],
-                )
+                from vllm.steer_vectors.request import build_server_request
                 engine_client = raw_request.app.state.engine_client
-                await engine_client.add_steer_vector(server_request)
+                await engine_client.add_steer_vector(
+                    build_server_request(steer_config)
+                )
+                # Cached KV was steered under the old scale; drop it so
+                # new requests never reuse stale blocks.
+                vllm_config = getattr(engine_client, "vllm_config", None)
+                if (
+                    vllm_config is not None
+                    and vllm_config.cache_config is not None
+                    and vllm_config.cache_config.enable_prefix_caching
+                ):
+                    await engine_client.reset_prefix_cache()
 
         return JSONResponse(content={
             "active": True,

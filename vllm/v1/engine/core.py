@@ -222,6 +222,19 @@ class EngineCore:
                 hash_block_size, caching_hash_fn
             )
 
+            # Server-level steering steers every request without a
+            # per-request config; salt all block hashes with the server
+            # config's identity (see steer_vectors.cache_salt).
+            steer_config = vllm_config.steer_vector_config
+            if steer_config is not None and steer_config.has_server_config:
+                from vllm.steer_vectors.cache_salt import set_server_steer_salt
+                from vllm.steer_vectors.request import build_server_request
+                from vllm.steer_vectors.worker_manager import config_fingerprint
+
+                set_server_steer_salt(
+                    config_fingerprint(build_server_request(steer_config))
+                )
+
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )

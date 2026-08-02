@@ -129,7 +129,15 @@ class StreamStore:
 
 
 def _sample_reduce(tensor: torch.Tensor, mode: str) -> torch.Tensor:
-    """Reduce a [tokens, dim] step tensor to one row per sample."""
+    """Reduce a [tokens, dim] step tensor to one row per sample.
+
+    Under chunked prefill, 'last' keeps only samples whose chunk is
+    final (decode samples, or prefill chunks reaching the prompt end),
+    so each sample contributes one row per logical step, not one per
+    chunk. 'mean' is inherently per-step: continuation chunks produce
+    per-chunk means (warned once) — use 'all' and reduce client-side
+    when chunked prompts need exact means.
+    """
     if mode == "all":
         return tensor
     from vllm.forward_context import get_forward_context
@@ -145,11 +153,28 @@ def _sample_reduce(tensor: torch.Tensor, mode: str) -> torch.Tensor:
         # No sample boundaries available; keep all tokens.
         return tensor
     qsl = samples_info["query_start_loc"].to(tensor.device)
-    ends = qsl[1:].clamp(max=tensor.shape[0])
-    if mode == "last":
-        return tensor[(ends - 1).clamp(min=0)]
-    # mean
     starts = qsl[:-1].clamp(max=tensor.shape[0])
+    ends = qsl[1:].clamp(max=tensor.shape[0])
+    num_computed = samples_info.get("num_computed")
+    num_prompt = samples_info.get("num_prompt_tokens")
+    if mode == "last":
+        idx = (ends - 1).clamp(min=0)
+        if num_computed is not None and num_prompt is not None:
+            # Keep decode samples and final prefill chunks only.
+            final = (num_computed + (ends - starts)) >= num_prompt.to(ends.device)
+            idx = idx[final]
+        return tensor[idx]
+    # mean
+    if (
+        num_computed is not None
+        and num_prompt is not None
+        and bool(((num_computed > 0) & (num_computed < num_prompt)).any())
+    ):
+        logger.warning_once(
+            "Capture 'mean' reduction under chunked prefill produces one "
+            "mean per chunk, not per prompt; use positions='all' and "
+            "reduce client-side for chunked prompts."
+        )
     rows = []
     for s, e in zip(starts.tolist(), ends.tolist()):
         rows.append(tensor[s:e].mean(dim=0) if e > s else torch.zeros_like(tensor[0]))

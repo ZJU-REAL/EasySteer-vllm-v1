@@ -40,9 +40,9 @@ class SteerVectorModelRunnerMixin:
         If server-level steering is configured, it is installed on the
         default routing slot before compilation/graph capture.
         """
-        if not hasattr(self, 'steer_vector_manager'):
+        if not hasattr(self, "steer_vector_manager"):
             self.steer_vector_manager = None
-            if hasattr(self, 'vllm_config') and self.vllm_config.steer_vector_config:  # type: ignore
+            if hasattr(self, "vllm_config") and self.vllm_config.steer_vector_config:  # type: ignore
                 self._init_steer_vector_manager(self.vllm_config)  # type: ignore
 
         if self.steer_vector_manager is not None:
@@ -63,7 +63,7 @@ class SteerVectorModelRunnerMixin:
         """Install the server-level steering config on the default slot."""
         if self.steer_vector_manager is None:
             return
-        vllm_config = getattr(self, 'vllm_config', None)
+        vllm_config = getattr(self, "vllm_config", None)
         if vllm_config is None:
             return
         steer_config = vllm_config.steer_vector_config  # type: ignore
@@ -79,18 +79,9 @@ class SteerVectorModelRunnerMixin:
             steer_config.server_algorithm,
             steer_config.server_normalize,
         )
-        server_request = SteerVectorRequest(
-            steer_vector_name="__server__",
-            steer_vector_int_id=1,
-            steer_vector_local_path=steer_config.server_vector_path,
-            scale=steer_config.server_scale,
-            target_layers=steer_config.server_target_layers,
-            algorithm=steer_config.server_algorithm,
-            normalize=steer_config.server_normalize,
-            prefill_trigger_tokens=[-1],
-            generate_trigger_tokens=[-1],
-        )
-        self.steer_vector_manager.set_server_config(server_request)
+        from vllm.steer_vectors.request import build_server_request
+
+        self.steer_vector_manager.set_server_config(build_server_request(steer_config))
         logger.info("Server-level steering vector loaded and active")
 
     def preload_steer_vectors(
@@ -110,12 +101,33 @@ class SteerVectorModelRunnerMixin:
         if self.steer_vector_manager is None:
             logger.warning("SteerVector not enabled, cannot add steer vector")
             return False
+        vllm_config = getattr(self, "vllm_config", None)
+        if (
+            vllm_config is not None
+            and vllm_config.cache_config is not None
+            and vllm_config.cache_config.enable_prefix_caching
+            and not (
+                vllm_config.steer_vector_config is not None
+                and vllm_config.steer_vector_config.has_server_config
+            )
+        ):
+            # Replacing a startup server config (scale updates) is fine:
+            # hashes are salted and the update path resets the prefix
+            # cache. A fresh install is not — pre-install blocks were
+            # hashed without any salt.
+            raise RuntimeError(
+                "Cannot install server-level steering at runtime on a "
+                "prefix-caching engine without a startup server config "
+                "(--steer-vector-path): existing cache blocks were hashed "
+                "without the server salt."
+            )
 
         # Handle msgspec deserialization - convert list back to SteerVectorRequest
         if isinstance(steer_vector_request, (list, tuple)):
             import msgspec
 
             from vllm.steer_vectors.request import SteerVectorRequest as SVR
+
             steer_vector_request = msgspec.convert(steer_vector_request, type=SVR)
 
         return self.steer_vector_manager.set_server_config(steer_vector_request)

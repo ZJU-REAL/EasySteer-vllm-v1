@@ -57,6 +57,50 @@ def _has_triggers(obj) -> bool:
     return any(getattr(obj, name) is not None for name in STEER_TRIGGER_FIELDS)
 
 
+def build_server_request(steer_config) -> "SteerVectorRequest":
+    """The canonical server-level steering request for a SteerVectorConfig.
+
+    Single source of truth for what server-level steering does (used by
+    the worker install path, the runtime scale-update endpoint, and the
+    prefix-cache salt): the configured vector applied globally to all
+    tokens of every request.
+    """
+    return SteerVectorRequest(
+        steer_vector_name="__server__",
+        steer_vector_int_id=1,
+        steer_vector_local_path=steer_config.server_vector_path,
+        scale=steer_config.server_scale,
+        target_layers=steer_config.server_target_layers,
+        algorithm=steer_config.server_algorithm,
+        normalize=steer_config.server_normalize,
+        prefill_trigger_tokens=[-1],
+        generate_trigger_tokens=[-1],
+    )
+
+
+def is_prompt_length_sensitive(request) -> bool:
+    """Whether the config's effect on a token depends on the request's
+    prompt length (and not just the token's absolute position).
+
+    True for negative trigger/exclude positions (resolved from the end
+    of the prompt) and first_k/after_k windows (relative to the end of
+    the prompt). Used by prefix-cache block hashing: such configs can
+    only share KV blocks between requests with equal prompt lengths.
+    """
+
+    def _sensitive(obj) -> bool:
+        return (
+            any(p < 0 for p in (obj.prefill_trigger_positions or []))
+            or any(p < 0 for p in (obj.prefill_exclude_positions or []))
+            or obj.generate_first_k_tokens is not None
+            or obj.generate_after_k_tokens is not None
+        )
+
+    if _sensitive(request):
+        return True
+    return any(_sensitive(vc) for vc in request.vector_configs or [])
+
+
 def _assert_schema_complete(cls, field_names, required) -> None:
     missing = set(required) - set(field_names)
     assert not missing, (

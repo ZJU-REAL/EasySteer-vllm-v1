@@ -129,8 +129,9 @@ from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 logger = init_logger(__name__)
 
 
-class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin,
-                     CaptureModelRunnerMixin):
+class GPUModelRunner(
+    LoRAModelRunnerMixin, SteerVectorModelRunnerMixin, CaptureModelRunnerMixin
+):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -1367,8 +1368,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin,
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
-            if (steer_config is not None and not steer_full_graph
-                    and not dummy_run):
+            if steer_config is not None and not steer_full_graph and not dummy_run:
                 # Config validation downgrades full cudagraphs when steering
                 # runs in piecewise mode; a FULL dispatch here would
                 # silently skip steering.
@@ -1388,8 +1388,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin,
             )
 
             steer_vector_kwargs = {}
-            if (steer_config is not None and not steer_full_graph
-                    and not dummy_run):
+            if steer_config is not None and not steer_full_graph and not dummy_run:
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE and (
                     "vllm::steer_apply"
                     not in (self.compilation_config.splitting_ops or [])
@@ -1405,20 +1404,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin,
                 steer_vector_kwargs = make_steer_vector_forward_kwargs(
                     input_batch,
                     self.steer_vector_state,
-                    default_slot=(
-                        -1 if manager is None else manager.server_slot
-                    ),
+                    default_slot=(-1 if manager is None else manager.server_slot),
                 )
             if not steer_vector_kwargs and not dummy_run:
-                # Capture-only runs still need sample boundaries in the
-                # forward context (per-sample position reductions).
+                # Capture-only runs still need batch geometry in the
+                # forward context (per-sample position reductions, which
+                # are chunk-aware and read prompt lengths / computed
+                # counts as well as sample boundaries).
                 capture_session = getattr(self, "capture_session", None)
                 if capture_session is not None and capture_session.any_enabled():
-                    steer_vector_kwargs = {
-                        "query_start_loc": input_batch.query_start_loc[
-                            : input_batch.num_reqs + 1
-                        ],
-                    }
+                    steer_vector_kwargs = make_steer_vector_forward_kwargs(input_batch)
 
             with set_forward_context(
                 attn_metadata,
