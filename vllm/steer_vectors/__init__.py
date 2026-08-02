@@ -10,14 +10,10 @@ from vllm.steer_vectors.layers import DecoderLayerWithSteerVector
 from vllm.steer_vectors.models import (
     SteerVectorModel,
     SteerVectorModelManager,
-    LRUCacheSteerVectorModelManager,
     create_sv_manager,
 )
 from vllm.steer_vectors.request import SteerVectorRequest, VectorConfig
-from vllm.steer_vectors.worker_manager import (
-    WorkerSteerVectorManager,
-    LRUCacheWorkerSteerVectorManager,
-)
+from vllm.steer_vectors.worker_manager import WorkerSteerVectorManager
 # Configuration (for advanced users who need to extend wrapper types)
 from vllm.steer_vectors import config
 
@@ -27,15 +23,12 @@ __all__ = [
     # Models
     "SteerVectorModel",
     "SteerVectorModelManager",
-    "LRUCacheSteerVectorModelManager",
     "create_sv_manager",
     # Request
     "SteerVectorRequest",
     "VectorConfig",
     # Worker Manager
     "WorkerSteerVectorManager",
-    "LRUCacheWorkerSteerVectorManager",
     # Configuration
     "config",
 ]
-

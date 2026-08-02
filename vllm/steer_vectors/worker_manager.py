@@ -11,11 +11,11 @@ from vllm.config import SteerVectorConfig
 from vllm.steer_vectors.models import (
     SteerVectorModel,
     SteerVectorModelManager,
-    LRUCacheSteerVectorModelManager,
     create_sv_manager
 )
 from vllm.steer_vectors.request import (
     STEER_APPLY_FIELDS,
+    STEER_MOE_FIELDS,
     SteerVectorRequest,
     layer_apply_kwargs,
     steer_params_dict,
@@ -37,10 +37,22 @@ def config_fingerprint(request: SteerVectorRequest) -> str:
     from the canonical field registry so new parameters participate
     automatically.
     """
+    def _canon(obj, fields):
+        out = []
+        for name in fields:
+            value = getattr(obj, name)
+            out.append(tuple(value) if isinstance(value, list) else value)
+        return out
+
     values = [request.local_path, request.debug]
-    for name in STEER_APPLY_FIELDS:
-        value = getattr(request, name)
-        values.append(tuple(value) if isinstance(value, list) else value)
+    values.extend(_canon(request, STEER_APPLY_FIELDS))
+    if request.is_multi_vector:
+        values.append(request.conflict_resolution)
+        for vc in request.vector_configs:
+            values.append(vc.path)
+            values.extend(_canon(vc, STEER_APPLY_FIELDS))
+    if request.algorithm == "moe_router":
+        values.extend(_canon(request, STEER_MOE_FIELDS))
     return repr(tuple(values))
 
 
@@ -71,6 +83,119 @@ class WorkerSteerVectorManager:
         self._req_fingerprints: dict[str, str] = {}
         self._free_slots: list[int] = []
         self._next_slot = _CONFIG_SLOT_BASE
+        # moe_router single-active state: fingerprint currently written to
+        # the MoE wrappers, and the wrapper modules it was written to.
+        self._moe_distributed_fp: str | None = None
+        self._moe_modules: list = []
+        # Tier-1 full-graph mode state (enable_graph_mode + wrap).
+        self._graph_full = steer_vector_config.graph_mode == "full"
+        self._graph_params: tuple | None = None
+        self._graph_controllers: list = []
+        self.row_tok_buf: torch.Tensor | None = None
+        self._slot_rows: dict[int, int] = {}
+        self._slot_graph_modules: dict[int, list] = {}
+        self._free_rows: list[int] = list(
+            range(steer_vector_config.max_steer_vectors, 0, -1)
+        )
+
+    def enable_graph_mode(
+        self, hidden_size: int, dtype: torch.dtype, max_num_tokens: int
+    ) -> None:
+        """Record buffer geometry for full-graph steering (before wrap)."""
+        self._graph_params = (hidden_size, dtype, max_num_tokens)
+
+    def _init_graph_tables(self) -> None:
+        """Allocate Tier-1 buffers on every decoder controller."""
+        assert self._adapter_manager is not None
+        assert self._graph_params is not None, (
+            "steer graph_mode=full requires enable_graph_mode() before "
+            "model wrap"
+        )
+        from vllm.steer_vectors.layers import DecoderLayerWithSteerVector
+        hidden_size, dtype, max_num_tokens = self._graph_params
+        self.row_tok_buf = torch.zeros(
+            max_num_tokens, dtype=torch.long, device=self.device
+        )
+        capacity = self.steer_vector_config.max_steer_vectors
+        for module in self._adapter_manager.modules.values():
+            if isinstance(module, DecoderLayerWithSteerVector):
+                module.init_graph_table(
+                    capacity, hidden_size, dtype, self.device,
+                    max_num_tokens, self.row_tok_buf,
+                )
+                self._graph_controllers.append(module)
+        logger.info(
+            "Full-graph steering buffers allocated on %d layers "
+            "(%d rows, hidden %d, %d max tokens)",
+            len(self._graph_controllers), capacity, hidden_size,
+            max_num_tokens,
+        )
+
+    def zero_graph_masks(self) -> None:
+        for module in self._graph_controllers:
+            module.graph_mask.zero_()
+
+    def graph_row_of(self, slot: int) -> int:
+        return self._slot_rows.get(slot, 0)
+
+    def graph_batch_entries(self) -> dict[int, tuple]:
+        """slot -> (row, request, controllers) for all live graph configs."""
+        return {
+            entry[0]: (
+                self._slot_rows[entry[0]],
+                entry[2],
+                self._slot_graph_modules[entry[0]],
+            )
+            for entry in self._config_slots.values()
+            if entry[0] in self._slot_rows
+        }
+
+    def _assert_graph_safe(self, request: SteerVectorRequest) -> None:
+        problem = None
+        if request.is_multi_vector:
+            problem = "multi-vector configs"
+        elif request.algorithm != "direct":
+            problem = f"algorithm '{request.algorithm}'"
+        elif request.normalize:
+            problem = "normalize=True"
+        if problem is not None:
+            raise ValueError(
+                f"steer graph_mode=full supports only graph-safe configs "
+                f"(direct algorithm, no normalize, single vector); got "
+                f"{problem}. Use --steer-graph-mode=piecewise."
+            )
+
+    def _distribute_graph_config(
+        self, slot: int, model: SteerVectorModel, request: SteerVectorRequest
+    ) -> None:
+        """Write a config's scaled payload into per-layer vector tables."""
+        assert self._adapter_manager is not None
+        if not self._free_rows:
+            raise RuntimeError(
+                f"No free steering rows (capacity "
+                f"{self.steer_vector_config.max_steer_vectors})."
+            )
+        row = self._free_rows.pop()
+        target_layers = request.target_layers
+        modules: list = []
+        for layer_idx, payload in (model.layer_payloads or {}).items():
+            if target_layers and layer_idx not in target_layers:
+                continue
+            for module in self._adapter_manager._get_modules_for_layer(
+                layer_idx, "decoder_layer"
+            ):
+                module.set_graph_row(row, payload * request.scale)
+                modules.append(module)
+        self._slot_rows[slot] = row
+        self._slot_graph_modules[slot] = modules
+
+    def _release_graph_config(self, slot: int) -> None:
+        row = self._slot_rows.pop(slot, None)
+        if row is None:
+            return
+        for module in self._slot_graph_modules.pop(slot, []):
+            module.clear_graph_row(row)
+        self._free_rows.append(row)
 
     # ------------------------------------------------------------------
     # Per-request config routing (Phase C)
@@ -82,19 +207,15 @@ class WorkerSteerVectorManager:
 
     def acquire_config(
         self, req_id: str, request: SteerVectorRequest
-    ) -> int | None:
+    ) -> int:
         """Register a live request's steering config; returns its slot.
 
-        Returns None for configs that cannot be routed per-request yet
-        (multi-vector and moe_router fall back to the legacy global path).
+        All config kinds route per-request: single-vector and multi-vector
+        configs steer only their own requests' tokens; moe_router configs
+        are applied at MoE-wrapper level with single-active semantics.
         """
-        if request.is_multi_vector or request.algorithm == "moe_router":
-            logger.warning(
-                "Per-request routing does not yet support %s configs; "
-                "falling back to globally-activated steering.",
-                "multi-vector" if request.is_multi_vector else "moe_router",
-            )
-            return None
+        if self._graph_full:
+            self._assert_graph_safe(request)
 
         fp = config_fingerprint(request)
         entry = self._config_slots.get(fp)
@@ -107,10 +228,20 @@ class WorkerSteerVectorManager:
         if slot == self._next_slot:
             self._next_slot += 1
 
-        model = self.vector_store.get(
-            request.local_path, request.algorithm, lazy=True
-        )
-        self._distribute_config(slot, model, request)
+        if request.is_multi_vector:
+            self._distribute_multi_config(slot, request)
+        elif request.algorithm == "moe_router":
+            self._distribute_moe_config(fp, request)
+        elif self._graph_full:
+            model = self.vector_store.get(
+                request.local_path, request.algorithm, lazy=True
+            )
+            self._distribute_graph_config(slot, model, request)
+        else:
+            model = self.vector_store.get(
+                request.local_path, request.algorithm, lazy=True
+            )
+            self._distribute_config(slot, model, request)
         self._config_slots[fp] = [slot, 1, request]
         self._req_fingerprints[req_id] = fp
         logger.debug("Configured steering slot %d for %s", slot, fp)
@@ -126,9 +257,13 @@ class WorkerSteerVectorManager:
         entry[1] -= 1
         if entry[1] > 0:
             return
-        slot = entry[0]
+        slot, _, request = entry
         del self._config_slots[fp]
-        if self._adapter_manager is not None:
+        if request.algorithm == "moe_router" and not request.is_multi_vector:
+            self._release_moe_config(fp)
+        elif slot in self._slot_rows:
+            self._release_graph_config(slot)
+        elif self._adapter_manager is not None:
             for module in self._adapter_manager.modules.values():
                 module.reset_steer_vector(slot)
                 slot_algos = getattr(module, "slot_algorithms", None)
@@ -158,6 +293,170 @@ class WorkerSteerVectorManager:
             ):
                 module.set_steer_vector(slot, payload=payload, **params)
 
+    def _distribute_multi_config(
+        self, slot: int, request: SteerVectorRequest
+    ) -> None:
+        """Configure a multi-vector request's sub-vectors on one slot.
+
+        Sub-vector payloads are deduplicated through the VectorStore; each
+        layer receives the specs of the vectors that target it.
+        """
+        assert self._adapter_manager is not None
+        specs = []
+        for vc in request.vector_configs:
+            model = self.vector_store.get(vc.path, vc.algorithm, lazy=True)
+            specs.append((steer_params_dict(vc), model.layer_payloads or {}))
+
+        layer_ids: set[int] = set()
+        for fields, payloads in specs:
+            tl = fields.get("target_layers")
+            layer_ids.update(
+                layer_idx for layer_idx in payloads
+                if not tl or layer_idx in tl
+            )
+        for layer_idx in sorted(layer_ids):
+            layer_specs = []
+            for fields, payloads in specs:
+                tl = fields.get("target_layers")
+                if tl and layer_idx not in tl:
+                    continue
+                payload = payloads.get(layer_idx)
+                if payload is None:
+                    continue
+                layer_specs.append({**fields, "payload": payload})
+            if not layer_specs:
+                continue
+            for module in self._adapter_manager._get_modules_for_layer(
+                layer_idx, "decoder_layer"
+            ):
+                module.set_steer_vector(
+                    slot,
+                    algorithm_name="multi_vector",
+                    multi_specs=layer_specs,
+                    conflict_resolution=request.conflict_resolution,
+                    debug=request.debug,
+                )
+
+    def _build_moe_model(
+        self, request: SteerVectorRequest
+    ) -> SteerVectorModel:
+        if not request.local_path:
+            if request.moe_expert_ids is None:
+                raise ValueError(
+                    "moe_router algorithm requires moe_expert_ids when no "
+                    "config file path is given"
+                )
+            layer_payloads = {}
+            for layer_id in (request.target_layers or []):
+                payload = {
+                    "expert_ids": request.moe_expert_ids,
+                    "mode": request.moe_mode,
+                }
+                if request.moe_mode == "soft":
+                    payload["lambda"] = request.moe_lambda
+                layer_payloads[layer_id] = payload
+            return self._steer_vector_model_cls(
+                steer_vector_id=request.steer_vector_id,
+                layer_payloads=layer_payloads,
+                scale_factor=1.0,
+                algorithm="moe_router",
+            )
+        return self._steer_vector_model_cls.from_local_checkpoint(
+            steer_vector_model_path=request.local_path,
+            steer_vector_id=request.steer_vector_id,
+            config=self.steer_vector_config,
+            device=str(self.device),
+            scale_factor=request.scale,
+            algorithm="moe_router",
+            target_layers=request.target_layers,
+            moe_mode=request.moe_mode,
+            moe_lambda=request.moe_lambda,
+            moe_topk=request.moe_topk,
+        )
+
+    def _reset_moe_wrapper_state(self) -> None:
+        for module in self._moe_modules:
+            module.reset_steer_vector(0)
+        self._moe_modules.clear()
+        self._moe_distributed_fp = None
+
+    def _distribute_moe_config(
+        self, fp: str, request: SteerVectorRequest
+    ) -> None:
+        """Write a moe_router config into the MoE wrappers (single-active).
+
+        MoE router steering operates on router logits at wrapper level and
+        is not token-routed; only one distinct config can be in effect at
+        a time. A newer distinct config overwrites the wrapper state.
+        """
+        assert self._adapter_manager is not None
+        if (self._moe_distributed_fp is not None
+                and self._moe_distributed_fp != fp):
+            logger.warning(
+                "Concurrent distinct moe_router configs are not batchable; "
+                "the newest config overwrites the MoE-wrapper state for ALL "
+                "running requests."
+            )
+        self._reset_moe_wrapper_state()
+        model = self._build_moe_model(request)
+        params = layer_apply_kwargs(request)
+        target_layers = params.pop("target_layers")
+        for layer_idx, payload in (model.layer_payloads or {}).items():
+            if target_layers and layer_idx not in target_layers:
+                continue
+            for module in self._adapter_manager._get_modules_for_layer(
+                layer_idx, "moe_layer"
+            ):
+                module.set_steer_vector(0, payload=payload, **params)
+                module.set_active_tensor(0)
+                self._moe_modules.append(module)
+        self._moe_distributed_fp = fp
+
+    def _release_moe_config(self, fp: str) -> None:
+        if self._moe_distributed_fp != fp:
+            return
+        self._reset_moe_wrapper_state()
+        # If another moe_router config is still live, restore it.
+        for other_fp, entry in self._config_slots.items():
+            req = entry[2]
+            if req.algorithm == "moe_router" and not req.is_multi_vector:
+                self._distribute_moe_config(other_fp, req)
+                break
+
+    # ------------------------------------------------------------------
+    # Server-level (default) steering config
+    # ------------------------------------------------------------------
+
+    _SERVER_REQ_ID = "__server__"
+
+    def set_server_config(self, request: SteerVectorRequest) -> bool:
+        """Install (or replace) the server-level default steering config.
+
+        The config occupies a normal routing slot; requests without their
+        own steer_vector_request are routed to it via the default slot.
+        """
+        self.clear_server_config()
+        slot = self.acquire_config(self._SERVER_REQ_ID, request)
+        logger.info("Server-level steering installed on slot %d", slot)
+        return True
+
+    def clear_server_config(self) -> bool:
+        had = self._SERVER_REQ_ID in self._req_fingerprints
+        self.release_config(self._SERVER_REQ_ID)
+        return had
+
+    @property
+    def server_slot(self) -> int:
+        slot = self.slot_for_request(self._SERVER_REQ_ID)
+        return -1 if slot is None else slot
+
+    def list_configs(self) -> Set[int]:
+        """Int ids of all live steering configs (including the server's)."""
+        return {
+            entry[2].steer_vector_int_id
+            for entry in self._config_slots.values()
+        }
+
     @property
     def is_enabled(self) -> bool:
         return True
@@ -173,279 +472,6 @@ class WorkerSteerVectorManager:
             steer_vector_manager_cls=self._manager_cls,
         )
         self._adapter_manager = steer_vector_manager
+        if self._graph_full:
+            self._init_graph_tables()
         return steer_vector_manager.model
-
-    def _load_adapter(
-        self,
-        steer_vector_request: SteerVectorRequest
-    ) -> SteerVectorModel:
-        """Load a steer vector from a request.
-        
-        This method acts as the decoupling layer between SteerVectorRequest
-        and SteerVectorModel, extracting parameters from the request and
-        calling the appropriate factory method.
-        
-        Similar to LoRA's WorkerLoRAManager._load_adapter() pattern.
-        """
-        try:
-            if not steer_vector_request.is_multi_vector:
-                # Check if this is MoE router algorithm WITHOUT a config file path
-                if (steer_vector_request.algorithm == "moe_router" and 
-                    not steer_vector_request.local_path):
-                    # MoE router: create model directly from request parameters
-                    # No need to load from file - parameters come from request
-                    if steer_vector_request.moe_expert_ids is None:
-                        raise ValueError("moe_router algorithm requires moe_expert_ids parameter")
-                    
-                    # Build layer payloads from request MoE parameters
-                    layer_payloads = {}
-                    target_layers = steer_vector_request.target_layers or []
-                    
-                    for layer_id in target_layers:
-                        payload = {
-                            'expert_ids': steer_vector_request.moe_expert_ids,
-                            'mode': steer_vector_request.moe_mode,  # 'boost', 'suppress', or 'soft'
-                        }
-                        # Add lambda parameter for 'soft' mode
-                        if steer_vector_request.moe_mode == 'soft':
-                            payload['lambda'] = steer_vector_request.moe_lambda
-                        layer_payloads[layer_id] = payload
-                    
-                    steer_vector = self._steer_vector_model_cls(
-                        steer_vector_id=steer_vector_request.steer_vector_id,
-                        layer_payloads=layer_payloads,
-                        scale_factor=1.0,
-                        algorithm="moe_router",
-                    )
-                else:
-                    # Single-vector mode: extract parameters and call from_local_checkpoint
-                    # This includes moe_router with a config file path
-                    
-                    # Build kwargs for algorithm-specific parameters
-                    load_kwargs = {}
-                    if steer_vector_request.algorithm == "moe_router":
-                        # Pass moe_mode, moe_lambda and moe_topk for moe_router algorithm
-                        load_kwargs['moe_mode'] = steer_vector_request.moe_mode
-                        load_kwargs['moe_lambda'] = steer_vector_request.moe_lambda
-                        load_kwargs['moe_topk'] = steer_vector_request.moe_topk
-                    
-                    steer_vector = self._steer_vector_model_cls.from_local_checkpoint(
-                        steer_vector_model_path=steer_vector_request.local_path,
-                        steer_vector_id=steer_vector_request.steer_vector_id,
-                        config=self.steer_vector_config,
-                        device=str(self.device),
-                        scale_factor=steer_vector_request.scale,
-                        algorithm=steer_vector_request.algorithm,
-                        target_layers=steer_vector_request.target_layers,
-                        **load_kwargs,
-                    )
-            else:
-                # Multi-vector mode: load each vector individually and assemble
-                multi_vector_data = []
-                
-                for i, vector_config in enumerate(steer_vector_request.vector_configs):
-                    try:
-                        # Load individual vector using from_local_checkpoint
-                        single_model = self._steer_vector_model_cls.from_local_checkpoint(
-                            steer_vector_model_path=vector_config.path,
-                            steer_vector_id=f"{steer_vector_request.steer_vector_id}_vec_{i}",
-                            config=self.steer_vector_config,
-                            device=str(self.device),
-                            scale_factor=vector_config.scale,
-                            algorithm=vector_config.algorithm,
-                            target_layers=vector_config.target_layers,
-                        )
-                        
-                        # Store vector data with its configuration
-                        # (canonical fields + payloads/path extras)
-                        vector_data = {
-                            **steer_params_dict(vector_config),
-                            'payloads': single_model.layer_payloads,
-                            'path': vector_config.path,
-                        }
-                        multi_vector_data.append(vector_data)
-                        
-                        logger.debug(
-                            f"Loaded vector {i}: {vector_config.path} "
-                            f"(algorithm: {vector_config.algorithm}, scale: {vector_config.scale})"
-                        )
-                        
-                    except Exception as e:
-                        logger.error(f"Failed to load vector {i} from {vector_config.path}: {e}")
-                        raise RuntimeError(
-                            f"Failed to load vector {i} from {vector_config.path}"
-                        ) from e
-                
-                logger.debug(
-                    f"Successfully loaded {len(multi_vector_data)} vectors for "
-                    f"multi-vector request '{steer_vector_request.steer_vector_name}'"
-                )
-                
-                # Create multi-vector model (note: no from_steer_vector_request needed!)
-                steer_vector = self._steer_vector_model_cls(
-                    steer_vector_id=steer_vector_request.steer_vector_id,
-                    layer_payloads=None,
-                    scale_factor=1.0,
-                    algorithm="multi_vector",
-                    multi_vector_data=multi_vector_data
-                )
-                
-        except Exception as e:
-            request_info = (
-                steer_vector_request.local_path 
-                if not steer_vector_request.is_multi_vector 
-                else f"multi-vector request with {len(steer_vector_request.vector_configs)} vectors"
-            )
-            # Import traceback to get full error details
-            import traceback
-            error_details = traceback.format_exc()
-            logger.error(f"Failed to load steer vector {request_info}:\n{error_details}")
-            raise RuntimeError(
-                f"Loading steer vector {request_info} failed: {str(e)}"
-            ) from e
-        
-        return steer_vector
-
-    def add_adapter(self, adapter_request: SteerVectorRequest) -> bool:
-        """Add a steer vector adapter."""
-        if self._adapter_manager is None:
-            logger.warning("Steer vector manager not initialized")
-            return False
-        
-        # Support replacing adapters with the same ID by removing old one first
-        if adapter_request.steer_vector_id in self.list_adapters():
-            logger.debug(
-                f"Replacing existing steer vector with ID {adapter_request.steer_vector_id}"
-            )
-            self.remove_adapter(adapter_request.steer_vector_id)
-        
-        # Load the adapter
-        adapter = self._load_adapter(adapter_request)
-        
-        # Add to manager
-        if not self._adapter_manager.add_adapter(adapter):
-            return False
-        
-        # Activate based on request type
-        if adapter_request.is_multi_vector:
-            # Multi-vector mode: activation is handled internally
-            self._adapter_manager.activate_adapter(
-                adapter_request.steer_vector_id,
-                debug=adapter_request.debug,
-                conflict_resolution=adapter_request.conflict_resolution
-            )
-        else:
-            # Single-vector mode: use request-level parameters
-            self._adapter_manager.activate_adapter(
-                adapter_request.steer_vector_id,
-                target_layers=adapter_request.target_layers,
-                prefill_trigger_tokens=adapter_request.prefill_trigger_tokens,
-                prefill_trigger_positions=adapter_request.prefill_trigger_positions,
-                prefill_exclude_tokens=adapter_request.prefill_exclude_tokens,
-                prefill_exclude_positions=adapter_request.prefill_exclude_positions,
-                generate_trigger_tokens=adapter_request.generate_trigger_tokens,
-                generate_first_k_tokens=adapter_request.generate_first_k_tokens,
-                generate_after_k_tokens=adapter_request.generate_after_k_tokens,
-                debug=adapter_request.debug,
-                normalize=adapter_request.normalize
-            )
-        
-        return True
-
-    def remove_adapter(self, adapter_id: int) -> bool:
-        """Remove a steer vector adapter."""
-        if self._adapter_manager is None:
-            return False
-        return self._adapter_manager.remove_adapter(adapter_id)
-
-    def remove_all_adapters(self):
-        """Remove all steer vector adapters."""
-        if self._adapter_manager is not None:
-            self._adapter_manager.remove_all_adapters()
-
-    def list_adapters(self) -> Set[int]:
-        """List all registered adapter IDs."""
-        if self._adapter_manager is None:
-            return set()
-        return set(self._adapter_manager.list_adapters().keys())
-
-
-class LRUCacheWorkerSteerVectorManager(WorkerSteerVectorManager):
-    """WorkerSteerVectorManager that manages steer vector models with LRU cache.
-
-    Uses an LRU Cache. Every request, the requested steer vectors will be loaded 
-    (unless they are already loaded) and least recently used steer vectors will
-    be unloaded if the cache is above capacity.
-    """
-
-    _steer_vector_manager_cls: type[
-        LRUCacheSteerVectorModelManager
-    ] = LRUCacheSteerVectorModelManager
-
-    def create_steer_vector_manager(
-        self,
-        model: torch.nn.Module,
-    ) -> Any:
-        """Create LRU cache steer vector manager."""
-        steer_vector_manager = create_sv_manager(
-            model,
-            steer_vector_config=self.steer_vector_config,
-            steer_vector_manager_cls=self._steer_vector_manager_cls
-        )
-        self._adapter_manager: LRUCacheSteerVectorModelManager = (
-            steer_vector_manager
-        )
-        return steer_vector_manager.model
-
-    def add_adapter(
-        self,
-        steer_vector_request: SteerVectorRequest
-    ) -> bool:
-        """Add adapter with LRU cache management."""
-        if self._adapter_manager is None:
-            return False
-        
-        if steer_vector_request.steer_vector_id not in self.list_adapters():
-            # Remove before we load the new steer vector to save memory
-            if (len(self._adapter_manager._registered_adapters) + 1 
-                > self._adapter_manager.capacity):
-                self._adapter_manager.remove_oldest_adapter()
-            
-            steer_vector = self._load_adapter(steer_vector_request)
-            loaded = self._adapter_manager.add_adapter(steer_vector)
-        else:
-            # Support replacing adapters with the same ID
-            logger.debug(
-                f"Replacing existing steer vector with ID "
-                f"{steer_vector_request.steer_vector_id}"
-            )
-            self._adapter_manager.remove_adapter(steer_vector_request.steer_vector_id)
-            steer_vector = self._load_adapter(steer_vector_request)
-            loaded = self._adapter_manager.add_adapter(steer_vector)
-        
-        if not loaded:
-            return False
-        
-        # Activate based on mode
-        if steer_vector_request.is_multi_vector:
-            self._adapter_manager.activate_adapter(
-                steer_vector_request.steer_vector_id,
-                debug=steer_vector_request.debug,
-                conflict_resolution=steer_vector_request.conflict_resolution
-            )
-        else:
-            self._adapter_manager.activate_adapter(
-                steer_vector_request.steer_vector_id,
-                target_layers=steer_vector_request.target_layers,
-                prefill_trigger_tokens=steer_vector_request.prefill_trigger_tokens,
-                prefill_trigger_positions=steer_vector_request.prefill_trigger_positions,
-                prefill_exclude_tokens=steer_vector_request.prefill_exclude_tokens,
-                prefill_exclude_positions=steer_vector_request.prefill_exclude_positions,
-                generate_trigger_tokens=steer_vector_request.generate_trigger_tokens,
-                generate_first_k_tokens=steer_vector_request.generate_first_k_tokens,
-                generate_after_k_tokens=steer_vector_request.generate_after_k_tokens,
-                debug=steer_vector_request.debug,
-                normalize=steer_vector_request.normalize
-            )
-        
-        return loaded

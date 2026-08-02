@@ -2260,12 +2260,8 @@ class GPUModelRunner(
                 self.input_batch, num_scheduled_tokens, num_sampled_tokens
             )
 
-        # Hot-Swap steer vector model
-        if self.vllm_config.steer_vector_config:
-            steer_vector_requests = self.input_batch.make_steer_vector_inputs(
-                num_scheduled_tokens
-            )
-            self.set_active_steer_vectors(steer_vector_requests)
+        # Steer vectors run on the V2 model runner only (config validation
+        # enforces this); no V1 hot-swap.
 
         return (
             logits_indices,

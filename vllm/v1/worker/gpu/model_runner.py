@@ -113,6 +113,7 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.steer_vector_utils import (
     SteerVectorState,
+    fill_graph_steer_buffers,
     make_steer_vector_forward_kwargs,
 )
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
@@ -1249,12 +1250,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin):
                 )
                 self._set_active_loras(*lora_inputs)
 
-            if self.vllm_config.steer_vector_config is not None:
-                # Routed configs were distributed at request admission;
-                # only legacy-path requests still need global hot-swap.
-                legacy_requests = self.steer_vector_state.legacy_requests()
-                if legacy_requests:
-                    self.set_active_steer_vectors(legacy_requests)
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
             input_batch = InputBatch.make_dummy(
@@ -1346,17 +1341,32 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin):
         # Update the EPLB meta.
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
+        steer_config = self.vllm_config.steer_vector_config
+        steer_full_graph = (
+            steer_config is not None and steer_config.graph_mode == "full"
+        )
+        if steer_full_graph and not dummy_run:
+            # Tier-1: fill the persistent row/mask buffers the captured
+            # steering kernel reads; no forward-context fields needed.
+            fill_graph_steer_buffers(
+                input_batch,
+                self.steer_vector_state,
+                self.steer_vector_manager,
+            )
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
-            if self.vllm_config.steer_vector_config is not None and not dummy_run:
+            if (steer_config is not None and not steer_full_graph
+                    and not dummy_run):
                 # Config validation downgrades full cudagraphs when steering
-                # is enabled; a FULL dispatch here would silently skip
-                # steering (no data-driven in-graph kernel yet).
+                # runs in piecewise mode; a FULL dispatch here would
+                # silently skip steering.
                 raise RuntimeError(
-                    "Steer vectors cannot run under FULL cudagraph dispatch."
+                    "Steer vectors cannot run under FULL cudagraph dispatch "
+                    "in piecewise mode."
                 )
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
@@ -1370,7 +1380,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin):
             )
 
             steer_vector_kwargs = {}
-            if self.vllm_config.steer_vector_config is not None and not dummy_run:
+            if (steer_config is not None and not steer_full_graph
+                    and not dummy_run):
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE and (
                     "vllm::steer_apply"
                     not in (self.compilation_config.splitting_ops or [])
@@ -1382,8 +1393,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin):
                         "vllm::steer_apply in splitting_ops. Launch with "
                         "enforce_eager=True or default config validation."
                     )
+                manager = getattr(self, "steer_vector_manager", None)
                 steer_vector_kwargs = make_steer_vector_forward_kwargs(
-                    input_batch, self.steer_vector_state
+                    input_batch,
+                    self.steer_vector_state,
+                    default_slot=(
+                        -1 if manager is None else manager.server_slot
+                    ),
                 )
 
             with set_forward_context(

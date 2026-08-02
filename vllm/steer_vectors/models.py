@@ -41,7 +41,6 @@ from vllm.steer_vectors.moe_layers import (
     MoELayerWithSteerVector,
     extract_moe_layer_id_from_name,
 )
-from vllm.utils.cache import LRUCache
 
 logger = logging.getLogger(__name__)
 
@@ -51,19 +50,6 @@ T = TypeVar("T")
 # ============================================================================
 # Section 1: Utility Classes and Functions
 # ============================================================================
-
-class AdapterLRUCache(LRUCache[int, T]):
-    """LRU cache for adapters with automatic deactivation on removal."""
-    
-    def __init__(self, capacity: int, deactivate_fn: Callable[[int], object]):
-        super().__init__(capacity)
-        self.deactivate_fn = deactivate_fn
-
-    def _on_remove(self, key: int, value: T | None):
-        logger.debug("Removing steer vector adapter int id: %d", key)
-        self.deactivate_fn(key)
-        return super()._on_remove(key, value)
-
 
 _GLOBAL_STEER_VECTOR_ID = 0
 
@@ -301,159 +287,12 @@ class SteerVectorModelManager:
         steer_vector_config: SteerVectorConfig
     ):
         self.model = model
-        self._registered_adapters: Dict[int, SteerVectorModel] = {}
-        self._active_adapters: Dict[int, Any] = {}
         self.steer_vector_config = steer_vector_config
         self.model.steer_vector_manager = self
-        self.steer_vector_index_to_id: list[Optional[int]] = [None] * self.adapter_slots
         self.modules: dict[str, nn.Module] = {}
         self._hook_handles: list = []
         self._hooked_modules: set[str] = set()
         self._create_sv_modules()
-
-    # ------------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------------
-
-    @property
-    def adapter_slots(self) -> int:
-        """Number of adapter slots available."""
-        return self.capacity
-
-    @property
-    def capacity(self) -> int:
-        """Maximum number of steer vectors that can be loaded."""
-        return self.steer_vector_config.max_steer_vectors
-
-    # ------------------------------------------------------------------------
-    # Adapter Lifecycle Management
-    # ------------------------------------------------------------------------
-
-    def activate_adapter(
-        self,
-        steer_vector_id: int,
-        target_layers: Optional[list[int]] = None,
-        prefill_trigger_tokens: Optional[list[int]] = None,
-        prefill_trigger_positions: Optional[list[int]] = None,
-        prefill_exclude_tokens: Optional[list[int]] = None,
-        prefill_exclude_positions: Optional[list[int]] = None,
-        generate_trigger_tokens: Optional[list[int]] = None,
-        generate_first_k_tokens: Optional[int] = None,
-        generate_after_k_tokens: Optional[int] = None,
-        debug: bool = False,
-        conflict_resolution: str = "priority",
-        normalize: bool = False,
-    ) -> bool:
-        """Activate a steer vector adapter.
-        
-        Args:
-            steer_vector_id: ID of the steer vector to activate
-            target_layers: Optional list of layer indices to apply to
-            prefill_trigger_tokens: Tokens that trigger intervention in prefill
-            prefill_trigger_positions: Positions that trigger intervention in prefill
-            prefill_exclude_tokens: Tokens to exclude from intervention
-            prefill_exclude_positions: Positions to exclude from intervention
-            generate_trigger_tokens: Tokens that trigger intervention in generation
-            generate_first_k_tokens: Only intervene on first k generated tokens
-            generate_after_k_tokens: Start intervening from k-th generated token
-            debug: Enable debug output
-            conflict_resolution: Strategy for multi-vector conflicts
-            normalize: Whether to normalize vectors
-            
-        Returns:
-            True if activation successful
-        """
-        if steer_vector_id in self._active_adapters:
-            self._deactivate_adapter(steer_vector_id)
-            del self._active_adapters[steer_vector_id]
-
-        first_free_slot = next(
-            (i for i, slot_id in enumerate(self.steer_vector_index_to_id) if slot_id is None),
-            None
-        )
-        if first_free_slot is None:
-            raise ValueError("No free steer vector slots")
-        index = first_free_slot
-        
-        steer_vector_model = self._registered_adapters.get(steer_vector_id)
-        if not steer_vector_model:
-            raise ValueError(f"Steer vector {steer_vector_id} not found.")
-
-        # Prepare unified parameter dictionary
-        params = {
-            "algorithm_name": steer_vector_model.algorithm,
-            "scale_factor": steer_vector_model.scale_factor,
-            "prefill_trigger_tokens": prefill_trigger_tokens,
-            "prefill_trigger_positions": prefill_trigger_positions,
-            "prefill_exclude_tokens": prefill_exclude_tokens,
-            "prefill_exclude_positions": prefill_exclude_positions,
-            "generate_trigger_tokens": generate_trigger_tokens,
-            "generate_first_k_tokens": generate_first_k_tokens,
-            "generate_after_k_tokens": generate_after_k_tokens,
-            "debug": debug,
-            "normalize": normalize,
-        }
-
-        # Apply algorithm-specific weights/parameters to all target modules
-        if steer_vector_model.is_multi_vector:
-            self._activate_multi_vector_adapter(index, steer_vector_model, debug, conflict_resolution)
-        elif steer_vector_model.layer_payloads:
-            target_wrapper_type = self._resolve_wrapper_type(steer_vector_model.algorithm)
-            for layer_idx, payload in steer_vector_model.layer_payloads.items():
-                if target_layers and layer_idx not in target_layers:
-                    continue
-                for module in self._get_modules_for_layer(layer_idx, target_wrapper_type):
-                    module.set_steer_vector(index, payload=payload, **params)
-        else:
-            # Fallback for models without payloads
-            pass
-
-        self.steer_vector_index_to_id[index] = steer_vector_id
-        self._active_adapters[steer_vector_id] = None
-        self._set_adapter_mapping(steer_vector_id)
-
-        logger.debug(f"Activated steer vector {steer_vector_id} in slot {index}")
-        return True
-
-    def deactivate_adapter(self, adapter_id: int) -> bool:
-        """Deactivate a steer vector adapter."""
-        if adapter_id in self._active_adapters:
-            self._deactivate_adapter(adapter_id)
-            del self._active_adapters[adapter_id]
-            return True
-        return False
-
-    def add_adapter(self, adapter: SteerVectorModel) -> bool:
-        """Add a steer vector adapter to the registry."""
-        if len(self._registered_adapters) >= self.capacity:
-            logger.warning(
-                f"Cannot add adapter {adapter.id}: "
-                f"already at capacity ({self.capacity})"
-            )
-            return False
-        return self._add_adapter(adapter)
-
-    def remove_adapter(self, adapter_id: int) -> bool:
-        """Remove a steer vector adapter."""
-        self.deactivate_adapter(adapter_id)
-        if adapter_id in self._registered_adapters:
-            del self._registered_adapters[adapter_id]
-            return True
-        return False
-
-    def remove_all_adapters(self):
-        """Remove all SteerVectorModels from the manager."""
-        self._registered_adapters.clear()
-        self.steer_vector_index_to_id = [None] * self.adapter_slots
-        self._active_adapters.clear()
-
-    def list_adapters(self) -> dict[int, Any]:
-        """List all registered adapters."""
-        return dict(self._registered_adapters)
-
-    def get_adapter(self, adapter_id: int) -> Optional[Any]:
-        """Get a specific adapter."""
-        return self._registered_adapters.get(adapter_id)
 
     # ------------------------------------------------------------------------
     # Wrapper Management (Configuration-Driven)
@@ -579,69 +418,6 @@ class SteerVectorModelManager:
     # Internal Helper Methods
     # ------------------------------------------------------------------------
 
-    def _activate_multi_vector_adapter(
-        self,
-        index: int,
-        steer_vector_model: SteerVectorModel,
-        debug: bool,
-        conflict_resolution: str
-    ):
-        """Handle multi-vector activation logic."""
-        layer_to_vectors: Dict[int, List[Tuple[int, Dict]]] = {}
-        
-        # 1. Collect vectors to process for each layer
-        for vector_idx, vector_data in enumerate(steer_vector_model.multi_vector_data):
-            vector_target_layers = vector_data.get('target_layers')
-            affected_layers = list(vector_data.get('payloads', {}).keys())
-            
-            for layer_idx in affected_layers:
-                if vector_target_layers is None or layer_idx in vector_target_layers:
-                    if layer_idx not in layer_to_vectors:
-                        layer_to_vectors[layer_idx] = []
-                    layer_to_vectors[layer_idx].append((vector_idx, vector_data))
-
-        # 2. Configure algorithm for each layer
-        for layer_idx, vectors_for_layer in layer_to_vectors.items():
-            # Determine the wrapper type based on algorithms used
-            # If any vector uses moe_router, use moe_layer; otherwise use decoder_layer
-            has_moe_router = any(
-                vec_data.get('algorithm') == 'moe_router' 
-                for _, vec_data in vectors_for_layer
-            )
-            target_wrapper_type = "moe_layer" if has_moe_router else "decoder_layer"
-            
-            for module in self._get_modules_for_layer(layer_idx, target_wrapper_type):
-                if len(vectors_for_layer) == 1:
-                    # Single vector: degrade to single-vector mode
-                    _, vector_data = vectors_for_layer[0]
-                    self._apply_single_vector_to_module(module, index, vector_data, debug, layer_idx)
-                else:
-                    # Multiple vectors: configure MultiVectorAlgorithm
-                    module.active_algorithm_name = "multi_vector"
-                    multi_vector_algo = module._get_or_create_algorithm("multi_vector")
-                    multi_vector_algo.set_conflict_resolution(conflict_resolution)
-                    multi_vector_algo.params.set_debug(debug)
-                    multi_vector_algo.reset_steer_vector(0)
-                    
-                    # Add all sub-vectors
-                    for vec_idx, vec_data in vectors_for_layer:
-                        add_kwargs = vec_data.copy()
-                        algorithm_type = add_kwargs.pop('algorithm')
-                        add_kwargs['payload'] = vec_data['payloads'][layer_idx]
-                        add_kwargs['scale_factor'] = vec_data.get('scale', 1.0)
-                        
-                        # Remove parameters that don't belong to add_vector
-                        add_kwargs.pop('payloads', None)
-                        add_kwargs.pop('weights', None)
-                        add_kwargs.pop('loreft_params', None)
-                        add_kwargs.pop('sv_vector', None)
-                        
-                        multi_vector_algo.add_vector(
-                            vector_idx=vec_idx, 
-                            algorithm_type=algorithm_type, 
-                            **add_kwargs
-                        )
-
     def _resolve_wrapper_type(self, algorithm_name: str) -> str:
         """Determine which wrapper type should receive a given algorithm."""
         if algorithm_name == "moe_router":
@@ -664,60 +440,6 @@ class SteerVectorModelManager:
                     continue
                 modules.append(module)
         return modules
-
-    def _apply_single_vector_to_module(
-        self,
-        module,
-        index,
-        vector_data,
-        debug,
-        layer_idx
-    ):
-        """Helper method: apply a single vector to a module."""
-        from vllm.steer_vectors.request import STEER_APPLY_FIELDS
-
-        # Canonical fields (this previously spelled the list out and had
-        # silently dropped generate_first_k/after_k for this path).
-        params = {name: vector_data.get(name) for name in STEER_APPLY_FIELDS}
-        params["algorithm_name"] = params.pop("algorithm") or "direct"
-        scale = params.pop("scale")
-        params["scale_factor"] = 1.0 if scale is None else scale
-        params.pop("target_layers")
-        params["normalize"] = bool(params["normalize"])
-        params["debug"] = debug
-        params["payload"] = vector_data['payloads'][layer_idx]
-        module.set_steer_vector(index, **params)
-
-    def _deactivate_adapter(self, steer_vector_id: int) -> bool:
-        """Internal method to deactivate an adapter."""
-        index = self.get_index_from_id(steer_vector_id)
-        if index is None:
-            return False
-        for k, v in self.modules.items():
-            v.reset_steer_vector(index)
-        self.steer_vector_index_to_id[index] = None
-        return True
-
-    def _add_adapter(self, steer_vector: SteerVectorModel) -> bool:
-        """Internal method to add a SteerVectorModel."""
-        self._registered_adapters[steer_vector.id] = steer_vector
-        return True
-
-    def _set_adapter_mapping(self, id: int) -> None:
-        """Internal method to set adapter mapping."""
-        index = self.get_index_from_id(id)
-        if index is None:
-            logger.warning(f"No slot found for steer vector ID {id}")
-            return
-        for k, v in self.modules.items():
-            v.set_active_tensor(index)
-
-    def get_index_from_id(self, id):
-        """Get the slot index for a given adapter ID."""
-        for i in range(len(self.steer_vector_index_to_id)):
-            if self.steer_vector_index_to_id[i] == id:
-                return i
-        return None
 
     def replace_submodule(
         self,
@@ -744,110 +466,6 @@ class SteerVectorModelManager:
             steer_ops.unregister_controller(module_name)
         self._hooked_modules.clear()
 
-
-# ============================================================================
-# Section 5: LRU Cache Extensions
-# ============================================================================
-
-class SteerVectorLRUCache(AdapterLRUCache[SteerVectorModel]):
-    """LRU cache specifically for SteerVectorModel."""
-    
-    def __init__(self, capacity: int, deactivate_sv_fn: Callable[[int], bool]):
-        super().__init__(capacity, deactivate_sv_fn)
-
-
-class LRUCacheSteerVectorModelManager(SteerVectorModelManager):
-    """A model manager with LRU cache for automatic memory management.
-    
-    This manager uses LRU (Least Recently Used) caching to automatically manage
-    steer vector capacity. When the cache is full and a new vector is added,
-    the least recently used vector is automatically evicted.
-    """
-
-    def __init__(
-        self,
-        model: nn.Module,
-        steer_vector_config: SteerVectorConfig,
-    ):
-        super().__init__(model, steer_vector_config)
-        # LRU-cached registry; eviction deactivates the adapter. Activation
-        # recency is tracked by _active_adapters insertion order (a plain
-        # dict), so a second LRU cache is unnecessary.
-        self._registered_adapters: SteerVectorLRUCache = SteerVectorLRUCache(
-            self.capacity, self.deactivate_adapter
-        )
-
-    def list_adapters(self) -> dict[int, SteerVectorModel]:
-        """List all registered SteerVectorModels."""
-        return dict(self._registered_adapters.cache)
-
-    def add_adapter(self, adapter: SteerVectorModel) -> bool:
-        """Add a steer vector adapter with LRU cache management."""
-        logger.debug(
-            "Adding steer vector. Model id: %d, int id: %d", 
-            adapter.id, adapter.id
-        )
-        if adapter.id not in self._registered_adapters:
-            self._add_adapter(adapter)
-            was_added = True
-        else:
-            # We always touch to update the LRU cache order
-            self._registered_adapters.touch(adapter.id)
-            was_added = False
-        return was_added
-
-    def activate_adapter(
-        self,
-        steer_vector_id: int,
-        target_layers: Optional[list[int]] = None,
-        prefill_trigger_tokens: Optional[list[int]] = None,
-        prefill_trigger_positions: Optional[list[int]] = None,
-        prefill_exclude_tokens: Optional[list[int]] = None,
-        prefill_exclude_positions: Optional[list[int]] = None,
-        generate_trigger_tokens: Optional[list[int]] = None,
-        generate_first_k_tokens: Optional[int] = None,
-        generate_after_k_tokens: Optional[int] = None,
-        debug: bool = False,
-        conflict_resolution: str = "priority",
-        normalize: bool = False,
-    ) -> bool:
-        """Activate adapter with automatic LRU eviction."""
-        # Automatically evict the least recently activated adapter if at
-        # capacity (dict insertion order == activation recency, since
-        # re-activation removes and re-inserts the id).
-        if (
-            steer_vector_id not in self._active_adapters
-            and len(self._active_adapters) >= self.adapter_slots
-        ):
-            oldest_id = next(iter(self._active_adapters))
-            self.deactivate_adapter(oldest_id)
-        
-        result = super().activate_adapter(
-            steer_vector_id,
-            target_layers,
-            prefill_trigger_tokens,
-            prefill_trigger_positions,
-            prefill_exclude_tokens,
-            prefill_exclude_positions,
-            generate_trigger_tokens,
-            generate_first_k_tokens,
-            generate_after_k_tokens,
-            debug,
-            conflict_resolution,
-            normalize
-        )
-        # Activation recency is dict insertion order; the base activate
-        # already removed and re-inserted the id, so no extra touch needed.
-        return result
-
-    def remove_oldest_adapter(self) -> bool:
-        """Remove the oldest (least recently used) adapter from registered cache."""
-        if len(self._registered_adapters) > 0:
-            self._registered_adapters.remove_oldest()
-            return True
-        return False
-
-
 # ============================================================================
 # Section 6: Factory Functions
 # ============================================================================
@@ -855,12 +473,9 @@ class LRUCacheSteerVectorModelManager(SteerVectorModelManager):
 def create_sv_manager(
     model: nn.Module,
     steer_vector_config: SteerVectorConfig,
-    steer_vector_manager_cls: type[SteerVectorModelManager] = LRUCacheSteerVectorModelManager,
+    steer_vector_manager_cls: type[SteerVectorModelManager] = SteerVectorModelManager,
 ) -> SteerVectorModelManager:
     """Factory function to create a steer vector manager.
-    
-    By default, creates an LRUCacheSteerVectorModelManager for automatic
-    capacity management.
     
     Args:
         model: The neural network model to manage

@@ -137,7 +137,6 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
     def __init__(self, base_layer=None) -> None:
         super().__init__()
         self.base_layer = base_layer
-        self.active_algorithm_name: str = "direct"
         self.algorithms: Dict[str, BaseSteerVectorAlgorithm] = {}
         self.layer_id: Optional[int] = None
         # Per-request routing: config slot -> algorithm name for the slots
@@ -146,6 +145,43 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         # Key under which this controller is reachable from the
         # vllm::steer_apply custom op (set when the hook is registered).
         self._op_key: Optional[str] = None
+        # Tier-1 full-graph mode: persistent buffers read by the captured
+        # kernel `hidden += mask * vectors[row_tok]` (see init_graph_table).
+        self._graph_mode: bool = False
+        self.graph_vectors: Optional[torch.Tensor] = None
+        self.graph_mask: Optional[torch.Tensor] = None
+        self.graph_row_tok: Optional[torch.Tensor] = None
+
+    def init_graph_table(
+        self,
+        num_rows: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        max_num_tokens: int,
+        row_tok: torch.Tensor,
+    ) -> None:
+        """Allocate Tier-1 persistent buffers (full-graph steering mode).
+
+        Must run before compilation/graph capture so the captured kernel
+        sees the final buffer addresses. Row 0 of the vector table stays
+        zero (the no-steer row).
+        """
+        self.graph_vectors = torch.zeros(
+            num_rows + 1, hidden_size, dtype=dtype, device=device
+        )
+        self.graph_mask = torch.zeros(
+            max_num_tokens, dtype=dtype, device=device
+        )
+        self.graph_row_tok = row_tok
+        self._graph_mode = True
+
+    def set_graph_row(self, row: int, payload: torch.Tensor) -> None:
+        self.graph_vectors[row].copy_(payload.to(self.graph_vectors.dtype))
+
+    def clear_graph_row(self, row: int) -> None:
+        if self.graph_vectors is not None:
+            self.graph_vectors[row].zero_()
 
     def _get_or_create_algorithm(self, name: str, **kwargs) -> BaseSteerVectorAlgorithm:
         """Lazy load or get algorithm instance by name."""
@@ -161,15 +197,14 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
             algo.layer_id = layer_id
 
     def set_steer_vector(self, index: int, **kwargs):
+        """Configure a per-request routing slot on this layer.
+
+        Distributes the payload and trigger parameters of one steering
+        config to the algorithm instance handling it; `index` is a config
+        slot (>= CONFIG_SLOT_BASE).
         """
-        Generic method: set steer vector parameters for the specified algorithm.
-        This method is responsible for distributing all relevant parameters to the algorithm instance.
-        """
-        # 1. Determine algorithm and extract its unique associated parameters
         algorithm_name = kwargs.pop("algorithm_name", "direct")
-        if index < CONFIG_SLOT_BASE:
-            self.active_algorithm_name = algorithm_name
-        
+
         # Extract constructor parameters (e.g., normalize)
         init_kwargs = {}
         if "normalize" in kwargs:
@@ -183,31 +218,15 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         if "normalize" in kwargs:
             algo.normalize = kwargs["normalize"]
 
-        # 2. Set core vector parameters (payload) and other runtime parameters
-        # Pass all remaining kwargs to set_steer_vector
+        # Set payload and per-slot trigger parameters
         algo.set_steer_vector(index, **kwargs)
-
-        # 3. Set intervention parameters (triggers and debug flags)
-        if index >= CONFIG_SLOT_BASE:
-            # Per-request config slot: triggers live in a per-slot
-            # controller and must not disturb the legacy global state.
-            self.slot_algorithms[index] = algorithm_name
-            algo.slot_params(index).configure_from_dict(kwargs)
-        else:
-            # Batch configure using InterventionController's unified interface
-            algo.params.configure_from_dict(kwargs)
+        self.slot_algorithms[index] = algorithm_name
+        algo.slot_params(index).configure_from_dict(kwargs)
 
     def reset_steer_vector(self, index: int):
-        """Reset the vector at specified index in all algorithms (or only the currently active one)."""
-        # For simplicity, we reset vectors in all created algorithms
-        # Could also reset only the currently active one
+        """Reset the vector at specified index in all algorithms."""
         for algo in self.algorithms.values():
             algo.reset_steer_vector(index)
-
-    def set_active_tensor(self, index: int):
-        """Set the active tensor for the currently active algorithm."""
-        algo = self._get_or_create_algorithm(self.active_algorithm_name)
-        algo.set_active_tensor(index)
 
     def forward(self, *args, **kwargs):
         """Wrap the forward method of DecoderLayer (legacy wrapper mode)."""
@@ -232,7 +251,18 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         else:
             complete_hidden_states = hidden_states
 
-        torch.ops.vllm.steer_apply(complete_hidden_states, self._op_key)
+        if self._graph_mode:
+            # Tier-1 full-graph kernel: pure tensor math over persistent
+            # buffers, safe to capture into CUDA graphs / compile. Rows
+            # and masks are filled host-side before each step; row 0 is
+            # the zero vector, so unsteered/padding tokens are no-ops.
+            n = complete_hidden_states.shape[0]
+            complete_hidden_states = complete_hidden_states + (
+                self.graph_mask[:n].unsqueeze(1)
+                * self.graph_vectors[self.graph_row_tok[:n]]
+            )
+        else:
+            torch.ops.vllm.steer_apply(complete_hidden_states, self._op_key)
 
         if residual is not None:
             zero_residual = torch.zeros_like(residual)
@@ -244,32 +274,29 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
     def apply_steering(self, complete_hidden_states):
         """Dispatch steering on complete hidden states (hidden + residual).
 
-        Per-request routing: when the forward context carries a
-        sample->slot map, apply each batch-active config to its own
-        requests' tokens only. Otherwise use the legacy global path.
+        Applies each batch-active config to its own requests' tokens via
+        the forward context's sample->slot map; no map means no steering
+        this step.
         """
         ctx = get_forward_context() if get_forward_context is not None else None
         token_slots = getattr(ctx, "steer_token_slots", None)
         active_slots = getattr(ctx, "steer_active_slots", None)
+        if token_slots is None or not active_slots:
+            return complete_hidden_states
 
-        if token_slots is not None and active_slots:
-            modified_complete_hidden_states = complete_hidden_states
-            for slot in active_slots:
-                algo_name = self.slot_algorithms.get(slot)
-                if algo_name is None:
-                    # This layer is not targeted by this config.
-                    continue
-                algo = self._get_or_create_algorithm(algo_name)
-                modified_complete_hidden_states = algo.apply_intervention(
-                    modified_complete_hidden_states,
-                    slot=slot,
-                    token_slots=token_slots,
-                )
-            return modified_complete_hidden_states
-
-        # Dynamically get the currently active algorithm and apply it
-        active_algo = self._get_or_create_algorithm(self.active_algorithm_name)
-        return active_algo.apply_intervention(complete_hidden_states)
+        modified_complete_hidden_states = complete_hidden_states
+        for slot in active_slots:
+            algo_name = self.slot_algorithms.get(slot)
+            if algo_name is None:
+                # This layer is not targeted by this config.
+                continue
+            algo = self._get_or_create_algorithm(algo_name)
+            modified_complete_hidden_states = algo.apply_intervention(
+                modified_complete_hidden_states,
+                slot=slot,
+                token_slots=token_slots,
+            )
+        return modified_complete_hidden_states
 
     def process_output(self, output):
         """Apply the active steering algorithm to a decoder layer output

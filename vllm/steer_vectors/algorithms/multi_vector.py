@@ -34,6 +34,10 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
         self.vector_scales: Dict[int, float] = {}
         # Conflict resolution strategy
         self.conflict_resolution: str = "priority"  # 'error', 'priority', or 'sequential'
+        # Per-request routing: config slot -> ordered sub-algorithm list
+        # (each with its own payload at index 0 and trigger controller).
+        self._slot_vectors: Dict[int, List[AlgorithmTemplate]] = {}
+        self._slot_conflict: Dict[int, str] = {}
         
     @classmethod
     def load_from_path(cls, path: str, device: str, **kwargs) -> Dict[str, Any]:
@@ -83,6 +87,117 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
         if vector_idx in self.vector_scales:
             del self.vector_scales[vector_idx]
 
+    def configure_slot(
+        self,
+        slot: int,
+        vector_specs: List[Dict[str, Any]],
+        conflict_resolution: str = "priority",
+    ) -> None:
+        """Configure a per-request routing slot from vector specs.
+
+        Each spec carries `algorithm`, `payload`, and the canonical
+        steering fields (scale, triggers, normalize) of one sub-vector.
+        """
+        entries: List[AlgorithmTemplate] = []
+        for spec in vector_specs:
+            init_kwargs = {}
+            if spec.get("normalize") is not None:
+                init_kwargs["normalize"] = spec["normalize"]
+            algo = create_algorithm(
+                spec["algorithm"], layer_id=self.layer_id, **init_kwargs
+            )
+            algo.set_steer_vector(
+                0,
+                payload=spec["payload"],
+                scale_factor=spec.get("scale", 1.0),
+            )
+            algo.set_active_tensor(0)
+            algo.params.configure_from_dict(spec)
+            entries.append(algo)
+        self._slot_vectors[slot] = entries
+        self._slot_conflict[slot] = conflict_resolution
+
+    def _apply_routed(
+        self,
+        hidden_states: torch.Tensor,
+        slot: int,
+        token_slots: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply this slot's sub-vectors to its own requests' tokens only."""
+        entries = self._slot_vectors.get(slot)
+        if not entries:
+            return hidden_states
+
+        ctx_info = None
+        collected: List[Tuple[int, AlgorithmTemplate, torch.Tensor]] = []
+        for idx, algo in enumerate(entries):
+            params = algo._get_params()
+            if not algo._is_valid(params):
+                continue
+            if not algo.params.has_any_triggers():
+                continue
+            if algo.params.is_global_only_config():
+                positions = (token_slots == slot).nonzero(
+                    as_tuple=False).squeeze(-1)
+            else:
+                if ctx_info is None:
+                    ctx_info = self._get_forward_context_and_samples(
+                        hidden_states)
+                if ctx_info is None:
+                    continue
+                _, samples_info, current_tokens = ctx_info
+                positions = algo.params.collect_intervention_positions(
+                    hidden_states=hidden_states,
+                    current_tokens=current_tokens,
+                    samples_info=samples_info,
+                )
+                if positions is None or positions.numel() == 0:
+                    continue
+                positions = positions[token_slots[positions] == slot]
+            if positions.numel() == 0:
+                continue
+            collected.append((idx, algo, positions))
+
+        conflict = self._slot_conflict.get(slot, "priority")
+        if conflict == "error":
+            for i in range(len(collected)):
+                for j in range(i + 1, len(collected)):
+                    overlap = torch.isin(collected[i][2], collected[j][2])
+                    if overlap.any():
+                        raise ValueError(
+                            f"Multi-vector conflict at positions "
+                            f"{collected[i][2][overlap].tolist()} between "
+                            f"vectors {collected[i][0]} and {collected[j][0]}"
+                        )
+        elif conflict == "priority":
+            claimed: Optional[torch.Tensor] = None
+            filtered = []
+            for idx, algo, positions in collected:
+                if claimed is not None and claimed.numel() > 0:
+                    positions = positions[~torch.isin(positions, claimed)]
+                    if positions.numel() == 0:
+                        continue
+                claimed = (positions if claimed is None
+                           else torch.cat([claimed, positions]))
+                filtered.append((idx, algo, positions))
+            collected = filtered
+        elif conflict != "sequential":
+            raise ValueError(
+                f"Unknown conflict resolution strategy: {conflict}")
+
+        from vllm.steer_vectors import trace
+        for idx, algo, positions in collected:
+            hidden_states = algo._batch_transform_tensor(
+                hidden_states, positions, algo._get_params()
+            )
+            if trace.enabled():
+                trace.record_apply(
+                    self.layer_id, slot,
+                    f"multi:{idx}:{algo.__class__.__name__}",
+                    positions.tolist(),
+                )
+        return hidden_states
+
     def _all_vectors_global(self) -> bool:
         """Check if all sub-vectors are globally configured (both phases use -1 trigger).
         
@@ -95,20 +210,26 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
         )
 
     def apply_intervention(
-        self, 
+        self,
         hidden_states: torch.Tensor,
-        context_info: Optional[Tuple[torch.Tensor, dict]] = None
+        context_info: Optional[Tuple[torch.Tensor, dict]] = None,
+        slot: Optional[int] = None,
+        token_slots: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply multi-vector intervention.
-        
+
         In V1 continuous batching, a batch may contain both decode and prefill samples.
         We need to handle them separately based on their individual lengths (not batch-level phase).
-        
+
         Args:
             hidden_states: Input tensor to transform
             context_info: Optional tuple of (current_tokens, samples_info).
                          If provided, use this instead of fetching from forward context.
+            slot: Per-request routing: config slot to apply (see template).
+            token_slots: token -> config slot map; required when slot given.
         """
+        if slot is not None:
+            return self._apply_routed(hidden_states, slot, token_slots)
         if not self.vector_algorithms:
             return hidden_states
 
@@ -272,11 +393,20 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
 
     # Methods to comply with BaseSteerVectorAlgorithm interface
     def set_steer_vector(self, index: int, **kwargs) -> None:
-        """Not directly used in multi-vector mode."""
-        pass
+        """Route per-request slot configuration; legacy indices are no-ops."""
+        if "multi_specs" in kwargs:
+            self.configure_slot(
+                index,
+                kwargs["multi_specs"],
+                kwargs.get("conflict_resolution", "priority"),
+            )
 
     def reset_steer_vector(self, index: int) -> None:
-        """Reset all vectors."""
+        """Reset a routing slot, or all legacy vectors for legacy indices."""
+        if index in self._slot_vectors:
+            del self._slot_vectors[index]
+            self._slot_conflict.pop(index, None)
+            return
         self.vector_algorithms.clear()
         self.vector_scales.clear()
 

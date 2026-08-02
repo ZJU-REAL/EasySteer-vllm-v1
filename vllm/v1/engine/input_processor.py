@@ -172,6 +172,24 @@ class InputProcessor:
                 f"Got steer_vector_request {steer_vector_request} but SteerVector is not enabled!"
             )
 
+        # Reject non-graph-safe configs at the frontend so a bad request
+        # errors instead of reaching (and killing) the engine core.
+        if self.vllm_config.steer_vector_config.graph_mode == "full":
+            problem = None
+            if steer_vector_request.is_multi_vector:
+                problem = "multi-vector configs"
+            elif steer_vector_request.algorithm != "direct":
+                problem = f"algorithm '{steer_vector_request.algorithm}'"
+            elif steer_vector_request.normalize:
+                problem = "normalize=True"
+            if problem is not None:
+                raise ValueError(
+                    f"steer graph_mode=full supports only graph-safe "
+                    f"configs (direct algorithm, no normalize, single "
+                    f"vector); got {problem}. Use "
+                    f"--steer-graph-mode=piecewise."
+                )
+
     def _get_mm_identifier(
         self,
         mm_hash: str,

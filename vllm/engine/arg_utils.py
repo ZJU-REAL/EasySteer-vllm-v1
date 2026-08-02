@@ -607,6 +607,7 @@ class EngineArgs:
     enable_steer_vector: bool = False
     max_steer_vectors: int = 8
     steer_allow_cuda_graphs: bool = False
+    steer_graph_mode: str = "piecewise"
     steer_vector_path: str | None = None
     steer_scale: float = 1.0
     steer_target_layers: list[int] | None = None
@@ -1385,10 +1386,18 @@ class EngineArgs:
         steer_vector_group.add_argument(
             "--steer-allow-cuda-graphs",
             action=argparse.BooleanOptionalAction,
+            help="DEPRECATED, ignored.",
+        )
+        steer_vector_group.add_argument(
+            "--steer-graph-mode",
+            type=str,
+            choices=["piecewise", "full"],
+            default=EngineArgs.steer_graph_mode,
             help=(
-                "Allow CUDA graphs when steering is enabled. Only safe when "
-                "all requests use global triggers (trigger_tokens=[-1]). "
-                "Can provide ~2.6x speedup for global-only steering workloads."
+                "CUDA-graph mode for steering: 'piecewise' (all algorithms; "
+                "steering runs between graph segments) or 'full' (keeps full "
+                "CUDA graphs via a data-driven in-graph kernel; graph-safe "
+                "configs only)."
             ),
         )
         steer_vector_group.add_argument(
@@ -2316,12 +2325,13 @@ class EngineArgs:
         from vllm.config.steer_vector import SteerVectorConfig
         # --steer-vector-path implies --enable-steer-vector
         enable_steer = self.enable_steer_vector or self.steer_vector_path is not None
-        # Server-level steering implies CUDA graphs are safe
-        allow_cuda = bool(self.steer_allow_cuda_graphs) or self.steer_vector_path is not None
+        # Deprecated no-op, kept for CLI compatibility (warns in VllmConfig).
+        allow_cuda = bool(self.steer_allow_cuda_graphs)
         steer_vector_config = (
             SteerVectorConfig(
                 max_steer_vectors=self.max_steer_vectors,
                 allow_cuda_graphs=allow_cuda,
+                graph_mode=self.steer_graph_mode,
                 server_vector_path=self.steer_vector_path,
                 server_scale=self.steer_scale,
                 server_target_layers=self.steer_target_layers,

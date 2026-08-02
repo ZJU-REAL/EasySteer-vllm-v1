@@ -45,11 +45,18 @@ class SteerVectorConfig:
     """Data type for steer vectors. If 'auto', will default to base model dtype."""
 
     allow_cuda_graphs: bool = False
-    """Allow CUDA graphs when steering is enabled. Only safe when all
-    requests use global triggers (prefill_trigger_tokens=[-1],
-    generate_trigger_tokens=[-1]). Requests with non-global triggers will
-    error rather than silently produce wrong results. Default False
-    preserves the current conservative behavior."""
+    """DEPRECATED, ignored. Steering now always runs eagerly between
+    piecewise CUDA-graph segments under compiled execution
+    (vllm::steer_apply splitting op); no configs are baked into graphs."""
+
+    graph_mode: str = "piecewise"
+    """CUDA-graph execution mode for steering: "piecewise" (default)
+    splits compiled graphs at every steered layer and runs steering
+    eagerly between the segments — all algorithms supported. "full" keeps
+    full CUDA graphs by capturing a data-driven per-layer kernel
+    (hidden += mask * vector_table[token_row]) that reads persistent
+    buffers filled host-side each step — only graph-safe configs are
+    admitted (direct algorithm, no normalize, single-vector)."""
 
     # Server-level steering: configure steering at startup instead of per-request.
     # When set, CUDA graphs are safe because every batch uses the same config.
@@ -83,6 +90,7 @@ class SteerVectorConfig:
         factors.append(self.max_steer_vectors)
         factors.append(self.steer_vector_dtype)
         factors.append(self.allow_cuda_graphs)
+        factors.append(self.graph_mode)
         factors.append(self.server_vector_path)
         factors.append(self.server_scale)
         factors.append(self.server_target_layers)
