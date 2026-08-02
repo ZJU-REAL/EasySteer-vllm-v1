@@ -47,7 +47,7 @@ def main() -> int:
     llm = LLM(
         model=args.model,
         enable_steer_vector=True,
-        enforce_eager=True,
+        enforce_eager=os.environ.get("STEER_TEST_EAGER", "1") == "1",
         tensor_parallel_size=1,
         enable_chunked_prefill=False,
         enable_prefix_caching=False,

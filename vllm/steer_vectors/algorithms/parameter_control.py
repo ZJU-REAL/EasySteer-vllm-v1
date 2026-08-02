@@ -263,7 +263,11 @@ def collect_positions_gpu_batch(
     is_decode_mask = samples_info['is_decode_mask']
 
     device = hidden_states.device
-    total_tokens = hidden_states.shape[0]
+    # Size the masks from current_tokens, not hidden_states: under
+    # piecewise cudagraphs hidden_states is padded to the graph bucket,
+    # while current_tokens/query_start_loc always cover the real tokens.
+    # Padding rows are never steered.
+    total_tokens = current_tokens.shape[0]
 
     if num_computed is not None and not isinstance(num_computed, torch.Tensor):
         num_computed = torch.tensor(num_computed, device=device, dtype=torch.long)

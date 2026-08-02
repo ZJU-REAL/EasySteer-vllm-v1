@@ -1351,6 +1351,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin):
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
+            if self.vllm_config.steer_vector_config is not None and not dummy_run:
+                # Config validation downgrades full cudagraphs when steering
+                # is enabled; a FULL dispatch here would silently skip
+                # steering (no data-driven in-graph kernel yet).
+                raise RuntimeError(
+                    "Steer vectors cannot run under FULL cudagraph dispatch."
+                )
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
@@ -1364,10 +1371,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin):
 
             steer_vector_kwargs = {}
             if self.vllm_config.steer_vector_config is not None and not dummy_run:
-                if batch_desc.cg_mode != CUDAGraphMode.NONE:
+                if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE and (
+                    "vllm::steer_apply"
+                    not in (self.compilation_config.splitting_ops or [])
+                ):
+                    # Piecewise graphs without the steer_apply split would
+                    # bake steering into the captured segments.
                     raise RuntimeError(
-                        "Steer vectors on the V2 model runner require eager "
-                        "execution. Launch with enforce_eager=True."
+                        "Steer vectors under piecewise cudagraphs require "
+                        "vllm::steer_apply in splitting_ops. Launch with "
+                        "enforce_eager=True or default config validation."
                     )
                 steer_vector_kwargs = make_steer_vector_forward_kwargs(
                     input_batch, self.steer_vector_state

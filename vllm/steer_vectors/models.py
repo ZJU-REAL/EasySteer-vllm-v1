@@ -32,6 +32,7 @@ from vllm.config import SteerVectorConfig
 from vllm.steer_vectors.algorithms import create_algorithm
 from vllm.steer_vectors.algorithms.factory import ALGORITHM_REGISTRY
 from vllm.steer_vectors.config import WRAPPER_REGISTRY, get_target_modules
+from vllm.steer_vectors import ops as steer_ops
 from vllm.steer_vectors.layers import (
     DecoderLayerWithSteerVector,
     extract_layer_id_from_module_name,
@@ -532,6 +533,8 @@ class SteerVectorModelManager:
                 layer_id = extract_layer_id_from_module_name(module_name)
                 if layer_id is not None:
                     controller.set_layer_id(layer_id)
+                controller._op_key = module_name
+                steer_ops.register_controller(module_name, controller)
                 handle = module.register_forward_hook(
                     controller.process_output_hook
                 )
@@ -737,6 +740,8 @@ class SteerVectorModelManager:
         for handle in self._hook_handles:
             handle.remove()
         self._hook_handles.clear()
+        for module_name in self._hooked_modules:
+            steer_ops.unregister_controller(module_name)
         self._hooked_modules.clear()
 
 

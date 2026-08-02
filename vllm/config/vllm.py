@@ -551,23 +551,20 @@ class VllmConfig:
 
     @property
     def use_v2_model_runner(self) -> bool:
-        # The V2 model runner supports steer vectors in eager mode only.
-        # CUDA-graph steering (steer_allow_cuda_graphs) and non-eager
-        # execution are implemented only in the V1 runner, so force V1 for
-        # those rather than silently skipping steering.
-        if self.steer_vector_config is not None:
-            enforce_eager = (
-                self.model_config is not None and self.model_config.enforce_eager
+        # The V2 model runner supports steer vectors in eager mode and in
+        # compiled/piecewise-cudagraph mode (steering runs eagerly between
+        # graph segments via the vllm::steer_apply splitting op). Only the
+        # legacy bake-in path (steer_allow_cuda_graphs) still needs the V1
+        # runner.
+        if (
+            self.steer_vector_config is not None
+            and self.steer_vector_config.allow_cuda_graphs
+        ):
+            logger.warning_once(
+                "steer_allow_cuda_graphs (legacy baked-in CUDA-graph "
+                "steering) uses the V1 model runner."
             )
-            if self.steer_vector_config.allow_cuda_graphs or not enforce_eager:
-                logger.warning_once(
-                    "Steer vectors with CUDA graphs or compiled execution "
-                    "use the V1 model runner; pass enforce_eager=True to "
-                    "allow the V2 model runner."
-                )
-                return False
-            # Eager-mode steering works on V2; fall through to the default
-            # runner selection.
+            return False
 
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         if use_v2_model_runner is not None:
@@ -1205,40 +1202,37 @@ class VllmConfig:
                     "enable_prefix_caching=False when using steering."
                 )
 
-        # Steer vectors wrap decoder layers and modify module state
-        # (e.g. algorithm dicts) during forward, which is incompatible
-        # with torch.compile (piecewise compilation).  However, full
-        # CUDA graph capture (without compilation) works for the
-        # global-only trigger fast path in template.py.
+        # Steering under compiled execution runs through the
+        # vllm::steer_apply splitting op: steering executes eagerly between
+        # piecewise CUDA-graph segments while the captured graphs stay
+        # config-free (wired after set_splitting_ops_for_v1 below). This is
+        # supported on the V2 model runner only; the legacy bake-in path
+        # (allow_cuda_graphs) and V1-runner configs keep their old behavior.
         if (
             self.steer_vector_config is not None
             and self.model_config is not None
             and not self.model_config.enforce_eager
         ):
             if self.steer_vector_config.allow_cuda_graphs:
-                # Disable torch.compile (incompatible with steering
-                # wrappers that mutate module state during forward),
-                # but keep full CUDA graphs for decode batches.
-                # We use FULL_DECODE_ONLY since piecewise CUDA graphs
-                # require compilation, and FULL requires attention
-                # backends to support cudagraphs for all batch types.
+                # Legacy: disable torch.compile but keep full CUDA graphs
+                # for decode batches, baking the globally-active config
+                # into the captured graph.
                 logger.info(
-                    "Steer vectors enabled with allow_cuda_graphs=True. "
-                    "Disabling torch.compile but keeping CUDA graphs "
-                    "(FULL_DECODE_ONLY). Only global triggers "
-                    "(trigger_tokens=[-1]) are safe in this mode."
+                    "Steer vectors enabled with allow_cuda_graphs=True "
+                    "(legacy baked-in mode). Disabling torch.compile but "
+                    "keeping CUDA graphs (FULL_DECODE_ONLY). Only global "
+                    "triggers (trigger_tokens=[-1]) are safe in this mode."
                 )
                 self.model_config.enforce_eager = False
                 self.compilation_config.mode = CompilationMode.NONE
                 self.compilation_config.cudagraph_mode = (
                     CUDAGraphMode.FULL_DECODE_ONLY
                 )
-            else:
+            elif not self.use_v2_model_runner:
                 logger.warning(
-                    "Steer vectors are not compatible with torch.compile / "
-                    "CUDA graphs. Setting enforce_eager=True automatically. "
-                    "Use --steer-allow-cuda-graphs to override if you only "
-                    "use global triggers (trigger_tokens=[-1])."
+                    "Steer vectors with compiled execution are only "
+                    "supported on the V2 model runner; this config uses "
+                    "the V1 runner. Setting enforce_eager=True."
                 )
                 self.model_config.enforce_eager = True
 
@@ -1553,6 +1547,40 @@ class VllmConfig:
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
         )
+
+        # Tier-2 piecewise steering: split the compiled graph at every
+        # steered decoder layer so vllm::steer_apply runs eagerly between
+        # CUDA-graph segments. Full cudagraphs are downgraded to piecewise
+        # until the data-driven (Tier-1) in-graph kernel exists.
+        if (
+            self.steer_vector_config is not None
+            and self.model_config is not None
+            and not self.model_config.enforce_eager
+            and not self.steer_vector_config.allow_cuda_graphs
+        ):
+            if self.compilation_config.mode == CompilationMode.VLLM_COMPILE:
+                splitting_ops = self.compilation_config.splitting_ops
+                if (
+                    splitting_ops is not None
+                    and "vllm::steer_apply" not in splitting_ops
+                ):
+                    splitting_ops.append("vllm::steer_apply")
+                if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+                    logger.info(
+                        "Steer vectors: downgrading cudagraph_mode from %s "
+                        "to PIECEWISE (steering runs eagerly between graph "
+                        "segments).",
+                        self.compilation_config.cudagraph_mode.name,
+                    )
+                    self.compilation_config.cudagraph_mode = (
+                        CUDAGraphMode.PIECEWISE
+                    )
+            elif self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+                logger.warning(
+                    "Steer vectors without torch.compile cannot use CUDA "
+                    "graphs; disabling them."
+                )
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
         if self.compilation_config.pass_config.enable_sp:
             # With pipeline parallelism, native rms norm tracing errors due to

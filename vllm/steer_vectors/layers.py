@@ -143,6 +143,9 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         # Per-request routing: config slot -> algorithm name for the slots
         # configured on this layer (slots >= CONFIG_SLOT_BASE).
         self.slot_algorithms: Dict[int, str] = {}
+        # Key under which this controller is reachable from the
+        # vllm::steer_apply custom op (set when the hook is registered).
+        self._op_key: Optional[str] = None
 
     def _get_or_create_algorithm(self, name: str, **kwargs) -> BaseSteerVectorAlgorithm:
         """Lazy load or get algorithm instance by name."""
@@ -212,23 +215,39 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         return self.process_output(output)
 
     def process_output_hook(self, module, args, output):
-        """torch forward-hook entry point: intervene on the layer output."""
-        return self.process_output(output)
+        """torch forward-hook entry point: intervene on the layer output.
 
-    def process_output(self, output):
-        """Apply the active steering algorithm to a decoder layer output."""
-        # Extract hidden_states and residual from decoder layer output
-        hidden_states, residual, other_outputs, original_format = _extract_hidden_states_and_residual(output)
+        Kept dynamo-traceable: only tensor-format handling runs inline;
+        all steering logic executes inside the opaque vllm::steer_apply
+        custom op, which is a piecewise splitting op under compiled
+        execution (it runs eagerly between CUDA-graph segments).
+        """
+        if self._op_key is None:
+            return self.process_output(output)
 
-        # Construct complete hidden state
+        hidden_states, residual, other_outputs, original_format = \
+            _extract_hidden_states_and_residual(output)
         if residual is not None:
             complete_hidden_states = hidden_states + residual
         else:
             complete_hidden_states = hidden_states
 
-        # Per-request routing: when the forward context carries a
-        # sample->slot map, apply each batch-active config to its own
-        # requests' tokens only. Otherwise use the legacy global path.
+        torch.ops.vllm.steer_apply(complete_hidden_states, self._op_key)
+
+        if residual is not None:
+            zero_residual = torch.zeros_like(residual)
+            return _reconstruct_output(complete_hidden_states, zero_residual,
+                                       other_outputs, original_format, output)
+        return _reconstruct_output(complete_hidden_states, None,
+                                   other_outputs, original_format, output)
+
+    def apply_steering(self, complete_hidden_states):
+        """Dispatch steering on complete hidden states (hidden + residual).
+
+        Per-request routing: when the forward context carries a
+        sample->slot map, apply each batch-active config to its own
+        requests' tokens only. Otherwise use the legacy global path.
+        """
         ctx = get_forward_context() if get_forward_context is not None else None
         token_slots = getattr(ctx, "steer_token_slots", None)
         active_slots = getattr(ctx, "steer_active_slots", None)
@@ -246,12 +265,27 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
                     slot=slot,
                     token_slots=token_slots,
                 )
+            return modified_complete_hidden_states
+
+        # Dynamically get the currently active algorithm and apply it
+        active_algo = self._get_or_create_algorithm(self.active_algorithm_name)
+        return active_algo.apply_intervention(complete_hidden_states)
+
+    def process_output(self, output):
+        """Apply the active steering algorithm to a decoder layer output
+        (legacy wrapper-mode path; the hook path goes through
+        vllm::steer_apply)."""
+        # Extract hidden_states and residual from decoder layer output
+        hidden_states, residual, other_outputs, original_format = _extract_hidden_states_and_residual(output)
+
+        # Construct complete hidden state
+        if residual is not None:
+            complete_hidden_states = hidden_states + residual
         else:
-            # Dynamically get the currently active algorithm and apply it
-            active_algo = self._get_or_create_algorithm(self.active_algorithm_name)
-            modified_complete_hidden_states = active_algo.apply_intervention(
-                complete_hidden_states
-            )
+            complete_hidden_states = hidden_states
+
+        modified_complete_hidden_states = self.apply_steering(
+            complete_hidden_states)
 
         # Reconstruct output format
         if residual is not None:
