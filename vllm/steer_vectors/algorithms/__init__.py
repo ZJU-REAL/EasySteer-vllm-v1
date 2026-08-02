@@ -10,7 +10,6 @@ from .factory import create_algorithm, register_algorithm
 # Algorithm implementations (import to register them)
 from .direct import DirectAlgorithm
 from .loreft import LoReFTAlgorithm
-from .multi_vector import MultiVectorAlgorithm
 from .linear import LinearTransformAlgorithm
 from .lm_steer import LMSteerAlgorithm
 from .moe_router import MoERouterAlgorithm

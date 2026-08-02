@@ -266,9 +266,6 @@ class WorkerSteerVectorManager:
         elif self._adapter_manager is not None:
             for module in self._adapter_manager.modules.values():
                 module.reset_steer_vector(slot)
-                slot_algos = getattr(module, "slot_algorithms", None)
-                if slot_algos is not None:
-                    slot_algos.pop(slot, None)
         self._free_slots.append(slot)
 
     def slot_for_request(self, req_id: str) -> int | None:
@@ -281,17 +278,11 @@ class WorkerSteerVectorManager:
     def _distribute_config(
         self, slot: int, model: SteerVectorModel, request: SteerVectorRequest
     ) -> None:
-        """Write a config's scaled payload + triggers into layer slot state."""
-        assert self._adapter_manager is not None
-        params = layer_apply_kwargs(request)
-        target_layers = params.pop("target_layers")
-        for layer_idx, payload in (model.layer_payloads or {}).items():
-            if target_layers and layer_idx not in target_layers:
-                continue
-            for module in self._adapter_manager._get_modules_for_layer(
-                layer_idx, "decoder_layer"
-            ):
-                module.set_steer_vector(slot, payload=payload, **params)
+        """Configure a single-vector request as a one-intervention slot."""
+        fields = {**steer_params_dict(request), "debug": request.debug}
+        self._configure_layer_slots(
+            slot, [(fields, model.layer_payloads or {})], "priority"
+        )
 
     def _distribute_multi_config(
         self, slot: int, request: SteerVectorRequest
@@ -301,12 +292,20 @@ class WorkerSteerVectorManager:
         Sub-vector payloads are deduplicated through the VectorStore; each
         layer receives the specs of the vectors that target it.
         """
-        assert self._adapter_manager is not None
         specs = []
         for vc in request.vector_configs:
             model = self.vector_store.get(vc.path, vc.algorithm, lazy=True)
-            specs.append((steer_params_dict(vc), model.layer_payloads or {}))
+            fields = {**steer_params_dict(vc), "debug": request.debug}
+            specs.append((fields, model.layer_payloads or {}))
+        self._configure_layer_slots(
+            slot, specs, request.conflict_resolution
+        )
 
+    def _configure_layer_slots(
+        self, slot: int, specs: list, conflict_resolution: str
+    ) -> None:
+        """Write an ordered intervention list into each targeted layer."""
+        assert self._adapter_manager is not None
         layer_ids: set[int] = set()
         for fields, payloads in specs:
             tl = fields.get("target_layers")
@@ -329,13 +328,7 @@ class WorkerSteerVectorManager:
             for module in self._adapter_manager._get_modules_for_layer(
                 layer_idx, "decoder_layer"
             ):
-                module.set_steer_vector(
-                    slot,
-                    algorithm_name="multi_vector",
-                    multi_specs=layer_specs,
-                    conflict_resolution=request.conflict_resolution,
-                    debug=request.debug,
-                )
+                module.configure_slot(slot, layer_specs, conflict_resolution)
 
     def _build_moe_model(
         self, request: SteerVectorRequest

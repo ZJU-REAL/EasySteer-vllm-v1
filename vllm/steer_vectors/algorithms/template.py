@@ -45,18 +45,6 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
         # self.clamp_range = kwargs.get('clamp_range', None)
         # self.dropout_rate = kwargs.get('dropout_rate', 0.0)
 
-        # Per-request routing: trigger controllers per config slot, so
-        # concurrent configs cannot overwrite each other's parameters.
-        self._slot_params: dict[int, InterventionController] = {}
-
-    def slot_params(self, index: int) -> InterventionController:
-        """Get (or create) the trigger controller for a config slot."""
-        ctrl = self._slot_params.get(index)
-        if ctrl is None:
-            ctrl = InterventionController()
-            self._slot_params[index] = ctrl
-        return ctrl
-    
     def set_steer_vector(self, index: int, **kwargs) -> None:
         """
         Universal implementation: Store payload of any type.
@@ -158,8 +146,6 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
         self,
         hidden_states: torch.Tensor,
         context_info: Optional[tuple] = None,
-        slot: Optional[int] = None,
-        token_slots: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Unified intervention application logic.
@@ -175,13 +161,7 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
                          If provided, use this instead of fetching from forward context.
                          This is useful for components like MoE routers where context
                          may not be available at the component level.
-            slot: Per-request routing: config slot whose payload/triggers to
-                  apply. None selects the legacy globally-active state.
-            token_slots: [total_tokens] tensor mapping each batch token to
-                  its request's config slot; required when slot is given.
         """
-        if slot is not None:
-            return self._apply_routed(hidden_states, slot, token_slots)
         # Skip if no triggers configured
         if not self.params.has_any_triggers():
             return hidden_states
@@ -255,54 +235,6 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
 
         return hidden_states
     
-    def _apply_routed(
-        self,
-        hidden_states: torch.Tensor,
-        slot: int,
-        token_slots: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply this slot's config to its own requests' tokens only.
-
-        Trigger positions are computed by the unchanged legacy collector
-        (absolute flat positions), then intersected with the tokens that
-        belong to requests routed to this slot.
-        """
-        ctrl = self._slot_params.get(slot)
-        payload = self._payloads.get(slot)
-        if ctrl is None or not self._is_valid(payload):
-            return hidden_states
-        if not ctrl.has_any_triggers():
-            return hidden_states
-
-        ctx_info = self._get_forward_context_and_samples(hidden_states)
-        if ctx_info is None:
-            return hidden_states
-        _, samples_info, current_tokens = ctx_info
-
-        if ctrl.is_global_only_config():
-            # All tokens of this slot's requests.
-            positions = (token_slots == slot).nonzero(as_tuple=False).squeeze(-1)
-        else:
-            positions = ctrl.collect_intervention_positions(
-                hidden_states=hidden_states,
-                current_tokens=current_tokens,
-                samples_info=samples_info,
-            )
-            if positions is not None and positions.numel() > 0:
-                positions = positions[token_slots[positions] == slot]
-
-        if positions is None or positions.numel() == 0:
-            return hidden_states
-
-        from vllm.steer_vectors import trace
-        if trace.enabled():
-            trace.record_apply(
-                self.layer_id, slot, self.__class__.__name__,
-                positions.tolist(),
-            )
-
-        return self._batch_transform_tensor(hidden_states, positions, payload)
-
     # ========== Helper Methods ==========
     def _get_forward_context_and_samples(self, hidden_states: torch.Tensor):
         """

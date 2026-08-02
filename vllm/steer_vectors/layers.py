@@ -6,12 +6,17 @@ import torch
 from torch import nn
 
 from .algorithms import BaseSteerVectorAlgorithm, create_algorithm
+from vllm.steer_vectors import trace
 
 # Import forward context to get current token information
 try:
     from vllm.forward_context import get_forward_context
 except ImportError:
     get_forward_context = None
+
+# Sentinel for lazily-fetched forward-context info (None is a valid
+# "unavailable" fetch result).
+_CTX_UNSET = object()
 
 
 def extract_layer_id_from_module_name(module_name: str) -> Optional[int]:
@@ -122,10 +127,52 @@ def _reconstruct_output(modified_hidden_states, residual, other_outputs, origina
         return modified_hidden_states
 
 
+def _resolve_conflicts(collected, mode: str):
+    """Resolve position conflicts between a slot's interventions.
+
+    `collected` is [(idx, algo, positions)] in priority order. 'priority'
+    gives earlier interventions exclusive claim to their positions,
+    'sequential' applies all in order, 'error' raises on overlap.
+    """
+    if mode == "sequential" or len(collected) <= 1:
+        return collected
+    if mode == "error":
+        for i in range(len(collected)):
+            for j in range(i + 1, len(collected)):
+                overlap = torch.isin(collected[i][2], collected[j][2])
+                if overlap.any():
+                    raise ValueError(
+                        f"Steering vectors conflict at positions "
+                        f"{collected[i][2][overlap].tolist()} between "
+                        f"vectors {collected[i][0]} and {collected[j][0]}. "
+                        f"Set conflict_resolution='priority' or "
+                        f"'sequential'."
+                    )
+        return collected
+    if mode != "priority":
+        raise ValueError(f"Unknown conflict resolution strategy: {mode}")
+    claimed = None
+    filtered = []
+    for idx, algo, positions in collected:
+        if claimed is not None and claimed.numel() > 0:
+            positions = positions[~torch.isin(positions, claimed)]
+            if positions.numel() == 0:
+                continue
+        claimed = (positions if claimed is None
+                   else torch.cat([claimed, positions]))
+        filtered.append((idx, algo, positions))
+    return filtered
+
+
 class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
     """
     Generic DecoderLayer intervention controller for full hidden states.
-    Uses lazy loading mechanism to create algorithm instances only when needed, saving memory.
+
+    Every routing slot holds an ordered list of interventions (a
+    single-vector config is a list of one), each backed by a private
+    algorithm instance with its own payload and trigger controller;
+    conflict resolution between a slot's interventions is a slot
+    property.
 
     Preferred usage is hook-based: the controller stays outside the model
     tree and `process_output_hook` is registered as a forward hook on the
@@ -137,11 +184,10 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
     def __init__(self, base_layer=None) -> None:
         super().__init__()
         self.base_layer = base_layer
-        self.algorithms: Dict[str, BaseSteerVectorAlgorithm] = {}
         self.layer_id: Optional[int] = None
-        # Per-request routing: config slot -> algorithm name for the slots
-        # configured on this layer (slots >= CONFIG_SLOT_BASE).
-        self.slot_algorithms: Dict[int, str] = {}
+        # Per-request routing: config slot -> ordered intervention list.
+        self.slot_interventions: Dict[int, list] = {}
+        self.slot_conflict: Dict[int, str] = {}
         # Key under which this controller is reachable from the
         # vllm::steer_apply custom op (set when the hook is registered).
         self._op_key: Optional[str] = None
@@ -183,50 +229,51 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         if self.graph_vectors is not None:
             self.graph_vectors[row].zero_()
 
-    def _get_or_create_algorithm(self, name: str, **kwargs) -> BaseSteerVectorAlgorithm:
-        """Lazy load or get algorithm instance by name."""
-        if name not in self.algorithms:
-            # Pass kwargs (e.g., normalize) from external calls to the constructor
-            self.algorithms[name] = create_algorithm(name, layer_id=self.layer_id, **kwargs)
-        return self.algorithms[name]
-
     def set_layer_id(self, layer_id: int) -> None:
-        """Set layer ID for all created algorithms."""
+        """Set layer ID for existing and future interventions."""
         self.layer_id = layer_id
-        for algo in self.algorithms.values():
-            algo.layer_id = layer_id
+        for entries in self.slot_interventions.values():
+            for algo in entries:
+                algo.layer_id = layer_id
 
-    def set_steer_vector(self, index: int, **kwargs):
-        """Configure a per-request routing slot on this layer.
+    def configure_slot(
+        self,
+        slot: int,
+        vector_specs: list,
+        conflict_resolution: str = "priority",
+    ) -> None:
+        """Configure a routing slot from an ordered list of vector specs.
 
-        Distributes the payload and trigger parameters of one steering
-        config to the algorithm instance handling it; `index` is a config
-        slot (>= CONFIG_SLOT_BASE).
+        Each spec carries `algorithm`, `payload`, and the canonical
+        steering fields (scale, triggers, normalize, debug) of one
+        intervention.
         """
-        algorithm_name = kwargs.pop("algorithm_name", "direct")
-
-        # Extract constructor parameters (e.g., normalize)
-        init_kwargs = {}
-        if "normalize" in kwargs:
-            init_kwargs["normalize"] = kwargs.get("normalize")
-
-        algo = self._get_or_create_algorithm(algorithm_name, **init_kwargs)
-
-        # Always update normalize on the algorithm instance, even if it already existed.
-        # _get_or_create_algorithm only passes init_kwargs on first creation;
-        # subsequent calls with a different normalize value would be silently ignored.
-        if "normalize" in kwargs:
-            algo.normalize = kwargs["normalize"]
-
-        # Set payload and per-slot trigger parameters
-        algo.set_steer_vector(index, **kwargs)
-        self.slot_algorithms[index] = algorithm_name
-        algo.slot_params(index).configure_from_dict(kwargs)
+        entries = []
+        for spec in vector_specs:
+            init_kwargs = {}
+            if spec.get("normalize") is not None:
+                init_kwargs["normalize"] = spec["normalize"]
+            algo = create_algorithm(
+                spec.get("algorithm") or "direct",
+                layer_id=self.layer_id,
+                **init_kwargs,
+            )
+            scale = spec.get("scale")
+            algo.set_steer_vector(
+                0,
+                payload=spec["payload"],
+                scale_factor=1.0 if scale is None else scale,
+            )
+            algo.set_active_tensor(0)
+            algo.params.configure_from_dict(spec)
+            entries.append(algo)
+        self.slot_interventions[slot] = entries
+        self.slot_conflict[slot] = conflict_resolution
 
     def reset_steer_vector(self, index: int):
-        """Reset the vector at specified index in all algorithms."""
-        for algo in self.algorithms.values():
-            algo.reset_steer_vector(index)
+        """Drop the intervention list of a routing slot."""
+        self.slot_interventions.pop(index, None)
+        self.slot_conflict.pop(index, None)
 
     def forward(self, *args, **kwargs):
         """Wrap the forward method of DecoderLayer (legacy wrapper mode)."""
@@ -274,9 +321,9 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
     def apply_steering(self, complete_hidden_states):
         """Dispatch steering on complete hidden states (hidden + residual).
 
-        Applies each batch-active config to its own requests' tokens via
-        the forward context's sample->slot map; no map means no steering
-        this step.
+        Applies each batch-active slot's interventions to its own
+        requests' tokens via the forward context's sample->slot map; no
+        map means no steering this step.
         """
         ctx = get_forward_context() if get_forward_context is not None else None
         token_slots = getattr(ctx, "steer_token_slots", None)
@@ -284,19 +331,54 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         if token_slots is None or not active_slots:
             return complete_hidden_states
 
-        modified_complete_hidden_states = complete_hidden_states
+        hidden = complete_hidden_states
+        ctx_info = _CTX_UNSET
         for slot in active_slots:
-            algo_name = self.slot_algorithms.get(slot)
-            if algo_name is None:
+            entries = self.slot_interventions.get(slot)
+            if not entries:
                 # This layer is not targeted by this config.
                 continue
-            algo = self._get_or_create_algorithm(algo_name)
-            modified_complete_hidden_states = algo.apply_intervention(
-                modified_complete_hidden_states,
-                slot=slot,
-                token_slots=token_slots,
-            )
-        return modified_complete_hidden_states
+            collected = []
+            for idx, algo in enumerate(entries):
+                params = algo._get_params()
+                if not algo._is_valid(params):
+                    continue
+                if not algo.params.has_any_triggers():
+                    continue
+                if algo.params.is_global_only_config():
+                    # All tokens of this slot's requests.
+                    positions = (token_slots == slot).nonzero(
+                        as_tuple=False).squeeze(-1)
+                else:
+                    if ctx_info is _CTX_UNSET:
+                        ctx_info = algo._get_forward_context_and_samples(
+                            hidden)
+                    if ctx_info is None:
+                        continue
+                    _, samples_info, current_tokens = ctx_info
+                    positions = algo.params.collect_intervention_positions(
+                        hidden_states=hidden,
+                        current_tokens=current_tokens,
+                        samples_info=samples_info,
+                    )
+                    if positions is None or positions.numel() == 0:
+                        continue
+                    positions = positions[token_slots[positions] == slot]
+                if positions.numel() == 0:
+                    continue
+                collected.append((idx, algo, positions))
+
+            collected = _resolve_conflicts(
+                collected, self.slot_conflict.get(slot, "priority"))
+            for idx, algo, positions in collected:
+                hidden = algo._batch_transform_tensor(
+                    hidden, positions, algo._get_params())
+                if trace.enabled():
+                    label = (algo.__class__.__name__ if len(entries) == 1
+                             else f"multi:{idx}:{algo.__class__.__name__}")
+                    trace.record_apply(
+                        self.layer_id, slot, label, positions.tolist())
+        return hidden
 
     def process_output(self, output):
         """Apply the active steering algorithm to a decoder layer output

@@ -21,7 +21,7 @@ def extract_samples_info(attn_metadata) -> Optional[Dict[str, torch.Tensor]]:
     Extract sample boundaries and phases from attention metadata.
     
     Uses GPU batch operations to calculate sample boundaries and phases without loops.
-    This is a shared utility function used by both AlgorithmTemplate and MultiVectorAlgorithm.
+    This is a shared utility used by AlgorithmTemplate and the layer-level apply loop.
     
     Args:
         attn_metadata: Attention metadata from forward context
