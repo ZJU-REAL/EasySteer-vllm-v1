@@ -238,7 +238,7 @@ class SteerVectorRequest(
     
     # === MoE-specific parameters (for moe_router algorithm) ===
     moe_expert_ids: List[int] | None = None  # Expert IDs to intervene
-    moe_mode: str | None = None               # Intervention mode override ('boost', 'suppress', 'soft', ...); None = use the config file's per-layer mode (falls back to 'boost')
+    moe_mode: str | None = None               # Intervention mode override ('activate', 'deactivate', 'soft', ...); None = use the config file's per-layer mode (falls back to 'activate')
     moe_lambda: float = 0.5                   # Lambda parameter for 'soft' modes (z'_k = z_k + lambda * std(z))
     moe_topk: int = 8                         # Top-K parameter for 'soft_topk' mode (only intervene if expert is in top-k)
 

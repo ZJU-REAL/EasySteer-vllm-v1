@@ -344,7 +344,7 @@ class WorkerSteerVectorManager:
                     "config file path is given"
                 )
             layer_payloads = {}
-            moe_mode = request.moe_mode or "boost"
+            moe_mode = request.moe_mode or "activate"
             for layer_id in (request.target_layers or []):
                 payload = {
                     "expert_ids": request.moe_expert_ids,

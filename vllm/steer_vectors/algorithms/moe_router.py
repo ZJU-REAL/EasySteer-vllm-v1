@@ -21,58 +21,71 @@ logger = logging.getLogger(__name__)
 class MoERouterAlgorithm(AlgorithmTemplate):
     """
     MoE Router Logits intervention algorithm.
-    
-    This algorithm modifies router logits to boost or suppress specific experts.
-    The intervention happens BEFORE softmax, directly manipulating the raw logits.
-    
-    Supported modes:
-    - 'boost': Set logits[expert_ids] = max(all_logits) - amplify specified experts
-    - 'suppress': Set logits[expert_ids] = min(all_logits) - dampen specified experts
+
+    Modifies router logits before top-k expert selection.
+
+    Canonical modes:
+    - 'activate': force expert_ids INTO the top-k. Log-softmax the
+      logits, set the experts to per-token max + epsilon (mechanism
+      from SteerMoE, arXiv:2509.09660: guaranteed selection, untouched
+      experts keep their relative weights).
+    - 'deactivate': force expert_ids OUT of the top-k (per-token
+      min - epsilon, guaranteed exclusion).
+      Both honor optional 'activate_ids'/'deactivate_ids' keys for
+      layers that need both directions at once.
     - 'soft': z'_k = z_k + lambda * std(z) - soft intervention based on logits std
-    - 'soft_random': z'_k = z_k + lambda * std(z) - soft intervention on random experts (same count as expert_ids)
-    - 'soft_hard': Set logits[expert_ids] = max(all_logits) + small_random - boost with random perturbation to avoid ties
-    - 'steermoe': Expert (de)activation from SteerMoE (arXiv:2509.09660):
-      log-softmax the logits, then set activated experts to per-token
-      max + epsilon and deactivated experts to per-token min - epsilon.
+    - 'soft_topk': soft intervention only when the expert is NOT already in top-k
+    - 'soft_random': z'_k = z_k + lambda * std(z) on random experts (expert_ids determines the count)
+
+    Deprecated aliases (kept working): 'boost' and 'soft_hard' ->
+    'activate'; 'suppress' -> 'deactivate'; 'steermoe' -> the
+    activate_ids/deactivate_ids form. The alias implementations set raw
+    logits to the exact max/min, which made top-k tie-break ambiguous
+    ('soft_hard' worked around it with random noise); the canonical
+    epsilon mechanism replaces them deterministically.
 
     Payload format (dict):
     {
-        'expert_ids': [1, 5, 10],  # List of expert IDs to intervene (for soft_random: determines count only)
-        'mode': 'boost',            # 'boost', 'suppress', 'soft', 'soft_topk', 'soft_random', 'soft_hard', or 'steermoe'
-        'lambda': 0.5,              # (Optional) For 'soft'/'soft_random' modes: intervention strength
-        'activate_ids': [3, 7],     # (steermoe) experts forced into top-k
-        'deactivate_ids': [1, 5],   # (steermoe) experts forced out of top-k
-        'epsilon': 0.01,            # (Optional, steermoe) tie-breaking margin
+        'mode': 'deactivate',       # see above
+        'expert_ids': [1, 5, 10],   # experts for the mode's direction (for soft_random: count only)
+        'activate_ids': [3, 7],     # (optional) additional experts forced into top-k
+        'deactivate_ids': [1, 5],   # (optional) additional experts forced out of top-k
+        'epsilon': 0.01,            # (optional) tie-breaking margin
+        'lambda': 0.5,              # (optional) for 'soft*' modes: intervention strength
     }
     """
-    
+
+    MODE_ALIASES = {
+        "boost": "activate",
+        "soft_hard": "activate",
+        "suppress": "deactivate",
+        "steermoe": "activate",
+    }
+
     def __init__(self, layer_id: Optional[int] = None, **kwargs):
         # MoE router doesn't use normalize parameter - remove it from kwargs if present
         kwargs.pop('normalize', None)
         super().__init__(layer_id=layer_id, normalize=False, **kwargs)
-    
+
     def _transform(self, router_logits: torch.Tensor, params: dict) -> torch.Tensor:
         """
         Apply intervention to router logits.
-        
+
         Args:
             router_logits: (num_tokens, n_experts) - raw logits from gate
-            params: Intervention parameters dict with keys:
-                - expert_ids: List[int] - expert indices to modify (or count for soft_random)
-                - mode: str - 'boost', 'suppress', 'soft', 'soft_topk', 'soft_random', or 'soft_hard'
-                - lambda: float - (for 'soft' modes) intervention strength
-                - topk: int - (for 'soft_topk' mode) only intervene if expert is NOT in top-k
-                
+            params: Intervention parameters dict (see class docstring)
+
         Returns:
             Modified router_logits with same shape
         """
         expert_ids = params.get('expert_ids', [])
-        mode = params.get('mode', 'boost')
+        mode = params.get('mode', 'activate')
+        mode = self.MODE_ALIASES.get(mode, mode)
         lambda_param = params.get('lambda', 0.5)  # Default lambda for soft modes
         topk_param = params.get('topk', 8)  # Default top-k for soft_topk mode
 
-        if mode == 'steermoe':
-            return self._transform_steermoe(router_logits, params)
+        if mode in ('activate', 'deactivate'):
+            return self._transform_toggle(router_logits, params, mode)
 
         if not expert_ids:
             # No experts specified, return original
@@ -88,20 +101,8 @@ class MoERouterAlgorithm(AlgorithmTemplate):
         
         # Clone to avoid modifying original
         modified_logits = router_logits.clone()
-        
-        if mode == 'boost':
-            # Boost: Set specified experts' logits to the maximum logit value
-            # This makes them most likely to be selected
-            max_logits = modified_logits.max(dim=-1, keepdim=True)[0]
-            modified_logits[:, expert_ids] = max_logits
-            
-        elif mode == 'suppress':
-            # Suppress: Set specified experts' logits to the minimum logit value
-            # This makes them least likely to be selected
-            min_logits = modified_logits.min(dim=-1, keepdim=True)[0]
-            modified_logits[:, expert_ids] = min_logits
-            
-        elif mode == 'soft':
+
+        if mode == 'soft':
             # Soft intervention: z'_k = z_k + lambda * std(z)
             # Calculate standard deviation of logits for each token
             # std(z) shape: (num_tokens, 1)
@@ -175,65 +176,40 @@ class MoERouterAlgorithm(AlgorithmTemplate):
             
             # Apply delta to randomly selected experts
             modified_logits[batch_flat, expert_flat] += delta_flat
-            
-        elif mode == 'soft_hard':
-            # Soft-hard intervention: set expert logits to max + small random perturbation
-            # This is similar to 'boost' but adds small random values to avoid ties
-            # when multiple experts are specified
-            
-            # Get maximum logit for each token
-            max_logits = modified_logits.max(dim=-1, keepdim=True)[0]  # (num_tokens, 1)
-            
-            num_experts = len(expert_ids)
-            if num_experts > 1:
-                # Add small random perturbations to avoid identical logits
-                # Random values in range [0, 0.0001] to ensure diversity without changing order significantly
-                # Each expert gets a unique random value for each token
-                
-                # Generate random perturbations for each token and each expert
-                # Shape: (num_tokens, num_experts)
-                # torch.rand generates values in [0, 1), multiply by 0.0001 to get [0, 0.0001)
-                # Match dtype with modified_logits to avoid BFloat16/Float mismatch
-                random_perturbations = torch.rand(
-                    modified_logits.shape[0], 
-                    num_experts, 
-                    device=modified_logits.device,
-                    dtype=modified_logits.dtype
-                ) * 0.0001
-                
-                # Set expert logits to max + random perturbation
-                # Use advanced indexing: modified_logits[:, expert_ids] has shape (num_tokens, num_experts)
-                modified_logits[:, expert_ids] = max_logits + random_perturbations
-            else:
-                # Single expert: just set to max (no need for perturbation)
-                modified_logits[:, expert_ids] = max_logits
-            
+
         else:
-            logger.warning(f"Unknown intervention mode: {mode}, must be 'boost', 'suppress', 'soft', 'soft_topk', 'soft_random', 'soft_hard', or 'steermoe'")
+            logger.warning(f"Unknown intervention mode: {mode}, must be 'activate', 'deactivate', 'soft', 'soft_topk', or 'soft_random' (or a deprecated alias: 'boost', 'suppress', 'soft_hard', 'steermoe')")
             return router_logits
 
         return modified_logits
 
-    def _transform_steermoe(
-        self, router_logits: torch.Tensor, params: dict
+    def _transform_toggle(
+        self, router_logits: torch.Tensor, params: dict, mode: str
     ) -> torch.Tensor:
-        """Expert (de)activation from SteerMoE (arXiv:2509.09660).
+        """Hard expert (de)activation (mechanism from arXiv:2509.09660).
 
         Logits are log-softmax normalized, then activated experts are set
         to the per-token max score + epsilon (guaranteeing top-k
         selection) and deactivated experts to the per-token min score -
         epsilon (guaranteeing exclusion). Downstream top-k softmax is
         monotone, so the untouched experts keep their relative weights.
+
+        `mode` decides which direction `expert_ids` maps to; the
+        explicit `activate_ids`/`deactivate_ids` keys are honored in
+        either mode for layers steering both directions at once. An
+        expert listed in both directions ends up deactivated
+        (deactivation is applied last).
         """
         n_experts = router_logits.shape[-1]
-        activate_ids = [
-            eid for eid in params.get('activate_ids', [])
-            if 0 <= eid < n_experts
-        ]
-        deactivate_ids = [
-            eid for eid in params.get('deactivate_ids', [])
-            if 0 <= eid < n_experts
-        ]
+        expert_ids = params.get('expert_ids') or []
+        activate_ids = list(params.get('activate_ids') or [])
+        deactivate_ids = list(params.get('deactivate_ids') or [])
+        if mode == 'activate':
+            activate_ids += expert_ids
+        else:
+            deactivate_ids += expert_ids
+        activate_ids = [e for e in activate_ids if 0 <= e < n_experts]
+        deactivate_ids = [e for e in deactivate_ids if 0 <= e < n_experts]
         if not activate_ids and not deactivate_ids:
             return router_logits
         epsilon = params.get('epsilon', 0.01)
@@ -257,11 +233,17 @@ class MoERouterAlgorithm(AlgorithmTemplate):
             "layer_configs": {
                 "15": {
                     "expert_ids": [1, 5, 10],
-                    "mode": "boost"  # Optional, defaults to "boost"
+                    "mode": "activate"  # Optional, defaults to "activate"
                 },
                 "20": {
                     "expert_ids": [0, 2],
-                    "mode": "suppress"
+                    "mode": "deactivate"
+                },
+                "22": {
+                    "mode": "activate",       # both directions at one layer
+                    "activate_ids": [3],
+                    "deactivate_ids": [0, 2],
+                    "epsilon": 0.01           # Optional tie-breaking margin
                 },
                 "25": {
                     "expert_ids": [3, 7, 12],
@@ -278,13 +260,12 @@ class MoERouterAlgorithm(AlgorithmTemplate):
                     "expert_ids": [1, 5, 10],  # Only count matters, not specific IDs
                     "mode": "soft_random",
                     "lambda": 0.5  # Optional, defaults to request.moe_lambda or 0.5
-                },
-                "40": {
-                    "expert_ids": [2, 4, 6],
-                    "mode": "soft_hard"  # Set to max logits with small random perturbations
                 }
             }
         }
+
+        Deprecated mode aliases 'boost', 'suppress', 'soft_hard' and
+        'steermoe' are still accepted (see class docstring).
         
         Args:
             path: Path to JSON config file
@@ -317,20 +298,23 @@ class MoERouterAlgorithm(AlgorithmTemplate):
                 try:
                     layer_id = int(layer_str)
 
-                    # Set mode: SteerVectorRequest > JSON > default 'boost'
+                    # Set mode: SteerVectorRequest > JSON > default 'activate'
                     # Priority: 1. default_mode from request (if specified)
                     #           2. mode from JSON file
-                    #           3. fallback to 'boost'
+                    #           3. fallback to 'activate'
                     if default_mode is not None:
                         mode = default_mode
                         logger.info(f"Layer {layer_id}: Using mode={mode} from SteerVectorRequest")
                     else:
-                        mode = params.get('mode', 'boost')
+                        mode = params.get('mode', 'activate')
+                    canonical = cls.MODE_ALIASES.get(mode, mode)
 
                     # Validate required fields
-                    if mode == 'steermoe':
-                        if not params.get('activate_ids') and not params.get('deactivate_ids'):
-                            logger.warning(f"Layer {layer_id} steermoe config has neither 'activate_ids' nor 'deactivate_ids', skipping")
+                    if canonical in ('activate', 'deactivate'):
+                        if not (params.get('expert_ids')
+                                or params.get('activate_ids')
+                                or params.get('deactivate_ids')):
+                            logger.warning(f"Layer {layer_id} {mode} config has no expert ids ('expert_ids', 'activate_ids' or 'deactivate_ids'), skipping")
                             continue
                     elif 'expert_ids' not in params:
                         logger.warning(f"Layer {layer_id} missing 'expert_ids', skipping")
@@ -341,7 +325,7 @@ class MoERouterAlgorithm(AlgorithmTemplate):
                         'mode': mode,
                     }
 
-                    if mode == 'steermoe':
+                    if canonical in ('activate', 'deactivate'):
                         intervention_params['activate_ids'] = params.get('activate_ids', [])
                         intervention_params['deactivate_ids'] = params.get('deactivate_ids', [])
                         if 'epsilon' in params:
@@ -389,12 +373,15 @@ class MoERouterAlgorithm(AlgorithmTemplate):
         if not isinstance(params, dict):
             return False
         
-        if params.get('mode') == 'steermoe':
+        mode = params.get('mode', 'activate')
+        if self.MODE_ALIASES.get(mode, mode) in ('activate', 'deactivate'):
             return bool(
-                params.get('activate_ids') or params.get('deactivate_ids')
+                params.get('expert_ids')
+                or params.get('activate_ids')
+                or params.get('deactivate_ids')
             )
 
-        # Must have expert_ids
+        # Soft modes must have expert_ids
         expert_ids = params.get('expert_ids', [])
         if not expert_ids or not isinstance(expert_ids, list):
             return False
