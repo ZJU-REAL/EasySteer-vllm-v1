@@ -52,6 +52,11 @@ def steer_params_dict(obj, fields: tuple = STEER_APPLY_FIELDS) -> dict:
     return {name: getattr(obj, name) for name in fields}
 
 
+def _has_triggers(obj) -> bool:
+    """Whether any canonical trigger field is set on a schema object."""
+    return any(getattr(obj, name) is not None for name in STEER_TRIGGER_FIELDS)
+
+
 def _assert_schema_complete(cls, field_names, required) -> None:
     missing = set(required) - set(field_names)
     assert not missing, (
@@ -316,6 +321,14 @@ class SteerVectorRequest(
                 )
             if not self.vector_configs:
                 raise ValueError("vector_configs cannot be empty in multi-vector mode")
+            for i, vc in enumerate(self.vector_configs):
+                if not _has_triggers(vc):
+                    raise ValueError(
+                        f"vector_configs[{i}] has no trigger fields and would "
+                        "steer no tokens. Set prefill_trigger_tokens=[-1] "
+                        "and/or generate_trigger_tokens=[-1] to apply it to "
+                        "all tokens of that phase."
+                    )
         else:
             # Special case: moe_router algorithm can work without a file path
             # It uses moe_expert_ids and moe_mode from the request directly
@@ -323,6 +336,24 @@ class SteerVectorRequest(
                 raise ValueError(
                     "Must specify steer_vector_local_path in single-vector mode "
                     "(except for moe_router algorithm)"
+                )
+            if self.algorithm == "moe_router" and not self.steer_vector_local_path:
+                if not self.moe_expert_ids:
+                    raise ValueError(
+                        "moe_router without a config file requires moe_expert_ids"
+                    )
+                if not self.target_layers:
+                    raise ValueError(
+                        "moe_router without a config file requires target_layers "
+                        "(the layers whose experts to steer); without it the "
+                        "request would steer nothing"
+                    )
+            if not _has_triggers(self):
+                raise ValueError(
+                    "Steering request has no trigger fields and would steer no "
+                    "tokens. Set prefill_trigger_tokens=[-1] and/or "
+                    "generate_trigger_tokens=[-1] to apply the vector to all "
+                    "tokens of that phase."
                 )
 
     @property

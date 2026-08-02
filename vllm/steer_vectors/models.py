@@ -131,9 +131,16 @@ class LoadedSteerVector:
             file_path, device, config=config, target_layers=target_layers, **kwargs
         )
 
+        layer_payloads = loaded_params.get("layer_payloads")
+        if not layer_payloads:
+            raise ValueError(
+                f"Algorithm '{algorithm}' loaded no layer payloads from "
+                f"{file_path}; the vector would steer nothing"
+            )
+
         return cls(
             steer_vector_id=steer_vector_id,
-            layer_payloads=loaded_params.get("layer_payloads"),
+            layer_payloads=layer_payloads,
             scale_factor=scale_factor,
             algorithm=algorithm,
         )

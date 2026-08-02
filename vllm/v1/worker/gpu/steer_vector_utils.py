@@ -32,9 +32,7 @@ class SteerVectorState:
             return
         self._requests[req_id] = steer_vector_request
         if manager is not None:
-            self._slots[req_id] = manager.acquire_config(
-                req_id, steer_vector_request
-            )
+            self._slots[req_id] = manager.acquire_config(req_id, steer_vector_request)
 
     def remove_request(self, req_id: str, manager) -> None:
         if self._requests.pop(req_id, None) is None:
@@ -76,15 +74,14 @@ def make_steer_vector_forward_kwargs(
     # During decode, the scheduler has computed prefill_len + (k - 1) tokens
     # when the k-th output token is being generated, matching the V1
     # semantics of len(output_token_ids) at execute time.
-    num_output = np.where(
-        is_prefilling, 0, num_computed - prefill_len + 1
-    ).astype(np.int32)
+    num_output = np.where(is_prefilling, 0, num_computed - prefill_len + 1).astype(
+        np.int32
+    )
     kwargs = {
         "current_tokens": input_batch.input_ids[: input_batch.num_tokens],
-        "num_computed_tokens_cpu": torch.from_numpy(
-            np.ascontiguousarray(num_computed)
-        ),
+        "num_computed_tokens_cpu": torch.from_numpy(np.ascontiguousarray(num_computed)),
         "num_output_tokens_cpu": torch.from_numpy(num_output),
+        "num_prompt_tokens_cpu": torch.from_numpy(np.ascontiguousarray(prefill_len)),
         "query_start_loc": input_batch.query_start_loc[: num_reqs + 1],
     }
 
@@ -102,17 +99,13 @@ def make_steer_vector_forward_kwargs(
         kwargs["steer_token_slots"] = torch.from_numpy(token_slots_np).to(
             input_batch.input_ids.device, non_blocking=True
         )
-        kwargs["steer_active_slots"] = sorted(
-            {int(s) for s in slots_np if s >= 0}
-        )
+        kwargs["steer_active_slots"] = sorted({int(s) for s in slots_np if s >= 0})
 
         if trace.enabled():
             trace.begin_step(
                 req_ids=input_batch.req_ids,
                 slots=slots_np.tolist(),
-                query_start_loc=input_batch.query_start_loc_np[
-                    : num_reqs + 1
-                ].tolist(),
+                query_start_loc=input_batch.query_start_loc_np[: num_reqs + 1].tolist(),
                 token_ids=kwargs["current_tokens"].cpu().tolist(),
                 num_computed=num_computed.tolist(),
                 num_output=num_output.tolist(),
@@ -165,15 +158,13 @@ def fill_graph_steer_buffers(
     if n == 0:
         return
     device = row_buf.device
-    row_buf[:n].copy_(
-        torch.from_numpy(token_rows_np).to(device, non_blocking=True)
-    )
+    row_buf[:n].copy_(torch.from_numpy(token_rows_np).to(device, non_blocking=True))
     token_slots = torch.from_numpy(np.repeat(slots_np, num_scheduled)).to(
         device, non_blocking=True
     )
 
-    # Batch geometry for the trigger collector (mirrors
-    # extract_samples_info: decode == single-token sample).
+    # Batch geometry for the trigger collector, from scheduler ground
+    # truth (is_prefilling_np), matching extract_samples_info.
     current_tokens = input_batch.input_ids[: input_batch.num_tokens]
     num_computed_np = input_batch.num_computed_tokens_np[:num_reqs]
     prefill_len_np = input_batch.prefill_len_np[:num_reqs]
@@ -183,13 +174,16 @@ def fill_graph_steer_buffers(
     ).astype(np.int32)
     samples_info = {
         "query_start_loc": input_batch.query_start_loc[: num_reqs + 1],
-        "num_computed": torch.from_numpy(
-            np.ascontiguousarray(num_computed_np)
-        ).to(device, non_blocking=True),
-        "is_decode_mask": torch.from_numpy(num_scheduled == 1).to(
+        "num_computed": torch.from_numpy(np.ascontiguousarray(num_computed_np)).to(
+            device, non_blocking=True
+        ),
+        "is_decode_mask": torch.from_numpy(np.ascontiguousarray(~is_prefilling_np)).to(
             device, non_blocking=True
         ),
         "num_output_tokens": torch.from_numpy(num_output_np).to(
+            device, non_blocking=True
+        ),
+        "num_prompt_tokens": torch.from_numpy(np.ascontiguousarray(prefill_len_np)).to(
             device, non_blocking=True
         ),
     }
@@ -201,8 +195,7 @@ def fill_graph_steer_buffers(
         ctrl = TriggerController()
         ctrl.configure_from_dict(steer_params_dict(request))
         if ctrl.is_global_only_config():
-            positions = (token_slots == slot).nonzero(
-                as_tuple=False).squeeze(-1)
+            positions = (token_slots == slot).nonzero(as_tuple=False).squeeze(-1)
         else:
             # current_tokens doubles as the hidden_states arg: the
             # collector only takes the device from it.

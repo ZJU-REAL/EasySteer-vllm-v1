@@ -200,8 +200,10 @@ class TriggerController:
 # - token exclusions are not phase-restricted (they only ever see
 #   prefill positions in practice because they apply to prefill_part)
 # - position triggers/exclusions use absolute positions within the
-#   request (prefix-cache offset included); negative indices are
-#   Python-style from the end of the total sequence
+#   request (chunked-prefill offset included); negative indices are
+#   Python-style from the end of the prompt when the runner provides
+#   per-request prompt lengths (correct across prefill chunks), else
+#   legacy-style from the end of the tokens processed so far
 # - first_k/after_k compare against the number of tokens already
 #   generated and only constrain decode tokens
 
@@ -221,8 +223,9 @@ def _match_positions(
     """[total_tokens] mask of tokens at the given absolute positions.
 
     Positive entries match absolute positions directly; negative entries
-    are Python-style indices from each sample's total length (prompt +
-    cached + generated so far).
+    are Python-style indices from each sample's length in
+    `total_len_per_sample` (the prompt length when the runner provides
+    it, else the tokens processed so far).
     """
     mask = torch.zeros_like(abs_positions, dtype=torch.bool)
     positive = [p for p in positions if p >= 0]
@@ -286,6 +289,11 @@ def collect_positions_gpu_batch(
     else:
         abs_positions = relative_positions
         total_len = query_start_loc[1:] - query_start_loc[:-1]
+    # Base for negative position indices: the prompt length when the
+    # runner provides it (stable across prefill chunks), else the
+    # legacy tokens-so-far total.
+    num_prompt = samples_info.get("num_prompt_tokens")
+    neg_base = total_len if num_prompt is None else num_prompt.to(device)
     is_decode_token = is_decode_mask[sample_ids]
     is_prefill_token = ~is_decode_token
 
@@ -316,7 +324,7 @@ def collect_positions_gpu_batch(
                 prefill_part |= is_prefill_token & _match_positions(
                     abs_positions,
                     prefill_trigger_positions,
-                    total_len,
+                    neg_base,
                     sample_ids,
                 )
             if prefill_trigger_tokens is not None:
@@ -330,7 +338,7 @@ def collect_positions_gpu_batch(
                         & _match_positions(
                             abs_positions,
                             prefill_exclude_positions,
-                            total_len,
+                            neg_base,
                             sample_ids,
                         )
                     )

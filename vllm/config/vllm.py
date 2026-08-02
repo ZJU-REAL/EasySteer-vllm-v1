@@ -1173,19 +1173,20 @@ class VllmConfig:
                 "precision for chunked prefill triton kernels."
             )
 
-        # Steer vectors are incompatible with chunked prefill and
-        # prefix caching.  Raise hard errors rather than silently
-        # fixing — these cause subtle correctness bugs that are
-        # extremely difficult to diagnose (see commit 9b999cb for
-        # the prefix cache collision bug that invalidated an entire
-        # experiment run).
         if self.steer_vector_config is not None:
-            if self.scheduler_config.enable_chunked_prefill:
-                raise ValueError(
-                    "Steer vectors are incompatible with chunked prefill. "
-                    "Set --no-enable-chunked-prefill or "
-                    "enable_chunked_prefill=False when using steering."
-                )
+            # Resolve steer_vector_dtype="auto" to the model dtype so
+            # vectors match the hidden states they steer.
+            if (
+                self.steer_vector_config.steer_vector_dtype == "auto"
+                and self.model_config is not None
+            ):
+                self.steer_vector_config.steer_vector_dtype = self.model_config.dtype
+            # Steer vectors are incompatible with prefix caching: raise a
+            # hard error rather than silently fixing — see commit 9b999cb
+            # for the prefix cache collision bug that invalidated an
+            # entire experiment run. (Chunked prefill is supported: phase
+            # classification and trigger positions come from scheduler
+            # ground truth in the forward context.)
             if (
                 self.cache_config is not None
                 and self.cache_config.enable_prefix_caching

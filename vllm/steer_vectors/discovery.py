@@ -366,6 +366,7 @@ def extract_samples_info(attn_metadata) -> dict[str, torch.Tensor] | None:
 
     num_computed_tokens_cpu = get_num_computed_tokens(attn_metadata)
     num_output_tokens_cpu = get_num_output_tokens(attn_metadata)
+    num_prompt_tokens_cpu = get_num_prompt_tokens(attn_metadata)
 
     # Downstream consumers index these with GPU sample ids; the runner
     # provides CPU tensors, so move them to the batch device here once.
@@ -374,18 +375,25 @@ def extract_samples_info(attn_metadata) -> dict[str, torch.Tensor] | None:
         num_computed_tokens_cpu = num_computed_tokens_cpu.to(device, non_blocking=True)
     if num_output_tokens_cpu is not None:
         num_output_tokens_cpu = num_output_tokens_cpu.to(device, non_blocking=True)
+    if num_prompt_tokens_cpu is not None:
+        num_prompt_tokens_cpu = num_prompt_tokens_cpu.to(device, non_blocking=True)
 
-    starts = query_start_loc[:-1]
-    ends = query_start_loc[1:]
-    lengths = ends - starts
-    # Decode samples contribute a single token; prefill samples more.
-    is_decode_mask = lengths == 1
+    if num_output_tokens_cpu is not None:
+        # Scheduler ground truth: a request has generated output iff it
+        # finished prefilling. Correct for 1-token prompts and chunked
+        # prefill, where the length heuristic below misclassifies.
+        is_decode_mask = num_output_tokens_cpu > 0
+    else:
+        starts = query_start_loc[:-1]
+        ends = query_start_loc[1:]
+        is_decode_mask = (ends - starts) == 1
 
     return {
         "query_start_loc": query_start_loc,
         "num_computed": num_computed_tokens_cpu,
         "is_decode_mask": is_decode_mask,
         "num_output_tokens": num_output_tokens_cpu,
+        "num_prompt_tokens": num_prompt_tokens_cpu,
     }
 
 
@@ -437,3 +445,11 @@ def get_num_output_tokens(attn_metadata) -> torch.Tensor | None:
     if ctx is not None:
         return ctx.num_output_tokens_cpu
     return _attn_metadata_field(attn_metadata, "num_output_tokens_cpu")
+
+
+def get_num_prompt_tokens(attn_metadata) -> torch.Tensor | None:
+    """Extract num_prompt_tokens_cpu (per-request prompt length)."""
+    ctx = _forward_context_or_none()
+    if ctx is not None:
+        return ctx.num_prompt_tokens_cpu
+    return _attn_metadata_field(attn_metadata, "num_prompt_tokens_cpu")

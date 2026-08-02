@@ -149,7 +149,7 @@ class ForwardContext:
     batch_descriptor: BatchDescriptor | None = None
 
     ubatch_slices: UBatchSlices | None = None
-    
+
     # Steer vector support: current tokens being processed
     current_tokens: torch.Tensor | None = None
     """Current batch token IDs being processed.
@@ -157,7 +157,7 @@ class ForwardContext:
     - Used by steer vectors for token-based triggers
     - In V1 continuous batching, contains both decode and prefill tokens concatenated
     """
-    
+
     num_computed_tokens_cpu: torch.Tensor | None = None
     """Number of cached/computed tokens for each request in the batch.
     - Shape: (batch_size,)
@@ -165,15 +165,22 @@ class ForwardContext:
       when prefix caching is enabled
     - Value 0 means no tokens are cached for that request
     """
-    
+
     num_output_tokens_cpu: torch.Tensor | None = None
     """Number of output tokens already generated for each request in the batch.
     - Shape: (batch_size,)
     - Used by steer vectors for generate_first_k_tokens and generate_after_k_tokens
-    - Value 0 means this is the first generation token for that request
-    - Only relevant for decode phase requests
+    - Value 0 means the request is still prefilling (scheduler ground truth,
+      also used to classify prefill vs decode tokens)
     """
-    
+
+    num_prompt_tokens_cpu: torch.Tensor | None = None
+    """Prompt length of each request in the batch.
+    - Shape: (batch_size,)
+    - Used by steer vectors to resolve negative prefill trigger/exclude
+      positions against the full prompt (correct under chunked prefill)
+    """
+
     query_start_loc: torch.Tensor | None = None
     """Sample boundary offsets for the current batch.
     - Shape: (num_samples + 1,) - cumulative token counts per sample
@@ -264,6 +271,7 @@ def create_forward_context(
     current_tokens: torch.Tensor | None = None,
     num_computed_tokens_cpu: torch.Tensor | None = None,
     num_output_tokens_cpu: torch.Tensor | None = None,
+    num_prompt_tokens_cpu: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
     steer_token_slots: torch.Tensor | None = None,
     steer_active_slots: list[int] | None = None,
@@ -288,6 +296,7 @@ def create_forward_context(
         current_tokens=current_tokens,
         num_computed_tokens_cpu=num_computed_tokens_cpu,
         num_output_tokens_cpu=num_output_tokens_cpu,
+        num_prompt_tokens_cpu=num_prompt_tokens_cpu,
         query_start_loc=query_start_loc,
         steer_token_slots=steer_token_slots,
         steer_active_slots=steer_active_slots,
@@ -324,6 +333,7 @@ def set_forward_context(
     current_tokens: torch.Tensor | None = None,
     num_computed_tokens_cpu: torch.Tensor | None = None,
     num_output_tokens_cpu: torch.Tensor | None = None,
+    num_prompt_tokens_cpu: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
     steer_token_slots: torch.Tensor | None = None,
     steer_active_slots: list[int] | None = None,
@@ -399,6 +409,7 @@ def set_forward_context(
         current_tokens=current_tokens,
         num_computed_tokens_cpu=num_computed_tokens_cpu,
         num_output_tokens_cpu=num_output_tokens_cpu,
+        num_prompt_tokens_cpu=num_prompt_tokens_cpu,
         query_start_loc=query_start_loc,
         steer_token_slots=steer_token_slots,
         steer_active_slots=steer_active_slots,

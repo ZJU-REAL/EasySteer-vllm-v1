@@ -4,7 +4,7 @@
 """Configuration for Steer Vectors."""
 
 import hashlib
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, Literal
 import torch
 from pydantic import ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
@@ -29,18 +29,18 @@ SteerVectorDType = Literal["auto", "float16", "bfloat16", "float32"]
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
 class SteerVectorConfig:
     """Configuration for Steer Vectors.
-    
+
     Steer vectors allow runtime intervention in model behavior by adding
     control vectors to hidden states at specific layers.
     """
 
     max_steer_vectors: int = Field(default=8, ge=1)
     """Maximum number of steer vectors in a single batch."""
-    
+
     max_cpu_steer_vectors: int | None = None
     """Maximum number of steer vectors to store in CPU memory. 
     Must be >= max_steer_vectors. If None, defaults to max_steer_vectors."""
-    
+
     steer_vector_dtype: SteerVectorDType = "auto"
     """Data type for steer vectors. If 'auto', will default to base model dtype."""
 
@@ -104,37 +104,32 @@ class SteerVectorConfig:
         factors.append(self.server_algorithm)
         factors.append(self.server_normalize)
 
-        hash_str = hashlib.md5(
-            str(factors).encode(), usedforsecurity=False
-        ).hexdigest()
+        hash_str = hashlib.md5(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
     @property
     def adapter_dtype(self) -> torch.dtype:
-        """Backward compatibility alias for steer_vector_dtype.
-        
-        Returns actual torch.dtype, converting "auto" to float16 as default.
+        """The resolved torch dtype vectors are loaded in.
+
+        "auto" is resolved to the model dtype during VllmConfig
+        post-init; seeing it here means that resolution never ran.
         """
         if isinstance(self.steer_vector_dtype, torch.dtype):
             return self.steer_vector_dtype
-        
-        # Convert string dtype to torch.dtype
+        if self.steer_vector_dtype == "auto":
+            raise RuntimeError(
+                "steer_vector_dtype='auto' was not resolved to the model "
+                "dtype; this config did not go through VllmConfig "
+                "initialization. Set an explicit dtype."
+            )
         dtype_map = {
-            "auto": torch.float16,  # Default to float16 for "auto"
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
             "float32": torch.float32,
         }
-        
-        if self.steer_vector_dtype in dtype_map:
-            return dtype_map[self.steer_vector_dtype]
-        
-        # Fallback to float16 if unknown
-        logger.warning(
-            f"Unknown steer_vector_dtype: {self.steer_vector_dtype}, "
-            f"defaulting to float16"
-        )
-        return torch.float16
+        if self.steer_vector_dtype not in dtype_map:
+            raise ValueError(f"Unknown steer_vector_dtype: {self.steer_vector_dtype}")
+        return dtype_map[self.steer_vector_dtype]
 
     @model_validator(mode="after")
     def _validate_config(self) -> Self:
@@ -146,5 +141,3 @@ class SteerVectorConfig:
                 f"must be >= max_steer_vectors ({self.max_steer_vectors})"
             )
         return self
-
-
