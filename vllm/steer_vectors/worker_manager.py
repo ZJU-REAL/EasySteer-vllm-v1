@@ -44,12 +44,20 @@ def config_fingerprint(request: SteerVectorRequest) -> str:
             out.append(tuple(value) if isinstance(value, list) else value)
         return out
 
+    from vllm.steer_vectors.store import file_version
+
+    # The file version participates so a vector regenerated at the same
+    # path gets a fresh slot (and thus a fresh load) even while requests
+    # with the old version are still running.
     values = [request.local_path, request.debug]
+    if request.local_path:
+        values.append(file_version(request.local_path))
     values.extend(_canon(request, STEER_APPLY_FIELDS))
     if request.is_multi_vector:
         values.append(request.conflict_resolution)
         for vc in request.vector_configs:
             values.append(vc.path)
+            values.append(file_version(vc.path))
             values.extend(_canon(vc, STEER_APPLY_FIELDS))
     if request.algorithm == "moe_router":
         values.extend(_canon(request, STEER_MOE_FIELDS))

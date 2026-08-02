@@ -8,6 +8,7 @@ request admission — never inside the forward pass.
 """
 
 import logging
+import os
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
@@ -18,38 +19,66 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class VectorStore:
-    """LRU cache of loaded steer vector payloads, keyed by (path, algorithm).
+def file_version(path: str) -> tuple[int, int]:
+    """(mtime_ns, size) of a vector file, (0, 0) if unreadable.
 
-    Entries hold unscaled per-layer payload tensors on the target device;
-    per-request scaling is applied when a config is distributed to layer
-    slots, so any number of configs can share one resident entry.
+    Used to detect regenerated vectors at the same path. For checkpoint
+    directories this tracks the directory inode (best effort: in-place
+    rewrites of files inside a directory may not bump it).
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return (0, 0)
+    return (st.st_mtime_ns, st.st_size)
+
+
+class VectorStore:
+    """LRU cache of loaded steer vector payloads.
+
+    Keyed by (path, algorithm, mtime_ns, size) so a vector regenerated at
+    the same path loads fresh instead of silently serving the stale cached
+    payload, while byte-identical reuse still dedups. Entries hold
+    unscaled per-layer payload tensors on the target device; per-request
+    scaling is applied when a config is distributed to layer slots, so any
+    number of configs can share one resident entry.
     """
 
     def __init__(self, device: str, steer_vector_config: "SteerVectorConfig"):
         self.device = device
         self.steer_vector_config = steer_vector_config
         self.capacity = max(1, steer_vector_config.max_steer_vectors)
-        self._entries: OrderedDict[tuple[str, str], "SteerVectorModel"] = (
-            OrderedDict()
-        )
+        self._entries: OrderedDict[tuple, "SteerVectorModel"] = OrderedDict()
         self._warned_lazy: set[str] = set()
 
     def get(
         self, path: str, algorithm: str, *, lazy: bool = False
     ) -> "SteerVectorModel":
-        """Return the loaded entry for (path, algorithm), loading if needed.
+        """Return the loaded entry for the file's current version, loading
+        if needed.
 
         With lazy=True (request admission), a one-time warning recommends
         preloading. Raises on load failure.
         """
-        key = (path, algorithm)
+        key = (path, algorithm, *file_version(path))
         entry = self._entries.get(key)
         if entry is not None:
             self._entries.move_to_end(key)
             return entry
 
-        if lazy and path not in self._warned_lazy:
+        # Drop stale versions of the same vector so they don't hold
+        # capacity (and so the reload is visible in the logs).
+        stale = [
+            k for k in self._entries
+            if k[0] == path and k[1] == algorithm
+        ]
+        for k in stale:
+            del self._entries[k]
+        if stale:
+            logger.info(
+                "Steer vector file changed on disk, reloading: %s", path
+            )
+        elif lazy and path not in self._warned_lazy:
             self._warned_lazy.add(path)
             logger.warning(
                 "Steer vector %s was not preloaded; loading it now blocks "
@@ -78,6 +107,11 @@ class VectorStore:
 
     def preload(self, path: str, algorithm: str = "direct") -> None:
         self.get(path, algorithm, lazy=False)
+
+    def reload(self, path: str, algorithm: str = "direct") -> None:
+        """Force-refresh a vector from disk regardless of stat changes."""
+        self.unload(path)
+        self.preload(path, algorithm)
 
     def unload(self, path: str) -> bool:
         removed = False
