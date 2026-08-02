@@ -31,12 +31,18 @@ class MoERouterAlgorithm(AlgorithmTemplate):
     - 'soft': z'_k = z_k + lambda * std(z) - soft intervention based on logits std
     - 'soft_random': z'_k = z_k + lambda * std(z) - soft intervention on random experts (same count as expert_ids)
     - 'soft_hard': Set logits[expert_ids] = max(all_logits) + small_random - boost with random perturbation to avoid ties
-    
+    - 'steermoe': Expert (de)activation from SteerMoE (arXiv:2509.09660):
+      log-softmax the logits, then set activated experts to per-token
+      max + epsilon and deactivated experts to per-token min - epsilon.
+
     Payload format (dict):
     {
         'expert_ids': [1, 5, 10],  # List of expert IDs to intervene (for soft_random: determines count only)
-        'mode': 'boost',            # 'boost', 'suppress', 'soft', 'soft_topk', 'soft_random', or 'soft_hard'
+        'mode': 'boost',            # 'boost', 'suppress', 'soft', 'soft_topk', 'soft_random', 'soft_hard', or 'steermoe'
         'lambda': 0.5,              # (Optional) For 'soft'/'soft_random' modes: intervention strength
+        'activate_ids': [3, 7],     # (steermoe) experts forced into top-k
+        'deactivate_ids': [1, 5],   # (steermoe) experts forced out of top-k
+        'epsilon': 0.01,            # (Optional, steermoe) tie-breaking margin
     }
     """
     
@@ -67,7 +73,10 @@ class MoERouterAlgorithm(AlgorithmTemplate):
         mode = params.get('mode', 'boost')
         lambda_param = params.get('lambda', 0.5)  # Default lambda for soft modes
         topk_param = params.get('topk', 8)  # Default top-k for soft_topk mode
-        
+
+        if mode == 'steermoe':
+            return self._transform_steermoe(router_logits, params)
+
         if not expert_ids:
             # No experts specified, return original
             return router_logits
@@ -203,10 +212,43 @@ class MoERouterAlgorithm(AlgorithmTemplate):
                 modified_logits[:, expert_ids] = max_logits
             
         else:
-            logger.warning(f"Unknown intervention mode: {mode}, must be 'boost', 'suppress', 'soft', 'soft_topk', 'soft_random', or 'soft_hard'")
+            logger.warning(f"Unknown intervention mode: {mode}, must be 'boost', 'suppress', 'soft', 'soft_topk', 'soft_random', 'soft_hard', or 'steermoe'")
             return router_logits
-        
+
         return modified_logits
+
+    def _transform_steermoe(
+        self, router_logits: torch.Tensor, params: dict
+    ) -> torch.Tensor:
+        """Expert (de)activation from SteerMoE (arXiv:2509.09660).
+
+        Logits are log-softmax normalized, then activated experts are set
+        to the per-token max score + epsilon (guaranteeing top-k
+        selection) and deactivated experts to the per-token min score -
+        epsilon (guaranteeing exclusion). Downstream top-k softmax is
+        monotone, so the untouched experts keep their relative weights.
+        """
+        n_experts = router_logits.shape[-1]
+        activate_ids = [
+            eid for eid in params.get('activate_ids', [])
+            if 0 <= eid < n_experts
+        ]
+        deactivate_ids = [
+            eid for eid in params.get('deactivate_ids', [])
+            if 0 <= eid < n_experts
+        ]
+        if not activate_ids and not deactivate_ids:
+            return router_logits
+        epsilon = params.get('epsilon', 0.01)
+
+        scores = torch.nn.functional.log_softmax(router_logits, dim=-1)
+        max_per_tok = scores.max(dim=-1, keepdim=True)[0]
+        min_per_tok = scores.min(dim=-1, keepdim=True)[0]
+        if activate_ids:
+            scores[:, activate_ids] = max_per_tok + epsilon
+        if deactivate_ids:
+            scores[:, deactivate_ids] = min_per_tok - epsilon
+        return scores
     
     @classmethod
     def load_from_path(cls, path: str, device: str, **kwargs) -> dict:
@@ -277,12 +319,7 @@ class MoERouterAlgorithm(AlgorithmTemplate):
             for layer_str, params in layer_configs.items():
                 try:
                     layer_id = int(layer_str)
-                    
-                    # Validate required fields
-                    if 'expert_ids' not in params:
-                        logger.warning(f"Layer {layer_id} missing 'expert_ids', skipping")
-                        continue
-                    
+
                     # Set mode: SteerVectorRequest > JSON > default 'boost'
                     # Priority: 1. default_mode from request (if specified)
                     #           2. mode from JSON file
@@ -292,11 +329,26 @@ class MoERouterAlgorithm(AlgorithmTemplate):
                         logger.info(f"Layer {layer_id}: Using mode={mode} from SteerVectorRequest")
                     else:
                         mode = params.get('mode', 'boost')
-                    
+
+                    # Validate required fields
+                    if mode == 'steermoe':
+                        if not params.get('activate_ids') and not params.get('deactivate_ids'):
+                            logger.warning(f"Layer {layer_id} steermoe config has neither 'activate_ids' nor 'deactivate_ids', skipping")
+                            continue
+                    elif 'expert_ids' not in params:
+                        logger.warning(f"Layer {layer_id} missing 'expert_ids', skipping")
+                        continue
+
                     intervention_params = {
                         'expert_ids': params.get('expert_ids', []),
                         'mode': mode,
                     }
+
+                    if mode == 'steermoe':
+                        intervention_params['activate_ids'] = params.get('activate_ids', [])
+                        intervention_params['deactivate_ids'] = params.get('deactivate_ids', [])
+                        if 'epsilon' in params:
+                            intervention_params['epsilon'] = params['epsilon']
                     
                     # Add lambda parameter:
                     # 1. If present in JSON, use JSON value
@@ -340,10 +392,15 @@ class MoERouterAlgorithm(AlgorithmTemplate):
         if not isinstance(params, dict):
             return False
         
+        if params.get('mode') == 'steermoe':
+            return bool(
+                params.get('activate_ids') or params.get('deactivate_ids')
+            )
+
         # Must have expert_ids
         expert_ids = params.get('expert_ids', [])
         if not expert_ids or not isinstance(expert_ids, list):
             return False
-        
+
         return True
 

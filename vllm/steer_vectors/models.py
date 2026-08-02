@@ -133,6 +133,20 @@ def find_moe_gate(moe_block: nn.Module) -> Optional[nn.Module]:
     return None
 
 
+def moe_gate_is_fused(moe_block: nn.Module) -> bool:
+    """Whether the block's MoE runner bypasses the gate module forward.
+
+    When a model provides both a gate and a shared-expert gate, the MoE
+    runner fuses their weights and computes routing with a raw ``F.linear``
+    (``MoERunner._fse_fuse_gate``) — the gate module is never called, so
+    forward hooks on it would silently never fire.
+    """
+    return any(
+        getattr(child, "_fse_fuse_gate", False)
+        for child in moe_block.children()
+    )
+
+
 # ============================================================================
 # Section 2: Wrapper Registry (Configuration-Driven)
 # ============================================================================
@@ -397,6 +411,15 @@ class SteerVectorModelManager:
                     logger.warning(
                         "MoE block %s has no gate/router submodule; "
                         "cannot steer its router logits.", module_name,
+                    )
+                    continue
+                if moe_gate_is_fused(module):
+                    logger.warning(
+                        "MoE block %s fuses gate weights into the MoE "
+                        "runner (the gate module forward is bypassed), so "
+                        "gate hooks would never fire; router-logit "
+                        "steering is unavailable for this block.",
+                        module_name,
                     )
                     continue
                 op_key = f"{module_name}::gate"

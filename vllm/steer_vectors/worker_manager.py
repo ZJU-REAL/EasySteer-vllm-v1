@@ -348,12 +348,13 @@ class WorkerSteerVectorManager:
                     "config file path is given"
                 )
             layer_payloads = {}
+            moe_mode = request.moe_mode or "boost"
             for layer_id in (request.target_layers or []):
                 payload = {
                     "expert_ids": request.moe_expert_ids,
-                    "mode": request.moe_mode,
+                    "mode": moe_mode,
                 }
-                if request.moe_mode == "soft":
+                if moe_mode == "soft":
                     payload["lambda"] = request.moe_lambda
                 layer_payloads[layer_id] = payload
             return self._steer_vector_model_cls(

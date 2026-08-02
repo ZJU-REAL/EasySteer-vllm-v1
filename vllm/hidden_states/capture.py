@@ -230,6 +230,7 @@ class CaptureSession:
         from vllm.steer_vectors.models import (
             find_moe_blocks_structurally,
             find_moe_gate,
+            moe_gate_is_fused,
         )
 
         blocks = find_moe_blocks_structurally(model)
@@ -240,6 +241,13 @@ class CaptureSession:
                 logger.warning(
                     "[Capture] MoE block %s has no gate/router submodule; "
                     "its router logits cannot be captured.", name,
+                )
+                continue
+            if moe_gate_is_fused(block):
+                logger.warning(
+                    "[Capture] MoE block %s fuses gate weights into the "
+                    "MoE runner (gate forward bypassed); its router "
+                    "logits cannot be captured.", name,
                 )
                 continue
             layer_id = extract_layer_id_from_module_name(name)
