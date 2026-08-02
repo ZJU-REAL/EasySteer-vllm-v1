@@ -127,6 +127,86 @@ def _reconstruct_output(modified_hidden_states, residual, other_outputs, origina
         return modified_hidden_states
 
 
+def extract_gate_logits(output):
+    """Pull the router-logits tensor out of a gate module's output.
+
+    vLLM linear layers typically return (logits, bias); some models
+    return a bare tensor.
+    """
+    if isinstance(output, tuple):
+        output = output[0]
+    return output if isinstance(output, torch.Tensor) else None
+
+
+class MoEGateSteerController(BaseLayerWithSteerVector):
+    """Hook-based MoE router-logits steering controller.
+
+    Registered as a forward hook on the MoE block's gate/router
+    submodule: the logits are steered in place (via the opaque
+    vllm::steer_moe_gate op, a splitting op under compiled execution)
+    before top-k expert selection consumes them — architecture-agnostic,
+    no per-model forward reimplementation. Single-active semantics: the
+    worker manager distributes at most one moe_router config at a time.
+    """
+
+    def __init__(self, base_layer=None) -> None:
+        super().__init__()
+        self.base_layer = base_layer
+        self.layer_id: Optional[int] = None
+        self.algorithm: Optional[BaseSteerVectorAlgorithm] = None
+        self._algorithm_name: Optional[str] = None
+        self._op_key: Optional[str] = None
+
+    def set_layer_id(self, layer_id: int) -> None:
+        self.layer_id = layer_id
+        if self.algorithm is not None:
+            self.algorithm.layer_id = layer_id
+
+    def set_steer_vector(self, index: int, **kwargs) -> None:
+        algorithm_name = kwargs.pop("algorithm_name", "moe_router")
+        if self.algorithm is None or self._algorithm_name != algorithm_name:
+            self.algorithm = create_algorithm(
+                algorithm_name, layer_id=self.layer_id)
+            self._algorithm_name = algorithm_name
+        self.algorithm.set_steer_vector(index, **kwargs)
+        self.algorithm.params.configure_from_dict(kwargs)
+
+    def set_active_tensor(self, index: int) -> None:
+        if self.algorithm is not None:
+            self.algorithm.set_active_tensor(index)
+
+    def reset_steer_vector(self, index: int) -> None:
+        if self.algorithm is not None:
+            self.algorithm.reset_steer_vector(index)
+            self.algorithm._active_payload = None
+
+    def process_gate_output_hook(self, module, args, output):
+        """Forward-hook entry point on the gate module.
+
+        The logits tensor is mutated in place, so the original output
+        structure flows on unchanged (hook returns None).
+        """
+        if self._op_key is None:
+            return None
+        logits = extract_gate_logits(output)
+        if logits is None:
+            return None
+        torch.ops.vllm.steer_moe_gate(logits, self._op_key)
+        return None
+
+    def apply_gate_steering(self, logits):
+        """Op implementation: apply the active moe_router config."""
+        algo = self.algorithm
+        if algo is None:
+            return None
+        ctx_info = algo._get_forward_context_and_samples(logits)
+        context_info = None
+        if ctx_info is not None:
+            _, samples_info, current_tokens = ctx_info
+            context_info = (current_tokens, samples_info)
+        return algo.apply_intervention(logits, context_info=context_info)
+
+
 def _resolve_conflicts(collected, mode: str):
     """Resolve position conflicts between a slot's interventions.
 

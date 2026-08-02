@@ -1545,11 +1545,10 @@ class VllmConfig:
                 )
             elif self.compilation_config.mode == CompilationMode.VLLM_COMPILE:
                 splitting_ops = self.compilation_config.splitting_ops
-                if (
-                    splitting_ops is not None
-                    and "vllm::steer_apply" not in splitting_ops
-                ):
-                    splitting_ops.append("vllm::steer_apply")
+                if splitting_ops is not None:
+                    for op in ("vllm::steer_apply", "vllm::steer_moe_gate"):
+                        if op not in splitting_ops:
+                            splitting_ops.append(op)
                 if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
                     logger.info(
                         "Steer vectors: downgrading cudagraph_mode from %s "

@@ -35,11 +35,8 @@ from vllm.steer_vectors.config import WRAPPER_REGISTRY, get_target_modules
 from vllm.steer_vectors import ops as steer_ops
 from vllm.steer_vectors.layers import (
     DecoderLayerWithSteerVector,
+    MoEGateSteerController,
     extract_layer_id_from_module_name,
-)
-from vllm.steer_vectors.moe_layers import (
-    MoELayerWithSteerVector,
-    extract_moe_layer_id_from_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -122,6 +119,20 @@ def find_moe_blocks_structurally(model: nn.Module) -> dict[str, nn.Module]:
     return matches
 
 
+def find_moe_gate(moe_block: nn.Module) -> Optional[nn.Module]:
+    """Return the routing (gate) submodule of a sparse-MoE block.
+
+    Architecture-agnostic: virtually every MoE block exposes the router
+    as a `gate` or `router` child whose output logits feed top-k expert
+    selection.
+    """
+    for attr in ("gate", "router"):
+        gate = getattr(moe_block, attr, None)
+        if isinstance(gate, nn.Module):
+            return gate
+    return None
+
+
 # ============================================================================
 # Section 2: Wrapper Registry (Configuration-Driven)
 # ============================================================================
@@ -139,7 +150,7 @@ for wrapper_type, config in WRAPPER_REGISTRY.items():
         if wrapper_type == "decoder_layer":
             _all_sv_classes[wrapper_type] = DecoderLayerWithSteerVector
         elif wrapper_type == "moe_layer":
-            _all_sv_classes[wrapper_type] = MoELayerWithSteerVector
+            _all_sv_classes[wrapper_type] = MoEGateSteerController
         # Future wrapper types can be added here:
         # elif wrapper_type == "attention":
         #     from vllm.steer_vectors.layers import AttentionWithSteerVector
@@ -354,18 +365,13 @@ class SteerVectorModelManager:
                     len(matches), wrapper_type, next(iter(matches)),
                 )
 
-        # Wrap matching modules
+        # Hook matching modules: the original modules stay in the tree
+        # (module names, classes and state-dict keys are untouched,
+        # keeping FSDP/checkpointing consumers such as VERL working);
+        # controllers live outside the model.
         wrapped_count = 0
         for module_name, module in matches.items():
-            # Skip if already wrapped
-            if isinstance(module, wrapper_class):
-                continue
-
             if wrapper_type == "decoder_layer":
-                # Hook-based interception: the original module stays in
-                # the tree (module names, classes and state-dict keys are
-                # untouched, keeping FSDP/checkpointing consumers such as
-                # VERL working); the controller lives outside the model.
                 if module_name in self._hooked_modules:
                     continue
                 controller = wrapper_class()
@@ -382,29 +388,35 @@ class SteerVectorModelManager:
                 self.register_module(module_name, controller)
                 wrapped_count += 1
                 logger.debug(f"Hooked {wrapper_type}: {module_name}")
-                continue
-
-            # Other wrapper types (moe_layer) still use in-place module
-            # replacement until they are ported to hooks.
-            new_module = self.replace_submodule(
-                self.model,
-                module_name,
-                wrapper_class(module, layer_name=module_name) if wrapper_type == "moe_layer" else wrapper_class(module)
-            )
-
-            # Extract layer ID based on wrapper type
-            if wrapper_type == "moe_layer":
-                layer_id = extract_moe_layer_id_from_name(module_name)
-            else:
+            elif wrapper_type == "moe_layer":
+                # Steer router logits by hooking the block's gate/router
+                # submodule (architecture-agnostic: the logits are
+                # modified in place before top-k expert selection).
+                gate = find_moe_gate(module)
+                if gate is None:
+                    logger.warning(
+                        "MoE block %s has no gate/router submodule; "
+                        "cannot steer its router logits.", module_name,
+                    )
+                    continue
+                op_key = f"{module_name}::gate"
+                if op_key in self._hooked_modules:
+                    continue
+                controller = wrapper_class()
                 layer_id = extract_layer_id_from_module_name(module_name)
+                if layer_id is not None:
+                    controller.set_layer_id(layer_id)
+                controller._op_key = op_key
+                steer_ops.register_controller(op_key, controller)
+                handle = gate.register_forward_hook(
+                    controller.process_gate_output_hook
+                )
+                self._hook_handles.append(handle)
+                self._hooked_modules.add(op_key)
+                self.register_module(module_name, controller)
+                wrapped_count += 1
+                logger.debug(f"Hooked {wrapper_type} gate: {module_name}")
 
-            if layer_id is not None:
-                new_module.set_layer_id(layer_id)
-
-            self.register_module(module_name, new_module)
-            wrapped_count += 1
-            logger.debug(f"Wrapped {wrapper_type}: {module_name}")
-        
         # Log summary
         if wrapped_count > 0:
             logger.debug(
@@ -440,18 +452,6 @@ class SteerVectorModelManager:
                     continue
                 modules.append(module)
         return modules
-
-    def replace_submodule(
-        self,
-        model: nn.Module,
-        module_name: str,
-        new_module: nn.Module
-    ) -> nn.Module:
-        """Replace a submodule in a model with a new module."""
-        parent = model.get_submodule(".".join(module_name.split(".")[:-1]))
-        target_name = module_name.split(".")[-1]
-        setattr(parent, target_name, new_module)
-        return new_module
 
     def register_module(self, module_name: str, module: nn.Module):
         """Register a wrapped module."""

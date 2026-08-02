@@ -220,7 +220,7 @@ WRAPPER_REGISTRY: Dict[str, Dict[str, Any]] = {
     
     # MoE-level intervention (router logits)
     "moe_layer": {
-        "wrapper_class": "MoELayerWithSteerVector",
+        "wrapper_class": "MoEGateSteerController",
         "target_modules": SUPPORTED_MOE_LAYERS,
         "enabled": True,
         "description": "MoE router logits intervention for expert selection control",

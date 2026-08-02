@@ -57,3 +57,28 @@ direct_register_custom_op(
     mutates_args=["hidden"],
     fake_impl=steer_apply_fake,
 )
+
+# Name used in CompilationConfig.splitting_ops.
+STEER_MOE_GATE_OP = "vllm::steer_moe_gate"
+
+
+def steer_moe_gate(logits: torch.Tensor, layer_name: str) -> None:
+    """Apply MoE router-logits steering for `layer_name` in place."""
+    controller = _CONTROLLERS.get(layer_name)
+    if controller is None:
+        return
+    result = controller.apply_gate_steering(logits)
+    if result is not None and result is not logits:
+        logits.copy_(result)
+
+
+def steer_moe_gate_fake(logits: torch.Tensor, layer_name: str) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="steer_moe_gate",
+    op_func=steer_moe_gate,
+    mutates_args=["logits"],
+    fake_impl=steer_moe_gate_fake,
+)
