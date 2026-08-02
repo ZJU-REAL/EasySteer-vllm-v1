@@ -242,12 +242,18 @@ class WorkerSteerVectorManager:
             self._distribute_moe_slot(slot, request)
         elif self._graph_full:
             model = self.vector_store.get(
-                request.local_path, request.algorithm, lazy=True
+                request.local_path,
+                request.algorithm,
+                target_layers=request.target_layers,
+                lazy=True,
             )
             self._distribute_graph_config(slot, model, request)
         else:
             model = self.vector_store.get(
-                request.local_path, request.algorithm, lazy=True
+                request.local_path,
+                request.algorithm,
+                target_layers=request.target_layers,
+                lazy=True,
             )
             self._distribute_config(slot, model, request)
         self._config_slots[fp] = [slot, 1, request]
@@ -298,7 +304,10 @@ class WorkerSteerVectorManager:
         """
         specs = []
         for vc in request.vector_configs:
-            model = self.vector_store.get(vc.path, vc.algorithm, lazy=True)
+            model = self.vector_store.get(
+                vc.path, vc.algorithm,
+                target_layers=vc.target_layers, lazy=True,
+            )
             fields = {**steer_params_dict(vc), "debug": request.debug}
             specs.append((fields, model.layer_payloads or {}))
         self._configure_layer_slots(slot, specs, request.conflict_resolution)

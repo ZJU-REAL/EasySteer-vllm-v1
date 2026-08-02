@@ -53,15 +53,29 @@ class VectorStore:
         self._warned_lazy: set[str] = set()
 
     def get(
-        self, path: str, algorithm: str, *, lazy: bool = False
+        self,
+        path: str,
+        algorithm: str,
+        *,
+        target_layers: list[int] | None = None,
+        lazy: bool = False,
     ) -> "LoadedSteerVector":
         """Return the loaded entry for the file's current version, loading
         if needed.
 
+        `target_layers` is forwarded to the loader: single-layer formats
+        (.pt vectors, linear .pkl, lm_steer projectors) need it to build
+        their layer payloads and refuse to guess. When given it joins the
+        cache key, so the same file requested with different layer sets
+        loads once per set — payloads are small and correctness beats
+        dedup here; layer-carrying formats (gguf, ReFT dirs) are normally
+        requested without it and keep full dedup.
+
         With lazy=True (request admission), a one-time warning recommends
         preloading. Raises on load failure.
         """
-        key = (path, algorithm, *file_version(path))
+        layers_key = tuple(sorted(target_layers)) if target_layers else None
+        key = (path, algorithm, layers_key, *file_version(path))
         entry = self._entries.get(key)
         if entry is not None:
             self._entries.move_to_end(key)
@@ -92,7 +106,7 @@ class VectorStore:
             device=self.device,
             scale_factor=1.0,
             algorithm=algorithm,
-            target_layers=None,
+            target_layers=list(target_layers) if target_layers else None,
         )
         self._entries[key] = entry
         logger.info("Loaded steer vector into store: %s (%s)", path, algorithm)
