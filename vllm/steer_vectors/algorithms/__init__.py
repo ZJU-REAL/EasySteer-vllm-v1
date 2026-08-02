@@ -1,18 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# Base classes and template
 from .base import BaseSteerVectorAlgorithm
-from .template import AlgorithmTemplate
-
-# Factory and registration
-from .factory import create_algorithm, register_algorithm
-
-# Algorithm implementations (import to register them)
+from .concept_replace import ConceptReplaceAlgorithm
 from .direct import DirectAlgorithm
-from .loreft import LoReFTAlgorithm
+from .erase import EraseAlgorithm
+from .factory import create_algorithm, register_algorithm
 from .linear import LinearTransformAlgorithm
 from .lm_steer import LMSteerAlgorithm
+from .loreft import LoReFTAlgorithm
 from .moe_router import MoERouterAlgorithm
 from .replace import ReplaceAlgorithm
-from .erase import EraseAlgorithm
-from .concept_replace import ConceptReplaceAlgorithm
+from .template import AlgorithmTemplate
+
+__all__ = [
+    "AlgorithmTemplate",
+    "BaseSteerVectorAlgorithm",
+    "ConceptReplaceAlgorithm",
+    "DirectAlgorithm",
+    "EraseAlgorithm",
+    "LMSteerAlgorithm",
+    "LinearTransformAlgorithm",
+    "LoReFTAlgorithm",
+    "MoERouterAlgorithm",
+    "ReplaceAlgorithm",
+    "create_algorithm",
+    "register_algorithm",
+]

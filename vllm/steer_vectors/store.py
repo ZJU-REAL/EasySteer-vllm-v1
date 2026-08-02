@@ -7,16 +7,17 @@ and cost nothing). Loading through the store happens at preload time or at
 request admission — never inside the forward pass.
 """
 
-import logging
 import os
 from collections import OrderedDict
 from typing import TYPE_CHECKING
+
+from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import SteerVectorConfig
     from vllm.steer_vectors.models import SteerVectorModel
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 def file_version(path: str) -> tuple[int, int]:
@@ -48,7 +49,7 @@ class VectorStore:
         self.device = device
         self.steer_vector_config = steer_vector_config
         self.capacity = max(1, steer_vector_config.max_steer_vectors)
-        self._entries: OrderedDict[tuple, "SteerVectorModel"] = OrderedDict()
+        self._entries: OrderedDict[tuple, SteerVectorModel] = OrderedDict()
         self._warned_lazy: set[str] = set()
 
     def get(
@@ -68,16 +69,11 @@ class VectorStore:
 
         # Drop stale versions of the same vector so they don't hold
         # capacity (and so the reload is visible in the logs).
-        stale = [
-            k for k in self._entries
-            if k[0] == path and k[1] == algorithm
-        ]
+        stale = [k for k in self._entries if k[0] == path and k[1] == algorithm]
         for k in stale:
             del self._entries[k]
         if stale:
-            logger.info(
-                "Steer vector file changed on disk, reloading: %s", path
-            )
+            logger.info("Steer vector file changed on disk, reloading: %s", path)
         elif lazy and path not in self._warned_lazy:
             self._warned_lazy.add(path)
             logger.warning(

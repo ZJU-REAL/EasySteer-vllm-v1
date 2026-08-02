@@ -23,14 +23,15 @@ Storage appends one CPU chunk per forward step and concatenates at fetch
 time; there is no batch-boundary heuristic.
 """
 
-import logging
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import torch
 from torch import nn
 
-logger = logging.getLogger(__name__)
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 HIDDEN_STATES = "hidden_states"
 ROUTER_LOGITS = "router_logits"
@@ -39,10 +40,10 @@ ROUTER_LOGITS = "router_logits"
 class StreamConfig:
     def __init__(
         self,
-        layers: Optional[List[int]] = None,
-        dtype: Optional[str] = None,
+        layers: list[int] | None = None,
+        dtype: str | None = None,
         positions: str = "all",
-        max_tokens: Optional[int] = None,
+        max_tokens: int | None = None,
     ):
         if positions not in ("all", "last", "mean"):
             raise ValueError(
@@ -59,11 +60,11 @@ class StreamStore:
 
     def __init__(self, config: StreamConfig):
         self.config = config
-        self.chunks: Dict[int, List[torch.Tensor]] = {}
-        self.layer_names: Dict[int, str] = {}
+        self.chunks: dict[int, list[torch.Tensor]] = {}
+        self.layer_names: dict[int, str] = {}
         # Rows stored per layer; the budget caps each layer at
         # max_tokens rows (i.e. sequence tokens, per layer).
-        self._layer_rows: Dict[int, int] = {}
+        self._layer_rows: dict[int, int] = {}
         self.tokens_dropped = 0
         self._warned_budget = False
         self.lock = threading.Lock()
@@ -78,10 +79,7 @@ class StreamStore:
     def append(self, layer_id: int, tensor: torch.Tensor, layer_name: str):
         with self.lock:
             stored = self._layer_rows.get(layer_id, 0)
-            if (
-                self.config.max_tokens is not None
-                and stored >= self.config.max_tokens
-            ):
+            if self.config.max_tokens is not None and stored >= self.config.max_tokens:
                 self.tokens_dropped += tensor.shape[0]
                 if not self._warned_budget:
                     self._warned_budget = True
@@ -103,10 +101,10 @@ class StreamStore:
             self.layer_names[layer_id] = layer_name
             self._layer_rows[layer_id] = stored + chunk.shape[0]
 
-    def serialize(self) -> Dict[int, Dict[str, Any]]:
+    def serialize(self) -> dict[int, dict[str, Any]]:
         """Concatenate chunks and pack for RPC transmission."""
         with self.lock:
-            result: Dict[int, Dict[str, Any]] = {}
+            result: dict[int, dict[str, Any]] = {}
             for layer_id in sorted(self.chunks):
                 tensor = torch.cat(self.chunks[layer_id], dim=0)
                 orig_dtype = tensor.dtype
@@ -131,7 +129,8 @@ def _sample_reduce(tensor: torch.Tensor, mode: str) -> torch.Tensor:
     ctx = get_forward_context()
     samples_info = (
         extract_samples_info(ctx.attn_metadata)
-        if ctx is not None and ctx.attn_metadata is not None else None
+        if ctx is not None and ctx.attn_metadata is not None
+        else None
     )
     if samples_info is None:
         # No sample boundaries available; keep all tokens.
@@ -144,10 +143,7 @@ def _sample_reduce(tensor: torch.Tensor, mode: str) -> torch.Tensor:
     starts = qsl[:-1].clamp(max=tensor.shape[0])
     rows = []
     for s, e in zip(starts.tolist(), ends.tolist()):
-        rows.append(
-            tensor[s:e].mean(dim=0) if e > s
-            else torch.zeros_like(tensor[0])
-        )
+        rows.append(tensor[s:e].mean(dim=0) if e > s else torch.zeros_like(tensor[0]))
     return torch.stack(rows)
 
 
@@ -155,7 +151,7 @@ class CaptureSession:
     """Owns capture hooks and streams for one worker's model."""
 
     def __init__(self):
-        self._streams: Dict[str, Optional[StreamStore]] = {
+        self._streams: dict[str, StreamStore | None] = {
             HIDDEN_STATES: None,
             ROUTER_LOGITS: None,
         }
@@ -176,21 +172,22 @@ class CaptureSession:
         self._attached = True
 
     def _attach_hidden_hooks(self, model: nn.Module) -> None:
-        from vllm.steer_vectors.config import get_target_modules
+        from vllm.steer_vectors.config import SUPPORTED_DECODER_LAYERS
         from vllm.steer_vectors.layers import (
             _extract_hidden_states_and_residual,
             extract_layer_id_from_module_name,
         )
         from vllm.steer_vectors.models import find_decoder_layers_structurally
 
-        target_classes = get_target_modules("decoder_layer")
-        matches = {
-            name: module
-            for name, module in model.named_modules()
-            if any(cls in module.__class__.__name__ for cls in target_classes)
-        }
+        matches = find_decoder_layers_structurally(model)
         if not matches:
-            matches = find_decoder_layers_structurally(model)
+            matches = {
+                name: module
+                for name, module in model.named_modules()
+                if any(
+                    cls in module.__class__.__name__ for cls in SUPPORTED_DECODER_LAYERS
+                )
+            }
 
         fallback_id = 0
         for name, module in matches.items():
@@ -203,8 +200,7 @@ class CaptureSession:
                 store = self._streams[HIDDEN_STATES]
                 if store is None or not store.wants_layer(_lid):
                     return
-                hidden, residual, _, _ = \
-                    _extract_hidden_states_and_residual(output)
+                hidden, residual, _, _ = _extract_hidden_states_and_residual(output)
                 if not isinstance(hidden, torch.Tensor):
                     return
                 complete = hidden + residual if residual is not None else hidden
@@ -240,14 +236,16 @@ class CaptureSession:
             if gate is None:
                 logger.warning(
                     "[Capture] MoE block %s has no gate/router submodule; "
-                    "its router logits cannot be captured.", name,
+                    "its router logits cannot be captured.",
+                    name,
                 )
                 continue
             if moe_gate_is_fused(block):
                 logger.warning(
                     "[Capture] MoE block %s fuses gate weights into the "
                     "MoE runner (gate forward bypassed); its router "
-                    "logits cannot be captured.", name,
+                    "logits cannot be captured.",
+                    name,
                 )
                 continue
             layer_id = extract_layer_id_from_module_name(name)
@@ -313,7 +311,7 @@ class CaptureSession:
 
     def fetch_stream(
         self, stream: str, clear: bool = True
-    ) -> Dict[int, Dict[str, Any]]:
+    ) -> dict[int, dict[str, Any]]:
         store = self._streams.get(stream)
         if store is None:
             return {}
@@ -328,12 +326,9 @@ class CaptureSession:
         if store is not None:
             self._streams[stream] = StreamStore(store.config)
 
-    def stream_status(self, stream: str) -> Dict[str, Any]:
+    def stream_status(self, stream: str) -> dict[str, Any]:
         store = self._streams.get(stream)
-        hooked = (
-            self._hidden_layers if stream == HIDDEN_STATES
-            else self._gate_layers
-        )
+        hooked = self._hidden_layers if stream == HIDDEN_STATES else self._gate_layers
         if store is None:
             return {"enabled": False, "hooked_layers": hooked}
         return {

@@ -13,14 +13,14 @@ from vllm.hidden_states.capture import (
     CaptureSession,
     StreamConfig,
 )
-from vllm.hidden_states.request import HiddenStatesCaptureRequest
-from vllm.hidden_states.moe_request import MoERouterLogitsCaptureRequest
+from vllm.hidden_states.request import (
+    HiddenStatesCaptureRequest,
+    MoERouterLogitsCaptureRequest,
+)
 from vllm.hidden_states.utils import (
     deserialize_hidden_states,
-    print_hidden_states_summary,
-)
-from vllm.hidden_states.moe_utils import (
     deserialize_moe_router_logits,
+    print_hidden_states_summary,
     print_moe_router_logits_summary,
 )
 

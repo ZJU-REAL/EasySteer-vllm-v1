@@ -7,36 +7,33 @@ This module provides:
 2. GPU-optimized functions - Determine WHERE to apply interventions based on parameters
 """
 
-from typing import Optional, Dict
 import torch
 
 
 class InterventionController:
     """
     Centralized controller for intervention parameters.
-    
+
     Manages all parameters that control WHERE interventions are applied,
     including trigger tokens, positions, exclusion rules, and debug settings.
-    
+
     This class decouples parameter management from algorithm implementation,
     allowing algorithm developers to focus only on transformation logic.
     """
-    
+
     def __init__(self):
         """Initialize with no triggers configured."""
         # Trigger parameters
-        self.prefill_trigger_tokens: Optional[set[int]] = None
-        self.prefill_trigger_positions: Optional[list[int]] = None
-        self.prefill_exclude_tokens: Optional[set[int]] = None
-        self.prefill_exclude_positions: Optional[list[int]] = None
-        self.generate_trigger_tokens: Optional[set[int]] = None
-        self.generate_first_k_tokens: Optional[int] = None
-        self.generate_after_k_tokens: Optional[int] = None
-        
+        self.prefill_trigger_tokens: set[int] | None = None
+        self.prefill_trigger_positions: list[int] | None = None
+        self.prefill_exclude_tokens: set[int] | None = None
+        self.prefill_exclude_positions: list[int] | None = None
+        self.generate_trigger_tokens: set[int] | None = None
+        self.generate_first_k_tokens: int | None = None
+        self.generate_after_k_tokens: int | None = None
+
         # Debug mode
         self.debug: bool = False
-    
-    # ========== Parameter Configuration ==========
 
     def set_debug(self, debug: bool) -> None:
         """Set debug mode."""
@@ -63,100 +60,112 @@ class InterventionController:
                 value = set(value)
             setattr(self, name, value)
 
-    # ========== Parameter Queries ==========
-    
     def should_apply_to_all_prefill_tokens(self) -> bool:
         """Check if steer vector should be applied to all prefill tokens."""
-        return self.prefill_trigger_tokens is not None and -1 in self.prefill_trigger_tokens
-    
+        return (
+            self.prefill_trigger_tokens is not None
+            and -1 in self.prefill_trigger_tokens
+        )
+
     def should_apply_to_all_generate_tokens(self) -> bool:
         """Check if steer vector should be applied to all generation tokens."""
-        return self.generate_trigger_tokens is not None and -1 in self.generate_trigger_tokens
-    
+        return (
+            self.generate_trigger_tokens is not None
+            and -1 in self.generate_trigger_tokens
+        )
+
     def has_prefill_triggers(self) -> bool:
         """Check if prefill triggers are configured."""
-        return (self.prefill_trigger_tokens is not None or
-                self.prefill_trigger_positions is not None)
-    
+        return (
+            self.prefill_trigger_tokens is not None
+            or self.prefill_trigger_positions is not None
+        )
+
     def has_any_triggers(self) -> bool:
         """Check if any triggers are configured."""
-        return (self.prefill_trigger_tokens is not None or 
-                self.generate_trigger_tokens is not None or
-                self.prefill_trigger_positions is not None or
-                self.generate_first_k_tokens is not None or
-                self.generate_after_k_tokens is not None)
-    
+        return (
+            self.prefill_trigger_tokens is not None
+            or self.generate_trigger_tokens is not None
+            or self.prefill_trigger_positions is not None
+            or self.generate_first_k_tokens is not None
+            or self.generate_after_k_tokens is not None
+        )
+
     def is_global_only_config(self) -> bool:
         """
         Check if this is a global-only configuration.
-        
+
         A global-only configuration means interventions are applied to ALL tokens
         in BOTH prefill and generate phases, without any position-based or exclusion
-        filters. This enables the fast path that avoids index_select/index_copy overhead.
-        
+        filters. This enables the fast path that avoids index_select/index_copy
+        overhead.
+
         Design rationale:
         - Fast path requires BOTH phases to be configured as global
         - Single-phase global configs must use the normal path because:
           * Fast path operates on the entire hidden_states tensor
-          * Phase information (prefill vs generate) is only available via forward context
+          * Phase information (prefill vs generate) is only available via forward
+          context
           * Mixed batches are common in continuous batching scenarios
-        - The -1 token ID is a special marker indicating "apply to all tokens in this phase"
-        
+        - The -1 token ID is a special marker meaning "apply to all
+          tokens in this phase"
+
         Requirements:
         - prefill_trigger_tokens must contain -1
         - generate_trigger_tokens must contain -1
-        - No exclusions (prefill_exclude_tokens = None, prefill_exclude_positions = None)
-        
-        Note: 
-        - Additional token IDs can coexist with -1 (e.g., {1234, -1}), as -1 takes 
+        - No exclusions (prefill_exclude_tokens = None, prefill_exclude_positions =
+        None)
+
+        Note:
+        - Additional token IDs can coexist with -1 (e.g., {1234, -1}), as -1 takes
           precedence and matches all tokens in the normal path.
-        - prefill_trigger_positions is NOT checked because when -1 is present in 
-          trigger_tokens, the normal path returns immediately without processing positions.
-        
+        - prefill_trigger_positions is NOT checked because when -1 is present in
+          trigger_tokens, the normal path returns immediately without processing
+          positions.
+
         Returns:
             True if BOTH phases are configured for global application, False otherwise
         """
-        # Only exclusion filters matter (-1 in trigger_tokens overrides position triggers)
+        # Only exclusion filters matter (-1 in trigger_tokens overrides position
+        # triggers)
         has_no_exclusions = (
-            self.prefill_exclude_tokens is None and
-            self.prefill_exclude_positions is None
+            self.prefill_exclude_tokens is None
+            and self.prefill_exclude_positions is None
         )
-        
+
         if not has_no_exclusions:
             return False
-        
+
         # Check if BOTH trigger configurations contain -1 (global marker)
         prefill_is_global = (
-            self.prefill_trigger_tokens is not None and 
-            -1 in self.prefill_trigger_tokens
+            self.prefill_trigger_tokens is not None
+            and -1 in self.prefill_trigger_tokens
         )
         generate_is_global = (
-            self.generate_trigger_tokens is not None and 
-            -1 in self.generate_trigger_tokens
+            self.generate_trigger_tokens is not None
+            and -1 in self.generate_trigger_tokens
         )
-        
+
         # Both phases must be global for fast path
         return prefill_is_global and generate_is_global
-    
-    # ========== Core Functionality ==========
-    
+
     def collect_intervention_positions(
         self,
         hidden_states: torch.Tensor,
         current_tokens: torch.Tensor,
-        samples_info: Dict[str, torch.Tensor]
-    ) -> Optional[torch.Tensor]:
+        samples_info: dict[str, torch.Tensor],
+    ) -> torch.Tensor | None:
         """
         Collect all intervention positions based on configured parameters.
-        
+
         This is the main entry point that uses all configured parameters
         to determine which token positions should receive interventions.
-        
+
         Args:
             hidden_states: [total_tokens, hidden_dim]
             current_tokens: [total_tokens] token IDs
             samples_info: Dict with 'query_start_loc', 'num_computed', 'is_decode_mask'
-            
+
         Returns:
             positions_tensor: [num_positions] GPU tensor of positions to transform
             or None if no positions to apply
@@ -172,11 +181,10 @@ class InterventionController:
             generate_trigger_tokens=self.generate_trigger_tokens,
             generate_first_k_tokens=self.generate_first_k_tokens,
             generate_after_k_tokens=self.generate_after_k_tokens,
-            has_prefill_triggers=self.has_prefill_triggers()
+            has_prefill_triggers=self.has_prefill_triggers(),
         )
 
 
-# ========== Position Collection: Mask Algebra ==========
 #
 # The final position set is a composition of small per-token boolean
 # masks over the flat batch:
@@ -203,9 +211,7 @@ class InterventionController:
 
 def _isin_token_set(tokens: torch.Tensor, ids) -> torch.Tensor:
     """[total_tokens] mask of tokens whose id is in `ids`."""
-    ids_tensor = torch.tensor(
-        list(ids), dtype=tokens.dtype, device=tokens.device
-    )
+    ids_tensor = torch.tensor(list(ids), dtype=tokens.dtype, device=tokens.device)
     return torch.isin(tokens, ids_tensor)
 
 
@@ -228,7 +234,8 @@ def _match_positions(
         mask |= torch.isin(
             abs_positions,
             torch.tensor(
-                positive, dtype=abs_positions.dtype,
+                positive,
+                dtype=abs_positions.dtype,
                 device=abs_positions.device,
             ),
         )
@@ -242,25 +249,25 @@ def _match_positions(
 def collect_positions_gpu_batch(
     hidden_states: torch.Tensor,
     current_tokens: torch.Tensor,
-    samples_info: Dict[str, torch.Tensor],
-    prefill_trigger_tokens: Optional[set],
-    prefill_trigger_positions: Optional[list],
-    prefill_exclude_tokens: Optional[set],
-    prefill_exclude_positions: Optional[list],
-    generate_trigger_tokens: Optional[set],
-    generate_first_k_tokens: Optional[int],
-    generate_after_k_tokens: Optional[int],
-    has_prefill_triggers: bool
-) -> Optional[torch.Tensor]:
+    samples_info: dict[str, torch.Tensor],
+    prefill_trigger_tokens: set | None,
+    prefill_trigger_positions: list | None,
+    prefill_exclude_tokens: set | None,
+    prefill_exclude_positions: list | None,
+    generate_trigger_tokens: set | None,
+    generate_first_k_tokens: int | None,
+    generate_after_k_tokens: int | None,
+    has_prefill_triggers: bool,
+) -> torch.Tensor | None:
     """
     Collect intervention positions for the whole batch on the GPU.
 
     Returns a [num_positions] tensor of flat token indices, or None when
     nothing matches.
     """
-    query_start_loc = samples_info['query_start_loc']
-    num_computed = samples_info['num_computed']
-    is_decode_mask = samples_info['is_decode_mask']
+    query_start_loc = samples_info["query_start_loc"]
+    num_computed = samples_info["num_computed"]
+    is_decode_mask = samples_info["is_decode_mask"]
 
     device = hidden_states.device
     # Size the masks from current_tokens, not hidden_states: under
@@ -292,17 +299,14 @@ def collect_positions_gpu_batch(
     # tokens" (the window is applied below).
     effective_gtt = generate_trigger_tokens
     if effective_gtt is None and (
-        generate_first_k_tokens is not None
-        or generate_after_k_tokens is not None
+        generate_first_k_tokens is not None or generate_after_k_tokens is not None
     ):
         effective_gtt = {-1}
     if effective_gtt is not None:
         if -1 in effective_gtt:
             mask |= is_decode_token
         else:
-            mask |= is_decode_token & _isin_token_set(
-                current_tokens, effective_gtt
-            )
+            mask |= is_decode_token & _isin_token_set(current_tokens, effective_gtt)
 
     # --- prefill part ---
     if has_prefill_triggers:
@@ -310,13 +314,13 @@ def collect_positions_gpu_batch(
             # "All prefill tokens" bypasses the exclusion rules.
             mask |= is_prefill_token
         else:
-            prefill_part = torch.zeros(
-                total_tokens, dtype=torch.bool, device=device
-            )
+            prefill_part = torch.zeros(total_tokens, dtype=torch.bool, device=device)
             if prefill_trigger_positions is not None:
                 prefill_part |= is_prefill_token & _match_positions(
-                    abs_positions, prefill_trigger_positions,
-                    total_len, sample_ids,
+                    abs_positions,
+                    prefill_trigger_positions,
+                    total_len,
+                    sample_ids,
                 )
             if prefill_trigger_tokens is not None:
                 prefill_part |= is_prefill_token & _isin_token_set(
@@ -324,10 +328,15 @@ def collect_positions_gpu_batch(
                 )
             if prefill_part.any():
                 if prefill_exclude_positions is not None:
-                    prefill_part &= ~(is_prefill_token & _match_positions(
-                        abs_positions, prefill_exclude_positions,
-                        total_len, sample_ids,
-                    ))
+                    prefill_part &= ~(
+                        is_prefill_token
+                        & _match_positions(
+                            abs_positions,
+                            prefill_exclude_positions,
+                            total_len,
+                            sample_ids,
+                        )
+                    )
                 if prefill_exclude_tokens is not None:
                     prefill_part &= ~_isin_token_set(
                         current_tokens, prefill_exclude_tokens
@@ -335,11 +344,8 @@ def collect_positions_gpu_batch(
             mask |= prefill_part
 
     # --- generate window (constrains decode tokens only) ---
-    if (
-        generate_first_k_tokens is not None
-        or generate_after_k_tokens is not None
-    ):
-        num_output_tokens = samples_info.get('num_output_tokens')
+    if generate_first_k_tokens is not None or generate_after_k_tokens is not None:
+        num_output_tokens = samples_info.get("num_output_tokens")
         if num_output_tokens is not None:
             gen_counts = num_output_tokens.to(device)[sample_ids]
             if generate_first_k_tokens is not None:

@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-from dataclasses import dataclass
-from typing import Optional, Tuple, Union, Dict, Any
 
 import torch
 from torch import nn
 
-from .algorithms import create_algorithm
 from vllm.steer_vectors import trace
+
+from .algorithms import create_algorithm
 
 # Import forward context to get current token information
 try:
@@ -19,22 +18,22 @@ except ImportError:
 _CTX_UNSET = object()
 
 
-def extract_layer_id_from_module_name(module_name: str) -> Optional[int]:
+def extract_layer_id_from_module_name(module_name: str) -> int | None:
     """
     Extract layer ID from module name.
-    
+
     Args:
         module_name: Module name like 'model.layers.0' or 'transformer.h.12'
-    
+
     Returns:
         Layer ID as integer, or None if not found
-    
+
     Examples:
         'model.layers.0' -> 0
         'transformer.h.12' -> 12
         'model.embed_tokens' -> None
     """
-    parts = module_name.split('.')
+    parts = module_name.split(".")
     for part in parts:
         if part.isdigit():
             return int(part)
@@ -43,10 +42,6 @@ def extract_layer_id_from_module_name(module_name: str) -> Optional[int]:
 
 class BaseLayerWithSteerVector(nn.Module):
     pass
-
-
-# Per-request config slots live above this id; legacy adapter slots below.
-CONFIG_SLOT_BASE = 1000
 
 
 def _extract_hidden_states_and_residual(output):
@@ -66,9 +61,11 @@ def _extract_hidden_states_and_residual(output):
         if len(output) == 2:
             # Assume (hidden_states, residual) format
             hidden_states, residual = output
-            if (isinstance(hidden_states, torch.Tensor) and
-                    isinstance(residual, torch.Tensor) and
-                    hidden_states.shape == residual.shape):
+            if (
+                isinstance(hidden_states, torch.Tensor)
+                and isinstance(residual, torch.Tensor)
+                and hidden_states.shape == residual.shape
+            ):
                 return hidden_states, residual, None, "tuple_2"
             else:
                 # If shapes don't match, may not be (hidden_states, residual) format
@@ -84,16 +81,18 @@ def _extract_hidden_states_and_residual(output):
         return output, None, None, "tensor"
     else:
         # Other formats, try to extract from attributes
-        if hasattr(output, 'hidden_states'):
+        if hasattr(output, "hidden_states"):
             hidden_states = output.hidden_states
-            residual = getattr(output, 'residual', None)
+            residual = getattr(output, "residual", None)
             return hidden_states, residual, output, "object"
         else:
             # Unrecognized format, return original output
             return output, None, None, "unknown"
 
 
-def _reconstruct_output(modified_hidden_states, residual, other_outputs, original_format, original_output):
+def _reconstruct_output(
+    modified_hidden_states, residual, other_outputs, original_format, original_output
+):
     """
     Reconstruct output based on original format.
 
@@ -119,7 +118,7 @@ def _reconstruct_output(modified_hidden_states, residual, other_outputs, origina
         return modified_hidden_states
     elif original_format == "object":
         # For object format, modify the corresponding attribute
-        if hasattr(original_output, 'hidden_states'):
+        if hasattr(original_output, "hidden_states"):
             original_output.hidden_states = modified_hidden_states
         return original_output
     else:
@@ -169,8 +168,7 @@ def _resolve_conflicts(collected, mode: str):
             positions = positions[~torch.isin(positions, claimed)]
             if positions.numel() == 0:
                 continue
-        claimed = (positions if claimed is None
-                   else torch.cat([claimed, positions]))
+        claimed = positions if claimed is None else torch.cat([claimed, positions])
         filtered.append((idx, algo, positions))
     return filtered
 
@@ -191,16 +189,15 @@ class SlotRoutedSteerController(BaseLayerWithSteerVector):
     layout — so subclasses only choose the hook point and the tensor.
     """
 
-    def __init__(self, base_layer=None) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.base_layer = base_layer
-        self.layer_id: Optional[int] = None
+        self.layer_id: int | None = None
         # Per-request routing: config slot -> ordered intervention list.
-        self.slot_interventions: Dict[int, list] = {}
-        self.slot_conflict: Dict[int, str] = {}
+        self.slot_interventions: dict[int, list] = {}
+        self.slot_conflict: dict[int, str] = {}
         # Key under which this controller is reachable from its custom
         # op (set when the hook is registered).
-        self._op_key: Optional[str] = None
+        self._op_key: str | None = None
 
     def set_layer_id(self, layer_id: int) -> None:
         """Set layer ID for existing and future interventions."""
@@ -232,12 +229,7 @@ class SlotRoutedSteerController(BaseLayerWithSteerVector):
                 **init_kwargs,
             )
             scale = spec.get("scale")
-            algo.set_steer_vector(
-                0,
-                payload=spec["payload"],
-                scale_factor=1.0 if scale is None else scale,
-            )
-            algo.set_active_tensor(0)
+            algo.set_payload(spec["payload"], 1.0 if scale is None else scale)
             algo.params.configure_from_dict(spec)
             entries.append(algo)
         self.slot_interventions[slot] = entries
@@ -277,12 +269,12 @@ class SlotRoutedSteerController(BaseLayerWithSteerVector):
                     continue
                 if algo.params.is_global_only_config():
                     # All tokens of this slot's requests.
-                    positions = (token_slots == slot).nonzero(
-                        as_tuple=False).squeeze(-1)
+                    positions = (
+                        (token_slots == slot).nonzero(as_tuple=False).squeeze(-1)
+                    )
                 else:
                     if ctx_info is _CTX_UNSET:
-                        ctx_info = algo._get_forward_context_and_samples(
-                            tensor)
+                        ctx_info = algo._get_forward_context_and_samples(tensor)
                     if ctx_info is None:
                         continue
                     _, samples_info, current_tokens = ctx_info
@@ -299,36 +291,39 @@ class SlotRoutedSteerController(BaseLayerWithSteerVector):
                 collected.append((idx, algo, positions))
 
             collected = _resolve_conflicts(
-                collected, self.slot_conflict.get(slot, "priority"))
+                collected, self.slot_conflict.get(slot, "priority")
+            )
             for idx, algo, positions in collected:
                 tensor = algo._batch_transform_tensor(
-                    tensor, positions, algo._get_params())
+                    tensor, positions, algo._get_params()
+                )
                 if trace.enabled():
-                    label = (algo.__class__.__name__ if len(entries) == 1
-                             else f"multi:{idx}:{algo.__class__.__name__}")
-                    trace.record_apply(
-                        self.layer_id, slot, label, positions.tolist())
+                    label = (
+                        algo.__class__.__name__
+                        if len(entries) == 1
+                        else f"multi:{idx}:{algo.__class__.__name__}"
+                    )
+                    trace.record_apply(self.layer_id, slot, label, positions.tolist())
         return tensor
 
 
 class DecoderLayerWithSteerVector(SlotRoutedSteerController):
     """DecoderLayer intervention controller for full hidden states.
 
-    Preferred usage is hook-based: the controller stays outside the model
-    tree and `process_output_hook` is registered as a forward hook on the
-    original decoder layer, so module names, classes and state-dict keys
-    are untouched (safe for FSDP/checkpointing, e.g. VERL). Wrapping a
-    layer as a submodule (`base_layer`) is kept for backward compatibility.
+    Hook-based: the controller stays outside the model tree and
+    `process_output_hook` is registered as a forward hook on the
+    original decoder layer, so module names, classes and state-dict
+    keys are untouched (safe for FSDP/checkpointing, e.g. VERL).
     """
 
-    def __init__(self, base_layer=None) -> None:
-        super().__init__(base_layer)
+    def __init__(self) -> None:
+        super().__init__()
         # Tier-1 full-graph mode: persistent buffers read by the captured
         # kernel `hidden += mask * vectors[row_tok]` (see init_graph_table).
         self._graph_mode: bool = False
-        self.graph_vectors: Optional[torch.Tensor] = None
-        self.graph_mask: Optional[torch.Tensor] = None
-        self.graph_row_tok: Optional[torch.Tensor] = None
+        self.graph_vectors: torch.Tensor | None = None
+        self.graph_mask: torch.Tensor | None = None
+        self.graph_row_tok: torch.Tensor | None = None
 
     def init_graph_table(
         self,
@@ -348,9 +343,7 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
         self.graph_vectors = torch.zeros(
             num_rows + 1, hidden_size, dtype=dtype, device=device
         )
-        self.graph_mask = torch.zeros(
-            max_num_tokens, dtype=dtype, device=device
-        )
+        self.graph_mask = torch.zeros(max_num_tokens, dtype=dtype, device=device)
         self.graph_row_tok = row_tok
         self._graph_mode = True
 
@@ -361,11 +354,6 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
         if self.graph_vectors is not None:
             self.graph_vectors[row].zero_()
 
-    def forward(self, *args, **kwargs):
-        """Wrap the forward method of DecoderLayer (legacy wrapper mode)."""
-        output = self.base_layer(*args, **kwargs)
-        return self.process_output(output)
-
     def process_output_hook(self, module, args, output):
         """torch forward-hook entry point: intervene on the layer output.
 
@@ -375,10 +363,11 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
         execution (it runs eagerly between CUDA-graph segments).
         """
         if self._op_key is None:
-            return self.process_output(output)
+            return output
 
-        hidden_states, residual, other_outputs, original_format = \
+        hidden_states, residual, other_outputs, original_format = (
             _extract_hidden_states_and_residual(output)
+        )
         if residual is not None:
             complete_hidden_states = hidden_states + residual
         else:
@@ -399,35 +388,16 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
 
         if residual is not None:
             zero_residual = torch.zeros_like(residual)
-            return _reconstruct_output(complete_hidden_states, zero_residual,
-                                       other_outputs, original_format, output)
-        return _reconstruct_output(complete_hidden_states, None,
-                                   other_outputs, original_format, output)
-
-    def process_output(self, output):
-        """Apply the active steering algorithm to a decoder layer output
-        (legacy wrapper-mode path; the hook path goes through
-        vllm::steer_apply)."""
-        # Extract hidden_states and residual from decoder layer output
-        hidden_states, residual, other_outputs, original_format = _extract_hidden_states_and_residual(output)
-
-        # Construct complete hidden state
-        if residual is not None:
-            complete_hidden_states = hidden_states + residual
-        else:
-            complete_hidden_states = hidden_states
-
-        modified_complete_hidden_states = self.apply_steering(
-            complete_hidden_states)
-
-        # Reconstruct output format
-        if residual is not None:
-            zero_residual = torch.zeros_like(residual)
-            return _reconstruct_output(modified_complete_hidden_states, zero_residual, other_outputs,
-                                       original_format, output)
-        else:
-            return _reconstruct_output(modified_complete_hidden_states, None, other_outputs, original_format,
-                                       output)
+            return _reconstruct_output(
+                complete_hidden_states,
+                zero_residual,
+                other_outputs,
+                original_format,
+                output,
+            )
+        return _reconstruct_output(
+            complete_hidden_states, None, other_outputs, original_format, output
+        )
 
 
 class MoEGateSteerController(SlotRoutedSteerController):
@@ -462,5 +432,3 @@ class MoEGateSteerController(SlotRoutedSteerController):
     def apply_gate_steering(self, logits):
         """Op implementation: slot-routed router-logit steering."""
         return self.apply_steering(logits)
-
-

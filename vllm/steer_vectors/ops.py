@@ -27,8 +27,7 @@ STEER_APPLY_OP = "vllm::steer_apply"
 _CONTROLLERS: dict[str, "DecoderLayerWithSteerVector"] = {}
 
 
-def register_controller(key: str,
-                        controller: "DecoderLayerWithSteerVector") -> None:
+def register_controller(key: str, controller: "DecoderLayerWithSteerVector") -> None:
     _CONTROLLERS[key] = controller
 
 

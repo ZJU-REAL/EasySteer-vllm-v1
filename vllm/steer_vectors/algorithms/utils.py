@@ -2,11 +2,12 @@
 """
 Utility functions for steer vector algorithms.
 
-This module provides shared utility functions used across different algorithm implementations,
-including sample information extraction, query_start_loc handling, and prefix cache support.
+This module provides shared utility functions used across different algorithm
+implementations,
+including sample information extraction, query_start_loc handling, and prefix cache
+support.
 """
 
-from typing import Optional, Dict
 import torch
 
 # Import forward context to get current token information
@@ -16,16 +17,16 @@ except ImportError:
     get_forward_context = None
 
 
-def extract_samples_info(attn_metadata) -> Optional[Dict[str, torch.Tensor]]:
+def extract_samples_info(attn_metadata) -> dict[str, torch.Tensor] | None:
     """
     Extract sample boundaries and phases from attention metadata.
-    
+
     Uses GPU batch operations to calculate sample boundaries and phases without loops.
     This is a shared utility used by AlgorithmTemplate and the layer-level apply loop.
-    
+
     Args:
         attn_metadata: Attention metadata from forward context
-        
+
     Returns:
         Dict with GPU tensors:
             'query_start_loc': [num_samples+1] tensor of sample boundaries
@@ -34,10 +35,10 @@ def extract_samples_info(attn_metadata) -> Optional[Dict[str, torch.Tensor]]:
         or None if query_start_loc is unavailable
     """
     query_start_loc = get_query_start_loc(attn_metadata)
-    
+
     if query_start_loc is None or len(query_start_loc) <= 1:
         return None
-    
+
     # Extract num_computed_tokens_cpu for prefix cache support
     num_computed_tokens_cpu = get_num_computed_tokens(attn_metadata)
 
@@ -48,44 +49,40 @@ def extract_samples_info(attn_metadata) -> Optional[Dict[str, torch.Tensor]]:
     # provides CPU tensors, so move them to the batch device here once.
     device = query_start_loc.device
     if num_computed_tokens_cpu is not None:
-        num_computed_tokens_cpu = num_computed_tokens_cpu.to(
-            device, non_blocking=True
-        )
+        num_computed_tokens_cpu = num_computed_tokens_cpu.to(device, non_blocking=True)
     if num_output_tokens_cpu is not None:
-        num_output_tokens_cpu = num_output_tokens_cpu.to(
-            device, non_blocking=True
-        )
-    
+        num_output_tokens_cpu = num_output_tokens_cpu.to(device, non_blocking=True)
+
     # Calculate sample lengths
     starts = query_start_loc[:-1]  # [num_samples]
-    ends = query_start_loc[1:]      # [num_samples]
-    lengths = ends - starts         # [num_samples]
-    
+    ends = query_start_loc[1:]  # [num_samples]
+    lengths = ends - starts  # [num_samples]
+
     # Determine decode/prefill phase based on length
     # Decode phase: length == 1 (single token)
     # Prefill phase: length > 1 (multiple tokens)
-    is_decode_mask = (lengths == 1)  # [num_samples], boolean tensor
-    
+    is_decode_mask = lengths == 1  # [num_samples], boolean tensor
+
     return {
-        'query_start_loc': query_start_loc,       # [num_samples+1] on GPU
-        'num_computed': num_computed_tokens_cpu,  # [num_samples] on GPU or None
-        'is_decode_mask': is_decode_mask,         # [num_samples] on GPU
-        'num_output_tokens': num_output_tokens_cpu  # [num_samples] on GPU or None
+        "query_start_loc": query_start_loc,  # [num_samples+1] on GPU
+        "num_computed": num_computed_tokens_cpu,  # [num_samples] on GPU or None
+        "is_decode_mask": is_decode_mask,  # [num_samples] on GPU
+        "num_output_tokens": num_output_tokens_cpu,  # [num_samples] on GPU or None
     }
 
 
-def get_query_start_loc(attn_metadata) -> Optional[torch.Tensor]:
+def get_query_start_loc(attn_metadata) -> torch.Tensor | None:
     """
     Extract query_start_loc (sample boundary offsets).
-    
+
     Primary path: read from ForwardContext.query_start_loc which is
     backend-agnostic (works with FlashInfer, FlashAttn, Triton, etc.).
     Fallback: read from per-layer attention metadata (only works for
     backends that store query_start_loc directly, e.g. FlashAttn).
-    
+
     Args:
         attn_metadata: Attention metadata from forward context
-        
+
     Returns:
         query_start_loc tensor or None if not available
     """
@@ -97,28 +94,28 @@ def get_query_start_loc(attn_metadata) -> Optional[torch.Tensor]:
                 return forward_ctx.query_start_loc
     except Exception:
         pass
-    
+
     # Fallback: read from per-layer attention metadata
     if isinstance(attn_metadata, dict):
         # V1: dict format
         if attn_metadata:
             first_layer_metadata = next(iter(attn_metadata.values()))
-            return getattr(first_layer_metadata, 'query_start_loc', None)
+            return getattr(first_layer_metadata, "query_start_loc", None)
     else:
         # Object format fallback
-        return getattr(attn_metadata, 'query_start_loc', None)
+        return getattr(attn_metadata, "query_start_loc", None)
     return None
 
 
-def get_num_computed_tokens(attn_metadata) -> Optional[torch.Tensor]:
+def get_num_computed_tokens(attn_metadata) -> torch.Tensor | None:
     """
     Extract num_computed_tokens_cpu for prefix cache support.
-    
+
     V1 stores num_computed_tokens_cpu in forward_context.
-    
+
     Args:
         attn_metadata: Attention metadata from forward context
-        
+
     Returns:
         num_computed_tokens_cpu tensor or None if not available
     """
@@ -131,20 +128,24 @@ def get_num_computed_tokens(attn_metadata) -> Optional[torch.Tensor]:
         # Fallback: try to extract from attn_metadata
         if isinstance(attn_metadata, dict) and attn_metadata:
             first_layer_metadata = next(iter(attn_metadata.values()))
-            return getattr(first_layer_metadata, 'num_computed_tokens_cpu', None)
+            return getattr(first_layer_metadata, "num_computed_tokens_cpu", None)
         else:
-            return getattr(attn_metadata, 'num_computed_tokens_cpu', None) if attn_metadata else None
+            return (
+                getattr(attn_metadata, "num_computed_tokens_cpu", None)
+                if attn_metadata
+                else None
+            )
 
 
-def get_num_output_tokens(attn_metadata) -> Optional[torch.Tensor]:
+def get_num_output_tokens(attn_metadata) -> torch.Tensor | None:
     """
     Extract num_output_tokens_cpu for generation position control.
-    
+
     V1 stores num_output_tokens_cpu in forward_context.
-    
+
     Args:
         attn_metadata: Attention metadata from forward context
-        
+
     Returns:
         num_output_tokens_cpu tensor or None if not available
     """
@@ -157,7 +158,10 @@ def get_num_output_tokens(attn_metadata) -> Optional[torch.Tensor]:
         # Fallback: try to extract from attn_metadata
         if isinstance(attn_metadata, dict) and attn_metadata:
             first_layer_metadata = next(iter(attn_metadata.values()))
-            return getattr(first_layer_metadata, 'num_output_tokens_cpu', None)
+            return getattr(first_layer_metadata, "num_output_tokens_cpu", None)
         else:
-            return getattr(attn_metadata, 'num_output_tokens_cpu', None) if attn_metadata else None
-
+            return (
+                getattr(attn_metadata, "num_output_tokens_cpu", None)
+                if attn_metadata
+                else None
+            )
