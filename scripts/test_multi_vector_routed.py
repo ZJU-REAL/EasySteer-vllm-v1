@@ -33,6 +33,11 @@ llm = LLM(
     enable_prefix_caching=False,
     gpu_memory_utilization=0.25,
     max_model_len=2048,
+    # M3 byte-compares one request's output across two generate calls;
+    # async scheduling makes prefill co-batching timing-dependent, which
+    # can change batch geometry between the runs (numeric drift, flaky
+    # false "contamination").
+    async_scheduling=False,
 )
 
 # ignore_eos keeps batch geometry identical between the mixed and plain

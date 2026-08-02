@@ -5,7 +5,7 @@ from typing import Optional, Tuple, Union, Dict, Any
 import torch
 from torch import nn
 
-from .algorithms import BaseSteerVectorAlgorithm, create_algorithm
+from .algorithms import create_algorithm
 from vllm.steer_vectors import trace
 
 # Import forward context to get current token information
@@ -138,75 +138,6 @@ def extract_gate_logits(output):
     return output if isinstance(output, torch.Tensor) else None
 
 
-class MoEGateSteerController(BaseLayerWithSteerVector):
-    """Hook-based MoE router-logits steering controller.
-
-    Registered as a forward hook on the MoE block's gate/router
-    submodule: the logits are steered in place (via the opaque
-    vllm::steer_moe_gate op, a splitting op under compiled execution)
-    before top-k expert selection consumes them — architecture-agnostic,
-    no per-model forward reimplementation. Single-active semantics: the
-    worker manager distributes at most one moe_router config at a time.
-    """
-
-    def __init__(self, base_layer=None) -> None:
-        super().__init__()
-        self.base_layer = base_layer
-        self.layer_id: Optional[int] = None
-        self.algorithm: Optional[BaseSteerVectorAlgorithm] = None
-        self._algorithm_name: Optional[str] = None
-        self._op_key: Optional[str] = None
-
-    def set_layer_id(self, layer_id: int) -> None:
-        self.layer_id = layer_id
-        if self.algorithm is not None:
-            self.algorithm.layer_id = layer_id
-
-    def set_steer_vector(self, index: int, **kwargs) -> None:
-        algorithm_name = kwargs.pop("algorithm_name", "moe_router")
-        if self.algorithm is None or self._algorithm_name != algorithm_name:
-            self.algorithm = create_algorithm(
-                algorithm_name, layer_id=self.layer_id)
-            self._algorithm_name = algorithm_name
-        self.algorithm.set_steer_vector(index, **kwargs)
-        self.algorithm.params.configure_from_dict(kwargs)
-
-    def set_active_tensor(self, index: int) -> None:
-        if self.algorithm is not None:
-            self.algorithm.set_active_tensor(index)
-
-    def reset_steer_vector(self, index: int) -> None:
-        if self.algorithm is not None:
-            self.algorithm.reset_steer_vector(index)
-            self.algorithm._active_payload = None
-
-    def process_gate_output_hook(self, module, args, output):
-        """Forward-hook entry point on the gate module.
-
-        The logits tensor is mutated in place, so the original output
-        structure flows on unchanged (hook returns None).
-        """
-        if self._op_key is None:
-            return None
-        logits = extract_gate_logits(output)
-        if logits is None:
-            return None
-        torch.ops.vllm.steer_moe_gate(logits, self._op_key)
-        return None
-
-    def apply_gate_steering(self, logits):
-        """Op implementation: apply the active moe_router config."""
-        algo = self.algorithm
-        if algo is None:
-            return None
-        ctx_info = algo._get_forward_context_and_samples(logits)
-        context_info = None
-        if ctx_info is not None:
-            _, samples_info, current_tokens = ctx_info
-            context_info = (current_tokens, samples_info)
-        return algo.apply_intervention(logits, context_info=context_info)
-
-
 def _resolve_conflicts(collected, mode: str):
     """Resolve position conflicts between a slot's interventions.
 
@@ -244,9 +175,8 @@ def _resolve_conflicts(collected, mode: str):
     return filtered
 
 
-class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
-    """
-    Generic DecoderLayer intervention controller for full hidden states.
+class SlotRoutedSteerController(BaseLayerWithSteerVector):
+    """Shared slot-routing engine for steering controllers.
 
     Every routing slot holds an ordered list of interventions (a
     single-vector config is a list of one), each backed by a private
@@ -254,11 +184,11 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
     conflict resolution between a slot's interventions is a slot
     property.
 
-    Preferred usage is hook-based: the controller stays outside the model
-    tree and `process_output_hook` is registered as a forward hook on the
-    original decoder layer, so module names, classes and state-dict keys
-    are untouched (safe for FSDP/checkpointing, e.g. VERL). Wrapping a
-    layer as a submodule (`base_layer`) is kept for backward compatibility.
+    `apply_steering` routes each batch-active slot's interventions to
+    its own requests' token rows via the forward context's token->slot
+    map. It operates on any per-token row tensor — decoder hidden
+    states and MoE router logits share the same first-dimension token
+    layout — so subclasses only choose the hook point and the tensor.
     """
 
     def __init__(self, base_layer=None) -> None:
@@ -268,46 +198,9 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         # Per-request routing: config slot -> ordered intervention list.
         self.slot_interventions: Dict[int, list] = {}
         self.slot_conflict: Dict[int, str] = {}
-        # Key under which this controller is reachable from the
-        # vllm::steer_apply custom op (set when the hook is registered).
+        # Key under which this controller is reachable from its custom
+        # op (set when the hook is registered).
         self._op_key: Optional[str] = None
-        # Tier-1 full-graph mode: persistent buffers read by the captured
-        # kernel `hidden += mask * vectors[row_tok]` (see init_graph_table).
-        self._graph_mode: bool = False
-        self.graph_vectors: Optional[torch.Tensor] = None
-        self.graph_mask: Optional[torch.Tensor] = None
-        self.graph_row_tok: Optional[torch.Tensor] = None
-
-    def init_graph_table(
-        self,
-        num_rows: int,
-        hidden_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        max_num_tokens: int,
-        row_tok: torch.Tensor,
-    ) -> None:
-        """Allocate Tier-1 persistent buffers (full-graph steering mode).
-
-        Must run before compilation/graph capture so the captured kernel
-        sees the final buffer addresses. Row 0 of the vector table stays
-        zero (the no-steer row).
-        """
-        self.graph_vectors = torch.zeros(
-            num_rows + 1, hidden_size, dtype=dtype, device=device
-        )
-        self.graph_mask = torch.zeros(
-            max_num_tokens, dtype=dtype, device=device
-        )
-        self.graph_row_tok = row_tok
-        self._graph_mode = True
-
-    def set_graph_row(self, row: int, payload: torch.Tensor) -> None:
-        self.graph_vectors[row].copy_(payload.to(self.graph_vectors.dtype))
-
-    def clear_graph_row(self, row: int) -> None:
-        if self.graph_vectors is not None:
-            self.graph_vectors[row].zero_()
 
     def set_layer_id(self, layer_id: int) -> None:
         """Set layer ID for existing and future interventions."""
@@ -355,6 +248,119 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         self.slot_interventions.pop(index, None)
         self.slot_conflict.pop(index, None)
 
+    def apply_steering(self, token_tensor):
+        """Dispatch slot-routed steering on a per-token row tensor.
+
+        Applies each batch-active slot's interventions to its own
+        requests' token rows via the forward context's token->slot map;
+        no map means no steering this step.
+        """
+        ctx = get_forward_context() if get_forward_context is not None else None
+        token_slots = getattr(ctx, "steer_token_slots", None)
+        active_slots = getattr(ctx, "steer_active_slots", None)
+        if token_slots is None or not active_slots:
+            return token_tensor
+
+        tensor = token_tensor
+        ctx_info = _CTX_UNSET
+        for slot in active_slots:
+            entries = self.slot_interventions.get(slot)
+            if not entries:
+                # This layer is not targeted by this config.
+                continue
+            collected = []
+            for idx, algo in enumerate(entries):
+                params = algo._get_params()
+                if not algo._is_valid(params):
+                    continue
+                if not algo.params.has_any_triggers():
+                    continue
+                if algo.params.is_global_only_config():
+                    # All tokens of this slot's requests.
+                    positions = (token_slots == slot).nonzero(
+                        as_tuple=False).squeeze(-1)
+                else:
+                    if ctx_info is _CTX_UNSET:
+                        ctx_info = algo._get_forward_context_and_samples(
+                            tensor)
+                    if ctx_info is None:
+                        continue
+                    _, samples_info, current_tokens = ctx_info
+                    positions = algo.params.collect_intervention_positions(
+                        hidden_states=tensor,
+                        current_tokens=current_tokens,
+                        samples_info=samples_info,
+                    )
+                    if positions is None or positions.numel() == 0:
+                        continue
+                    positions = positions[token_slots[positions] == slot]
+                if positions.numel() == 0:
+                    continue
+                collected.append((idx, algo, positions))
+
+            collected = _resolve_conflicts(
+                collected, self.slot_conflict.get(slot, "priority"))
+            for idx, algo, positions in collected:
+                tensor = algo._batch_transform_tensor(
+                    tensor, positions, algo._get_params())
+                if trace.enabled():
+                    label = (algo.__class__.__name__ if len(entries) == 1
+                             else f"multi:{idx}:{algo.__class__.__name__}")
+                    trace.record_apply(
+                        self.layer_id, slot, label, positions.tolist())
+        return tensor
+
+
+class DecoderLayerWithSteerVector(SlotRoutedSteerController):
+    """DecoderLayer intervention controller for full hidden states.
+
+    Preferred usage is hook-based: the controller stays outside the model
+    tree and `process_output_hook` is registered as a forward hook on the
+    original decoder layer, so module names, classes and state-dict keys
+    are untouched (safe for FSDP/checkpointing, e.g. VERL). Wrapping a
+    layer as a submodule (`base_layer`) is kept for backward compatibility.
+    """
+
+    def __init__(self, base_layer=None) -> None:
+        super().__init__(base_layer)
+        # Tier-1 full-graph mode: persistent buffers read by the captured
+        # kernel `hidden += mask * vectors[row_tok]` (see init_graph_table).
+        self._graph_mode: bool = False
+        self.graph_vectors: Optional[torch.Tensor] = None
+        self.graph_mask: Optional[torch.Tensor] = None
+        self.graph_row_tok: Optional[torch.Tensor] = None
+
+    def init_graph_table(
+        self,
+        num_rows: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        max_num_tokens: int,
+        row_tok: torch.Tensor,
+    ) -> None:
+        """Allocate Tier-1 persistent buffers (full-graph steering mode).
+
+        Must run before compilation/graph capture so the captured kernel
+        sees the final buffer addresses. Row 0 of the vector table stays
+        zero (the no-steer row).
+        """
+        self.graph_vectors = torch.zeros(
+            num_rows + 1, hidden_size, dtype=dtype, device=device
+        )
+        self.graph_mask = torch.zeros(
+            max_num_tokens, dtype=dtype, device=device
+        )
+        self.graph_row_tok = row_tok
+        self._graph_mode = True
+
+    def set_graph_row(self, row: int, payload: torch.Tensor) -> None:
+        self.graph_vectors[row].copy_(payload.to(self.graph_vectors.dtype))
+
+    def clear_graph_row(self, row: int) -> None:
+        if self.graph_vectors is not None:
+            self.graph_vectors[row].zero_()
+
     def forward(self, *args, **kwargs):
         """Wrap the forward method of DecoderLayer (legacy wrapper mode)."""
         output = self.base_layer(*args, **kwargs)
@@ -398,68 +404,6 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         return _reconstruct_output(complete_hidden_states, None,
                                    other_outputs, original_format, output)
 
-    def apply_steering(self, complete_hidden_states):
-        """Dispatch steering on complete hidden states (hidden + residual).
-
-        Applies each batch-active slot's interventions to its own
-        requests' tokens via the forward context's sample->slot map; no
-        map means no steering this step.
-        """
-        ctx = get_forward_context() if get_forward_context is not None else None
-        token_slots = getattr(ctx, "steer_token_slots", None)
-        active_slots = getattr(ctx, "steer_active_slots", None)
-        if token_slots is None or not active_slots:
-            return complete_hidden_states
-
-        hidden = complete_hidden_states
-        ctx_info = _CTX_UNSET
-        for slot in active_slots:
-            entries = self.slot_interventions.get(slot)
-            if not entries:
-                # This layer is not targeted by this config.
-                continue
-            collected = []
-            for idx, algo in enumerate(entries):
-                params = algo._get_params()
-                if not algo._is_valid(params):
-                    continue
-                if not algo.params.has_any_triggers():
-                    continue
-                if algo.params.is_global_only_config():
-                    # All tokens of this slot's requests.
-                    positions = (token_slots == slot).nonzero(
-                        as_tuple=False).squeeze(-1)
-                else:
-                    if ctx_info is _CTX_UNSET:
-                        ctx_info = algo._get_forward_context_and_samples(
-                            hidden)
-                    if ctx_info is None:
-                        continue
-                    _, samples_info, current_tokens = ctx_info
-                    positions = algo.params.collect_intervention_positions(
-                        hidden_states=hidden,
-                        current_tokens=current_tokens,
-                        samples_info=samples_info,
-                    )
-                    if positions is None or positions.numel() == 0:
-                        continue
-                    positions = positions[token_slots[positions] == slot]
-                if positions.numel() == 0:
-                    continue
-                collected.append((idx, algo, positions))
-
-            collected = _resolve_conflicts(
-                collected, self.slot_conflict.get(slot, "priority"))
-            for idx, algo, positions in collected:
-                hidden = algo._batch_transform_tensor(
-                    hidden, positions, algo._get_params())
-                if trace.enabled():
-                    label = (algo.__class__.__name__ if len(entries) == 1
-                             else f"multi:{idx}:{algo.__class__.__name__}")
-                    trace.record_apply(
-                        self.layer_id, slot, label, positions.tolist())
-        return hidden
-
     def process_output(self, output):
         """Apply the active steering algorithm to a decoder layer output
         (legacy wrapper-mode path; the hook path goes through
@@ -484,5 +428,39 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
         else:
             return _reconstruct_output(modified_complete_hidden_states, None, other_outputs, original_format,
                                        output)
+
+
+class MoEGateSteerController(SlotRoutedSteerController):
+    """Hook-based MoE router-logits steering controller.
+
+    Registered as a forward hook on the MoE block's gate/router
+    submodule: the logits are steered in place (via the opaque
+    vllm::steer_moe_gate op, a splitting op under compiled execution)
+    before top-k expert selection consumes them — architecture-agnostic,
+    no per-model forward reimplementation.
+
+    Slot-routed exactly like decoder-layer steering: router-logit rows
+    share the token layout of hidden states, so each request's
+    moe_router config applies only to its own tokens and distinct MoE
+    configs batch together.
+    """
+
+    def process_gate_output_hook(self, module, args, output):
+        """Forward-hook entry point on the gate module.
+
+        The logits tensor is mutated in place, so the original output
+        structure flows on unchanged (hook returns None).
+        """
+        if self._op_key is None:
+            return None
+        logits = extract_gate_logits(output)
+        if logits is None:
+            return None
+        torch.ops.vllm.steer_moe_gate(logits, self._op_key)
+        return None
+
+    def apply_gate_steering(self, logits):
+        """Op implementation: slot-routed router-logit steering."""
+        return self.apply_steering(logits)
 
 

@@ -55,17 +55,6 @@ def steer_params_dict(obj, fields: tuple = STEER_APPLY_FIELDS) -> dict:
     return {name: getattr(obj, name) for name in fields}
 
 
-def layer_apply_kwargs(obj) -> dict:
-    """kwargs for layer-level set_steer_vector() from a request/config.
-
-    The layer API names two fields differently (algorithm_name,
-    scale_factor) and additionally takes the debug flag.
-    """
-    d = steer_params_dict(obj)
-    d["algorithm_name"] = d.pop("algorithm")
-    d["scale_factor"] = d.pop("scale")
-    d["debug"] = getattr(obj, "debug", False)
-    return d
 
 
 def _assert_schema_complete(cls, field_names, required) -> None:

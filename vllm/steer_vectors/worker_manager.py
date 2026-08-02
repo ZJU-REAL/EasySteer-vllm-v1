@@ -17,7 +17,6 @@ from vllm.steer_vectors.request import (
     STEER_APPLY_FIELDS,
     STEER_MOE_FIELDS,
     SteerVectorRequest,
-    layer_apply_kwargs,
     steer_params_dict,
 )
 
@@ -91,10 +90,6 @@ class WorkerSteerVectorManager:
         self._req_fingerprints: dict[str, str] = {}
         self._free_slots: list[int] = []
         self._next_slot = _CONFIG_SLOT_BASE
-        # moe_router single-active state: fingerprint currently written to
-        # the MoE wrappers, and the wrapper modules it was written to.
-        self._moe_distributed_fp: str | None = None
-        self._moe_modules: list = []
         # Tier-1 full-graph mode state (enable_graph_mode + wrap).
         self._graph_full = steer_vector_config.graph_mode == "full"
         self._graph_params: tuple | None = None
@@ -218,9 +213,8 @@ class WorkerSteerVectorManager:
     ) -> int:
         """Register a live request's steering config; returns its slot.
 
-        All config kinds route per-request: single-vector and multi-vector
-        configs steer only their own requests' tokens; moe_router configs
-        are applied at MoE-wrapper level with single-active semantics.
+        All config kinds route per-request: single-vector, multi-vector
+        and moe_router configs steer only their own requests' tokens.
         """
         if self._graph_full:
             self._assert_graph_safe(request)
@@ -239,7 +233,7 @@ class WorkerSteerVectorManager:
         if request.is_multi_vector:
             self._distribute_multi_config(slot, request)
         elif request.algorithm == "moe_router":
-            self._distribute_moe_config(fp, request)
+            self._distribute_moe_slot(slot, request)
         elif self._graph_full:
             model = self.vector_store.get(
                 request.local_path, request.algorithm, lazy=True
@@ -267,9 +261,7 @@ class WorkerSteerVectorManager:
             return
         slot, _, request = entry
         del self._config_slots[fp]
-        if request.algorithm == "moe_router" and not request.is_multi_vector:
-            self._release_moe_config(fp)
-        elif slot in self._slot_rows:
+        if slot in self._slot_rows:
             self._release_graph_config(slot)
         elif self._adapter_manager is not None:
             for module in self._adapter_manager.modules.values():
@@ -310,7 +302,11 @@ class WorkerSteerVectorManager:
         )
 
     def _configure_layer_slots(
-        self, slot: int, specs: list, conflict_resolution: str
+        self,
+        slot: int,
+        specs: list,
+        conflict_resolution: str,
+        wrapper_type: str = "decoder_layer",
     ) -> None:
         """Write an ordered intervention list into each targeted layer."""
         assert self._adapter_manager is not None
@@ -334,7 +330,7 @@ class WorkerSteerVectorManager:
             if not layer_specs:
                 continue
             for module in self._adapter_manager._get_modules_for_layer(
-                layer_idx, "decoder_layer"
+                layer_idx, wrapper_type
             ):
                 module.configure_slot(slot, layer_specs, conflict_resolution)
 
@@ -376,54 +372,17 @@ class WorkerSteerVectorManager:
             moe_topk=request.moe_topk,
         )
 
-    def _reset_moe_wrapper_state(self) -> None:
-        for module in self._moe_modules:
-            module.reset_steer_vector(0)
-        self._moe_modules.clear()
-        self._moe_distributed_fp = None
-
-    def _distribute_moe_config(
-        self, fp: str, request: SteerVectorRequest
+    def _distribute_moe_slot(
+        self, slot: int, request: SteerVectorRequest
     ) -> None:
-        """Write a moe_router config into the MoE wrappers (single-active).
-
-        MoE router steering operates on router logits at wrapper level and
-        is not token-routed; only one distinct config can be in effect at
-        a time. A newer distinct config overwrites the wrapper state.
-        """
-        assert self._adapter_manager is not None
-        if (self._moe_distributed_fp is not None
-                and self._moe_distributed_fp != fp):
-            logger.warning(
-                "Concurrent distinct moe_router configs are not batchable; "
-                "the newest config overwrites the MoE-wrapper state for ALL "
-                "running requests."
-            )
-        self._reset_moe_wrapper_state()
+        """Configure a moe_router request as a one-intervention slot on
+        the MoE gate controllers (token-routed like any other config)."""
         model = self._build_moe_model(request)
-        params = layer_apply_kwargs(request)
-        target_layers = params.pop("target_layers")
-        for layer_idx, payload in (model.layer_payloads or {}).items():
-            if target_layers and layer_idx not in target_layers:
-                continue
-            for module in self._adapter_manager._get_modules_for_layer(
-                layer_idx, "moe_layer"
-            ):
-                module.set_steer_vector(0, payload=payload, **params)
-                module.set_active_tensor(0)
-                self._moe_modules.append(module)
-        self._moe_distributed_fp = fp
-
-    def _release_moe_config(self, fp: str) -> None:
-        if self._moe_distributed_fp != fp:
-            return
-        self._reset_moe_wrapper_state()
-        # If another moe_router config is still live, restore it.
-        for other_fp, entry in self._config_slots.items():
-            req = entry[2]
-            if req.algorithm == "moe_router" and not req.is_multi_vector:
-                self._distribute_moe_config(other_fp, req)
-                break
+        fields = {**steer_params_dict(request), "debug": request.debug}
+        self._configure_layer_slots(
+            slot, [(fields, model.layer_payloads or {})], "priority",
+            wrapper_type="moe_layer",
+        )
 
     # ------------------------------------------------------------------
     # Server-level (default) steering config

@@ -1258,6 +1258,9 @@ class Worker(WorkerBase):
     def remove_steer_vector(self, steer_vector_id: int) -> bool:
         return self.model_runner.remove_steer_vector(steer_vector_id)
 
+    def list_steer_vectors(self) -> set[int]:
+        return self.model_runner.list_steer_vectors()
+
     # Capture stream RPCs
     def start_capture(self, stream: str, **config_kwargs) -> bool:
         return self.model_runner.start_capture(stream, **config_kwargs)

@@ -42,8 +42,3 @@ class BaseSteerVectorAlgorithm(ABC):
     def set_active_tensor(self, index: int) -> None:
         """Set active steer vector."""
         pass
-
-    @abstractmethod
-    def apply_intervention(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply steer vector intervention."""
-        pass

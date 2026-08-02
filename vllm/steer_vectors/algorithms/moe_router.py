@@ -51,9 +51,6 @@ class MoERouterAlgorithm(AlgorithmTemplate):
         kwargs.pop('normalize', None)
         super().__init__(layer_id=layer_id, normalize=False, **kwargs)
     
-    # Inherit apply_intervention from AlgorithmTemplate - it has full trigger support!
-    # We only need to implement _transform for MoE-specific logic
-    
     def _transform(self, router_logits: torch.Tensor, params: dict) -> torch.Tensor:
         """
         Apply intervention to router logits.
