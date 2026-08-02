@@ -20,7 +20,7 @@ class TriggerController:
 
     def __init__(self):
         """Initialize with no triggers configured."""
-        # Trigger parameters
+        # v1 (deprecated) trigger parameters
         self.prefill_trigger_tokens: set[int] | None = None
         self.prefill_trigger_positions: list[int] | None = None
         self.prefill_exclude_tokens: set[int] | None = None
@@ -28,6 +28,10 @@ class TriggerController:
         self.generate_trigger_tokens: set[int] | None = None
         self.generate_first_k_tokens: int | None = None
         self.generate_after_k_tokens: int | None = None
+
+        # v2 where-clause (wire dict from ApplySpec.to_wire()); mutually
+        # exclusive with the v1 fields above.
+        self.apply_spec: dict | None = None
 
         # Debug mode
         self.debug: bool = False
@@ -73,6 +77,8 @@ class TriggerController:
 
     def has_prefill_triggers(self) -> bool:
         """Check if prefill triggers are configured."""
+        if self.apply_spec is not None:
+            return "prompt" in self.apply_spec["phases"]
         return (
             self.prefill_trigger_tokens is not None
             or self.prefill_trigger_positions is not None
@@ -80,6 +86,8 @@ class TriggerController:
 
     def has_any_triggers(self) -> bool:
         """Check if any triggers are configured."""
+        if self.apply_spec is not None:
+            return True
         return (
             self.prefill_trigger_tokens is not None
             or self.generate_trigger_tokens is not None
@@ -123,6 +131,19 @@ class TriggerController:
         Returns:
             True if BOTH phases are configured for global application, False otherwise
         """
+        if self.apply_spec is not None:
+            spec = self.apply_spec
+            return len(spec["phases"]) == 2 and all(
+                spec.get(key) is None
+                for key in (
+                    "tokens",
+                    "positions",
+                    "exclude_tokens",
+                    "exclude_positions",
+                    "window",
+                )
+            )
+
         # Only exclusion filters matter (-1 in trigger_tokens overrides position
         # triggers)
         has_no_exclusions = (
@@ -167,6 +188,12 @@ class TriggerController:
             positions_tensor: [num_positions] GPU tensor of positions to transform
             or None if no positions to apply
         """
+        if self.apply_spec is not None:
+            return collect_positions_apply_spec(
+                current_tokens=current_tokens,
+                samples_info=samples_info,
+                spec=self.apply_spec,
+            )
         return collect_positions_gpu_batch(
             hidden_states=hidden_states,
             current_tokens=current_tokens,
@@ -358,6 +385,95 @@ def collect_positions_gpu_batch(
             else:
                 in_window = gen_counts >= generate_after_k_tokens
             mask &= is_prefill_token | in_window
+
+    positions_tensor = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+    if positions_tensor.numel() == 0:
+        return None
+    return positions_tensor
+
+
+def collect_positions_apply_spec(
+    current_tokens: torch.Tensor,
+    samples_info: dict[str, torch.Tensor],
+    spec: dict,
+) -> torch.Tensor | None:
+    """Collect intervention positions for a v2 `apply_spec` where-clause.
+
+    Semantics (see steer_vectors/api.py):
+      candidates = tokens of the selected phases
+      if tokens/positions given: candidates &= (token match | position match)
+      candidates &= ~(exclude_tokens match | exclude_positions match)
+      generation tokens are additionally constrained to the half-open
+      window over 0-based decode steps (step j iff start <= j < stop).
+
+    Unlike the v1 collector there are no sentinel values and nothing
+    bypasses exclusions.
+    """
+    query_start_loc = samples_info["query_start_loc"]
+    num_computed = samples_info["num_computed"]
+    is_decode_mask = samples_info["is_decode_mask"]
+    device = current_tokens.device
+    total_tokens = current_tokens.shape[0]
+
+    if num_computed is not None and not isinstance(num_computed, torch.Tensor):
+        num_computed = torch.tensor(num_computed, device=device, dtype=torch.long)
+
+    all_positions = torch.arange(total_tokens, device=device)
+    sample_ids = torch.searchsorted(query_start_loc, all_positions, right=True) - 1
+    relative_positions = all_positions - query_start_loc[:-1][sample_ids]
+    if num_computed is not None:
+        abs_positions = relative_positions + num_computed[sample_ids]
+        total_len = (query_start_loc[1:] - query_start_loc[:-1]) + num_computed
+    else:
+        abs_positions = relative_positions
+        total_len = query_start_loc[1:] - query_start_loc[:-1]
+    num_prompt = samples_info.get("num_prompt_tokens")
+    neg_base = total_len if num_prompt is None else num_prompt.to(device)
+    is_decode_token = is_decode_mask[sample_ids]
+
+    phases = spec["phases"]
+    mask = torch.zeros(total_tokens, dtype=torch.bool, device=device)
+    if "prompt" in phases:
+        mask |= ~is_decode_token
+    if "generation" in phases:
+        mask |= is_decode_token
+
+    tokens = spec.get("tokens")
+    positions = spec.get("positions")
+    if tokens is not None or positions is not None:
+        trigger = torch.zeros(total_tokens, dtype=torch.bool, device=device)
+        if tokens is not None:
+            trigger |= _isin_token_set(current_tokens, tokens)
+        if positions is not None:
+            trigger |= _match_positions(abs_positions, positions, neg_base, sample_ids)
+        mask &= trigger
+
+    exclude_tokens = spec.get("exclude_tokens")
+    if exclude_tokens is not None:
+        mask &= ~_isin_token_set(current_tokens, exclude_tokens)
+    exclude_positions = spec.get("exclude_positions")
+    if exclude_positions is not None:
+        mask &= ~_match_positions(
+            abs_positions, exclude_positions, neg_base, sample_ids
+        )
+
+    window = spec.get("window")
+    if window is not None:
+        num_output_tokens = samples_info.get("num_output_tokens")
+        if num_output_tokens is None:
+            raise RuntimeError(
+                "apply_spec has a generation window but the runner did not "
+                "provide num_output_tokens in samples_info"
+            )
+        # The decode step processing generated token j has
+        # num_output_tokens == j + 1 (the prompt's last position, which
+        # produces the first generated token, is a prompt-phase token).
+        gen_idx = num_output_tokens.to(device)[sample_ids] - 1
+        start, stop = window
+        in_window = gen_idx >= start
+        if stop is not None:
+            in_window &= gen_idx < stop
+        mask &= (~is_decode_token) | in_window
 
     positions_tensor = torch.nonzero(mask, as_tuple=False).squeeze(-1)
     if positions_tensor.numel() == 0:

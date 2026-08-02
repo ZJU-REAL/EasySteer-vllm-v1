@@ -22,6 +22,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
+from vllm.steer_vectors.api import SteeringSpec
 from vllm.steer_vectors.request import SteerVectorRequestParam
 from vllm.logprobs import Logprob
 from vllm.renderers import TokenizeParams
@@ -215,10 +216,18 @@ class CompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    steering: "SteeringSpec | None" = Field(
+        default=None,
+        description=(
+            "Steering configuration (v2 API) applied to this request. "
+            "Requires the server to be started with --enable-steer-vector."
+        ),
+    )
+
     steer_vector_request: "SteerVectorRequestParam | None" = Field(
         default=None,
         description=(
-            "Steer vector request for activation steering. "
+            "Deprecated v1 steering request; use 'steering' instead. "
             "Requires the server to be started with --enable-steer-vector."
         ),
     )

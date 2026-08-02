@@ -609,6 +609,7 @@ class EngineArgs:
     steer_allow_cuda_graphs: bool = False
     steer_graph_mode: str = "piecewise"
     steer_require_preload: bool = False
+    steering_config: str | None = None
     steer_vector_path: str | None = None
     steer_scale: float = 1.0
     steer_target_layers: list[int] | None = None
@@ -1411,15 +1412,27 @@ class EngineArgs:
             ),
         )
         steer_vector_group.add_argument(
+            "--steering-config",
+            type=str,
+            default=None,
+            help=(
+                "Engine-default steering (v2 API): a SteeringSpec as inline "
+                "JSON or a path to a JSON file. Every request is steered "
+                "with this config and per-request steering is rejected; "
+                "replace it at runtime via POST /v1/steering. Implies "
+                "--enable-steer-vector."
+            ),
+        )
+        steer_vector_group.add_argument(
             "--steer-vector-path",
             type=str,
             default=None,
             help=(
-                "Path to a steering vector file (.gguf) to load at server "
-                "startup. Enables server-level steering: every request is "
-                "steered with this vector, and per-request steer_vector_request "
-                "is rejected. Implies --enable-steer-vector and enables CUDA "
-                "graphs for ~2.6x speedup."
+                "[DEPRECATED: use --steering-config] Path to a steering "
+                "vector file (.gguf) to load at server startup. Enables "
+                "server-level steering: every request is steered with this "
+                "vector, and per-request steer_vector_request is rejected. "
+                "Implies --enable-steer-vector."
             ),
         )
         steer_vector_group.add_argument(
@@ -2333,8 +2346,19 @@ class EngineArgs:
 
         # Steer Vector configuration
         from vllm.config.steer_vector import SteerVectorConfig
-        # --steer-vector-path implies --enable-steer-vector
-        enable_steer = self.enable_steer_vector or self.steer_vector_path is not None
+        # An engine-default steering config implies --enable-steer-vector
+        enable_steer = (
+            self.enable_steer_vector
+            or self.steering_config is not None
+            or self.steer_vector_path is not None
+        )
+        if self.steer_vector_path is not None:
+            logger.warning(
+                "--steer-vector-path/--steer-scale/--steer-target-layers/"
+                "--steer-algorithm/--steer-normalize are deprecated; use "
+                "--steering-config with a SteeringSpec JSON "
+                "(see STEERING_API_V2.md)."
+            )
         # Deprecated no-op, kept for CLI compatibility (warns in VllmConfig).
         allow_cuda = bool(self.steer_allow_cuda_graphs)
         steer_vector_config = (
@@ -2343,6 +2367,7 @@ class EngineArgs:
                 allow_cuda_graphs=allow_cuda,
                 graph_mode=self.steer_graph_mode,
                 require_preload=bool(self.steer_require_preload),
+                steering_config=self.steering_config,
                 server_vector_path=self.steer_vector_path,
                 server_scale=self.steer_scale,
                 server_target_layers=self.steer_target_layers,

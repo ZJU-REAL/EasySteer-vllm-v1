@@ -32,12 +32,15 @@ def config_fingerprint(request: SteerVectorRequest) -> str:
     automatically.
     """
 
+    def _canon_value(value):
+        if isinstance(value, list):
+            return tuple(_canon_value(v) for v in value)
+        if isinstance(value, dict):
+            return tuple(sorted((k, _canon_value(v)) for k, v in value.items()))
+        return value
+
     def _canon(obj, fields):
-        out = []
-        for name in fields:
-            value = getattr(obj, name)
-            out.append(tuple(value) if isinstance(value, list) else value)
-        return out
+        return [_canon_value(getattr(obj, name)) for name in fields]
 
     from vllm.steer_vectors.store import file_version
 

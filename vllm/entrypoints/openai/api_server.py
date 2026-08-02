@@ -809,37 +809,49 @@ def _register_steering_endpoints(app: FastAPI) -> None:
             "preloaded": engine_client.list_preloaded_steer_vectors(),
         })
 
-    @app.get("/v1/steering")
-    async def get_steering_config(raw_request: Request):
-        """Return the current server-level steering configuration."""
-        vllm_config = raw_request.app.state.vllm_config
-        steer_config = vllm_config.steer_vector_config
-        if steer_config is None or not steer_config.has_server_config:
-            return JSONResponse(content={"active": False})
-        return JSONResponse(content={
+    def _steering_status(steer_config) -> dict:
+        if steer_config.steering_config is not None:
+            return {
+                "active": True,
+                "spec": _json.loads(steer_config.steering_config),
+            }
+        return {
             "active": True,
             "vector_path": steer_config.server_vector_path,
             "scale": steer_config.server_scale,
             "target_layers": steer_config.server_target_layers,
             "algorithm": steer_config.server_algorithm,
             "normalize": steer_config.server_normalize,
-        })
+        }
+
+    @app.get("/v1/steering")
+    async def get_steering_config(raw_request: Request):
+        """Return the current engine-default steering configuration."""
+        vllm_config = raw_request.app.state.vllm_config
+        steer_config = vllm_config.steer_vector_config
+        if steer_config is None or not steer_config.has_server_config:
+            return JSONResponse(content={"active": False})
+        return JSONResponse(content=_steering_status(steer_config))
 
     @app.post("/v1/steering")
     async def update_steering_config(raw_request: Request):
-        """Update server-level steering at runtime.
+        """Replace the engine-default steering config at runtime.
 
-        Only ``scale`` can be changed without CUDA graph re-capture.
-        Structural changes (different vector path, layers, algorithm) would
-        require graph re-capture and are rejected in this first version.
+        v2: ``{"spec": <SteeringSpec JSON>}`` replaces the whole config;
+        the prefix cache is reset afterwards so cached KV steered under
+        the old config is never reused. Backends validate the new spec at
+        install and unsupported specs are rejected with 400.
+
+        Deprecated v1 (``--steer-vector-path`` engines only):
+        ``{"scale": x}`` updates the scale; other v1 fields are fixed.
         """
         vllm_config = raw_request.app.state.vllm_config
         steer_config = vllm_config.steer_vector_config
         if steer_config is None or not steer_config.has_server_config:
             return JSONResponse(
                 status_code=400,
-                content={"error": "Server-level steering is not configured. "
-                         "Start the server with --steer-vector-path to enable."},
+                content={"error": "Engine-default steering is not configured. "
+                         "Start the server with --steering-config to enable."},
             )
 
         try:
@@ -850,48 +862,72 @@ def _register_steering_endpoints(app: FastAPI) -> None:
                 content={"error": f"Invalid JSON: {e}"},
             )
 
-        structural_keys = {"vector_path", "target_layers", "algorithm",
-                           "normalize"}
-        requested_structural = structural_keys & set(body.keys())
-        if requested_structural:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": f"Changing {requested_structural} requires CUDA "
-                             "graph re-capture, which is not supported yet. "
-                             "Only 'scale' can be changed at runtime."
-                },
-            )
+        engine_client = raw_request.app.state.engine_client
+
+        async def _reset_prefix_cache_if_enabled():
+            client_config = getattr(engine_client, "vllm_config", None)
+            if (
+                client_config is not None
+                and client_config.cache_config is not None
+                and client_config.cache_config.enable_prefix_caching
+            ):
+                await engine_client.reset_prefix_cache()
+
+        if "spec" in body:
+            from pydantic import ValidationError
+
+            from vllm.steer_vectors.api import SteeringSpec, to_engine_request
+
+            try:
+                spec = SteeringSpec.model_validate(body["spec"])
+            except ValidationError as e:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Invalid SteeringSpec: {e}"},
+                )
+            async with _steering_update_lock:
+                try:
+                    await engine_client.add_steer_vector(
+                        to_engine_request(spec, name="__server__", int_id=1)
+                    )
+                except Exception as e:
+                    # The workers rejected the spec (e.g. not graph-safe
+                    # on a full-graph engine); the old config stays live.
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": f"Spec rejected at install: {e}"},
+                    )
+                object.__setattr__(
+                    steer_config, "steering_config", spec.model_dump_json()
+                )
+                object.__setattr__(steer_config, "server_vector_path", None)
+                await _reset_prefix_cache_if_enabled()
+            return JSONResponse(content=_steering_status(steer_config))
 
         new_scale = body.get("scale")
         if new_scale is not None:
+            if steer_config.steering_config is not None:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "This engine uses a v2 steering spec; "
+                                 "POST {\"spec\": {...}} to replace it "
+                                 "(scale lives inside the spec)."
+                    },
+                )
             async with _steering_update_lock:
                 object.__setattr__(steer_config, "server_scale",
                                    float(new_scale))
 
                 from vllm.steer_vectors.request import build_server_request
-                engine_client = raw_request.app.state.engine_client
                 await engine_client.add_steer_vector(
                     build_server_request(steer_config)
                 )
                 # Cached KV was steered under the old scale; drop it so
                 # new requests never reuse stale blocks.
-                vllm_config = getattr(engine_client, "vllm_config", None)
-                if (
-                    vllm_config is not None
-                    and vllm_config.cache_config is not None
-                    and vllm_config.cache_config.enable_prefix_caching
-                ):
-                    await engine_client.reset_prefix_cache()
+                await _reset_prefix_cache_if_enabled()
 
-        return JSONResponse(content={
-            "active": True,
-            "vector_path": steer_config.server_vector_path,
-            "scale": steer_config.server_scale,
-            "target_layers": steer_config.server_target_layers,
-            "algorithm": steer_config.server_algorithm,
-            "normalize": steer_config.server_normalize,
-        })
+        return JSONResponse(content=_steering_status(steer_config))
 
 
 async def run_server(args, **uvicorn_kwargs) -> None:

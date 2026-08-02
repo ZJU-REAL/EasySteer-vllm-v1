@@ -65,8 +65,14 @@ class SteerVectorConfig:
     buffers filled host-side each step — only graph-safe configs are
     admitted (direct algorithm, no normalize, single-vector)."""
 
-    # Server-level steering: configure steering at startup instead of per-request.
-    # When set, CUDA graphs are safe because every batch uses the same config.
+    steering_config: str | None = None
+    """Engine-default steering (v2 API): a SteeringSpec as inline JSON or
+    a path to a JSON file. Applied to every request; per-request steering
+    is rejected while it is active. Normalized to canonical JSON text at
+    validation time so every consumer (salt, worker install, endpoint)
+    sees identical content."""
+
+    # Deprecated v1 server-level steering flags; use steering_config.
     server_vector_path: str | None = None
     """Path to a steering vector file to load at startup."""
 
@@ -84,8 +90,8 @@ class SteerVectorConfig:
 
     @property
     def has_server_config(self) -> bool:
-        """True when server-level steering is configured."""
-        return self.server_vector_path is not None
+        """True when engine-default (server-level) steering is configured."""
+        return self.steering_config is not None or self.server_vector_path is not None
 
     def compute_hash(self) -> str:
         """
@@ -98,6 +104,7 @@ class SteerVectorConfig:
         factors.append(self.steer_vector_dtype)
         factors.append(self.allow_cuda_graphs)
         factors.append(self.graph_mode)
+        factors.append(self.steering_config)
         factors.append(self.server_vector_path)
         factors.append(self.server_scale)
         factors.append(self.server_target_layers)
@@ -140,4 +147,27 @@ class SteerVectorConfig:
                 f"max_cpu_steer_vectors ({self.max_cpu_steer_vectors}) "
                 f"must be >= max_steer_vectors ({self.max_steer_vectors})"
             )
+        if self.steering_config is not None:
+            if self.server_vector_path is not None:
+                raise ValueError(
+                    "steering_config and the deprecated --steer-vector-path "
+                    "flags are mutually exclusive; use steering_config alone"
+                )
+            import os
+
+            from vllm.steer_vectors.api import SteeringSpec
+
+            text = self.steering_config
+            if not text.lstrip().startswith("{"):
+                if not os.path.exists(text):
+                    raise ValueError(
+                        f"steering_config file does not exist: {text!r} "
+                        "(pass inline JSON or a path to a SteeringSpec "
+                        "JSON file)"
+                    )
+                with open(text) as f:
+                    text = f.read()
+            self.steering_config = SteeringSpec.model_validate_json(
+                text
+            ).model_dump_json()
         return self

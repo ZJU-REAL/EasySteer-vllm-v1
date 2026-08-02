@@ -15,7 +15,11 @@ from pydantic import BaseModel
 # schema classes, and consume it where needed — nothing else to keep in
 # sync.
 
-STEER_TRIGGER_FIELDS: tuple[str, ...] = (
+# v1 (deprecated) trigger fields. The v2 API carries the whole
+# where-clause as one canonical `apply_spec` dict instead (see
+# steer_vectors/api.py); the two forms are mutually exclusive on a
+# struct.
+STEER_LEGACY_TRIGGER_FIELDS: tuple[str, ...] = (
     "prefill_trigger_tokens",
     "prefill_trigger_positions",
     "prefill_exclude_tokens",
@@ -24,6 +28,8 @@ STEER_TRIGGER_FIELDS: tuple[str, ...] = (
     "generate_first_k_tokens",
     "generate_after_k_tokens",
 )
+
+STEER_TRIGGER_FIELDS: tuple[str, ...] = STEER_LEGACY_TRIGGER_FIELDS + ("apply_spec",)
 
 STEER_APPLY_FIELDS: tuple[str, ...] = (
     "scale",
@@ -57,14 +63,103 @@ def _has_triggers(obj) -> bool:
     return any(getattr(obj, name) is not None for name in STEER_TRIGGER_FIELDS)
 
 
+_APPLY_SPEC_KEYS = (
+    "phases",
+    "tokens",
+    "positions",
+    "exclude_tokens",
+    "exclude_positions",
+    "window",
+)
+
+
+def validate_apply_spec(spec: dict) -> None:
+    """Structurally validate a wire-format `apply_spec` dict.
+
+    The pydantic ApplySpec model is the authoring-side validator; this
+    guards the engine struct against hand-built or corrupted dicts.
+    """
+    if not isinstance(spec, dict):
+        raise ValueError(f"apply_spec must be a dict, got {type(spec).__name__}")
+    unknown = set(spec) - set(_APPLY_SPEC_KEYS)
+    if unknown:
+        raise ValueError(f"apply_spec has unknown keys: {sorted(unknown)}")
+    phases = spec.get("phases")
+    if (
+        not isinstance(phases, list)
+        or not phases
+        or len(set(phases)) != len(phases)
+        or any(p not in ("prompt", "generation") for p in phases)
+    ):
+        raise ValueError(
+            "apply_spec['phases'] must be a non-empty duplicate-free "
+            f"subset of ['prompt', 'generation'], got {phases!r}"
+        )
+    for key in ("tokens", "positions", "exclude_tokens", "exclude_positions"):
+        value = spec.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, list) or not value:
+            raise ValueError(
+                f"apply_spec[{key!r}] must be None or a non-empty list, "
+                f"got {value!r}"
+            )
+        if key in ("tokens", "exclude_tokens") and any(t < 0 for t in value):
+            raise ValueError(
+                f"apply_spec[{key!r}] must contain real token ids (>= 0), "
+                f"got {value!r}"
+            )
+    window = spec.get("window")
+    if window is not None:
+        if (
+            not isinstance(window, (list, tuple))
+            or len(window) != 2
+            or window[0] < 0
+            or (window[1] is not None and window[1] <= window[0])
+        ):
+            raise ValueError(
+                "apply_spec['window'] must be a half-open [start, stop] "
+                f"with start >= 0 and stop > start or None, got {window!r}"
+            )
+        if "generation" not in phases:
+            raise ValueError(
+                "apply_spec['window'] requires 'generation' in phases"
+            )
+
+
+def _validate_where_clause(obj, context: str) -> None:
+    """Validate one struct's where-clause: apply_spec is well-formed and
+    not mixed with the deprecated v1 trigger fields."""
+    if obj.apply_spec is None:
+        return
+    validate_apply_spec(obj.apply_spec)
+    legacy_set = [
+        name
+        for name in STEER_LEGACY_TRIGGER_FIELDS
+        if getattr(obj, name) is not None
+    ]
+    if legacy_set:
+        raise ValueError(
+            f"{context} sets both apply_spec and deprecated trigger "
+            f"fields {legacy_set}; use apply_spec alone"
+        )
+
+
 def build_server_request(steer_config) -> "SteerVectorRequest":
     """The canonical server-level steering request for a SteerVectorConfig.
 
     Single source of truth for what server-level steering does (used by
-    the worker install path, the runtime scale-update endpoint, and the
-    prefix-cache salt): the configured vector applied globally to all
-    tokens of every request.
+    the worker install path, the runtime update endpoint, and the
+    prefix-cache salt). v2 (`steering_config` JSON spec) translates the
+    full spec; the deprecated v1 flags mean the configured vector applied
+    globally to all tokens of every request. Name/id are fixed so every
+    construction site produces an identical (same-fingerprint) request.
     """
+    if steer_config.steering_config is not None:
+        from vllm.steer_vectors.api import SteeringSpec, to_engine_request
+
+        spec = SteeringSpec.model_validate_json(steer_config.steering_config)
+        return to_engine_request(spec, name="__server__", int_id=1)
     return SteerVectorRequest(
         steer_vector_name="__server__",
         steer_vector_int_id=1,
@@ -89,6 +184,13 @@ def is_prompt_length_sensitive(request) -> bool:
     """
 
     def _sensitive(obj) -> bool:
+        spec = obj.apply_spec
+        if spec is not None:
+            return (
+                any(p < 0 for p in (spec.get("positions") or []))
+                or any(p < 0 for p in (spec.get("exclude_positions") or []))
+                or spec.get("window") is not None
+            )
         return (
             any(p < 0 for p in (obj.prefill_trigger_positions or []))
             or any(p < 0 for p in (obj.prefill_exclude_positions or []))
@@ -135,6 +237,7 @@ class VectorConfigParam(BaseModel):
     generate_trigger_tokens: list[int] | None = None
     generate_first_k_tokens: int | None = None
     generate_after_k_tokens: int | None = None
+    apply_spec: dict | None = None
     algorithm: str = "direct"
     normalize: bool = False
 
@@ -162,6 +265,7 @@ class SteerVectorRequestParam(BaseModel):
     generate_trigger_tokens: list[int] | None = None
     generate_first_k_tokens: int | None = None
     generate_after_k_tokens: int | None = None
+    apply_spec: dict | None = None
     algorithm: str = "direct"
     normalize: bool = False
 
@@ -227,6 +331,7 @@ class VectorConfig(
     generate_trigger_tokens: list[int] | None = None
     generate_first_k_tokens: int | None = None
     generate_after_k_tokens: int | None = None
+    apply_spec: dict | None = None
     algorithm: str = "direct"
     normalize: bool = False
 
@@ -238,7 +343,13 @@ class SteerVectorRequest(
     frozen=False,  # type: ignore[call-arg]
 ):  # type: ignore[call-arg]
     """
-    Request to apply a steering configuration.
+    Request to apply a steering configuration (internal engine struct).
+
+    The documented user-facing API is v2 (`vllm.steer_vectors.SteeringSpec`,
+    see STEERING_API_V2.md), which translates into this struct at admission
+    and carries its where-clause in `apply_spec`. Constructing this struct
+    directly with the legacy trigger fields is deprecated.
+
     Supports both single-vector mode (backward compatible) and multi-vector mode.
 
     Args:
@@ -296,6 +407,7 @@ class SteerVectorRequest(
     generate_trigger_tokens: list[int] | None = None
     generate_first_k_tokens: int | None = None
     generate_after_k_tokens: int | None = None
+    apply_spec: dict | None = None
     algorithm: str = "direct"
     normalize: bool = False
 
@@ -358,6 +470,8 @@ class SteerVectorRequest(
                 f"{self.generate_after_k_tokens}"
             )
 
+        _validate_where_clause(self, "Steering request")
+
         if self.is_multi_vector:
             if self.steer_vector_local_path:
                 raise ValueError(
@@ -366,6 +480,7 @@ class SteerVectorRequest(
             if not self.vector_configs:
                 raise ValueError("vector_configs cannot be empty in multi-vector mode")
             for i, vc in enumerate(self.vector_configs):
+                _validate_where_clause(vc, f"vector_configs[{i}]")
                 if not _has_triggers(vc):
                     raise ValueError(
                         f"vector_configs[{i}] has no trigger fields and would "

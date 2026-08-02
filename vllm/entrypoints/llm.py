@@ -46,6 +46,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.steer_vectors.api import SteeringSpec, to_engine_request
 from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
@@ -62,6 +63,32 @@ if TYPE_CHECKING:
     from vllm.v1.metrics.reader import Metric
 
 logger = init_logger(__name__)
+
+
+def _resolve_steering(
+    steering: Sequence[SteeringSpec] | SteeringSpec | None,
+    steer_vector_request: Sequence[SteerVectorRequest] | SteerVectorRequest | None,
+) -> Sequence[SteerVectorRequest] | SteerVectorRequest | None:
+    """Translate the v2 `steering` argument into engine requests.
+
+    Rejects mixing with the deprecated `steer_vector_request` argument
+    and warns when only the deprecated form is used.
+    """
+    if steering is not None and steer_vector_request is not None:
+        raise ValueError(
+            "Pass either steering= or the deprecated steer_vector_request=, "
+            "not both."
+        )
+    if steering is not None:
+        if isinstance(steering, SteeringSpec):
+            return to_engine_request(steering)
+        return [to_engine_request(spec) for spec in steering]
+    if steer_vector_request is not None:
+        logger.warning_once(
+            "steer_vector_request is deprecated; use "
+            "steering=SteeringSpec(...) (see STEERING_API_V2.md)."
+        )
+    return steer_vector_request
 
 
 class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
@@ -416,6 +443,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         *,
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
+        steering: "Sequence[SteeringSpec] | SteeringSpec | None" = None,
         steer_vector_request: Sequence[SteerVectorRequest] | SteerVectorRequest | None = None,
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -441,6 +469,10 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
                 it is used to create the progress bar.
                 If `False`, no progress bar is created.
             lora_request: LoRA request to use for generation, if any.
+            steering: Steering configuration (`SteeringSpec`) applied to
+                the request(s); a sequence pairs one spec per prompt.
+            steer_vector_request: Deprecated v1 steering request; use
+                ``steering`` instead.
             priority: The priority of the requests, if any.
                 Only applicable when priority scheduling policy is enabled.
                 If provided, must be a list of integers matching the length
@@ -464,6 +496,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
 
+        steer_vector_request = _resolve_steering(steering, steer_vector_request)
+
         return self._run_completion(
             prompts=prompts,
             params=sampling_params,
@@ -481,6 +515,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         prompts: PromptType | Sequence[PromptType],
         sampling_params: SamplingParams | Sequence[SamplingParams] | None = None,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
+        steering: Sequence[SteeringSpec] | SteeringSpec | None = None,
         steer_vector_request: Sequence[SteerVectorRequest] | SteerVectorRequest | None = None,
         priority: list[int] | None = None,
         use_tqdm: bool | Callable[..., tqdm] = True,
@@ -511,6 +546,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
+
+        steer_vector_request = _resolve_steering(steering, steer_vector_request)
 
         return self._add_completion_requests(
             prompts=prompts,

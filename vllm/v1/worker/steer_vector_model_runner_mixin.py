@@ -70,15 +70,21 @@ class SteerVectorModelRunnerMixin:
         if steer_config is None or not steer_config.has_server_config:
             return
 
-        logger.info(
-            "Loading server-level steering vector: path=%s, scale=%s, "
-            "layers=%s, algorithm=%s, normalize=%s",
-            steer_config.server_vector_path,
-            steer_config.server_scale,
-            steer_config.server_target_layers,
-            steer_config.server_algorithm,
-            steer_config.server_normalize,
-        )
+        if steer_config.steering_config is not None:
+            logger.info(
+                "Loading engine-default steering spec: %s",
+                steer_config.steering_config,
+            )
+        else:
+            logger.info(
+                "Loading server-level steering vector: path=%s, scale=%s, "
+                "layers=%s, algorithm=%s, normalize=%s",
+                steer_config.server_vector_path,
+                steer_config.server_scale,
+                steer_config.server_target_layers,
+                steer_config.server_algorithm,
+                steer_config.server_normalize,
+            )
         from vllm.steer_vectors.request import build_server_request
 
         self.steer_vector_manager.set_server_config(build_server_request(steer_config))
@@ -118,7 +124,7 @@ class SteerVectorModelRunnerMixin:
             raise RuntimeError(
                 "Cannot install server-level steering at runtime on a "
                 "prefix-caching engine without a startup server config "
-                "(--steer-vector-path): existing cache blocks were hashed "
+                "(--steering-config): existing cache blocks were hashed "
                 "without the server salt."
             )
 
