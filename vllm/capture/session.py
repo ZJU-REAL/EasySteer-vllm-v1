@@ -4,8 +4,8 @@
 One CaptureSession per worker owns named capture *streams*:
 
 - ``hidden_states``: complete post-layer hidden states (hidden + residual)
-  from every decoder layer, discovered by the same class-name lists +
-  structural fallback as steering (architecture-agnostic).
+  from every decoder layer, discovered structurally with the same
+  class-name-list fallback as steering (architecture-agnostic).
 - ``router_logits``: MoE router logits, captured by a forward hook on
   each MoE block's gate/router submodule (works for any architecture
   whose experts run on vLLM's fused-MoE stack — no per-model class list
@@ -21,6 +21,15 @@ covers the common probing/diffmean workflows.
 
 Storage appends one CPU chunk per forward step and concatenates at fetch
 time; there is no batch-boundary heuristic.
+
+Relation to upstream: vLLM's ``extract_hidden_states`` speculative
+method (with a hidden-states KV connector) also extracts per-layer
+hidden states, computed identically (hidden + residual, see
+``SupportsEagle3._maybe_add_hidden_state``) — so values from the two
+mechanisms are directly comparable. Prefer that path for bulk offline
+extraction over a fixed layer set; this session is for interactive use:
+runtime enable/disable, arbitrary layer subsets with no graph change,
+reductions/budgets, and router logits (which upstream does not capture).
 """
 
 import threading
@@ -124,7 +133,7 @@ def _sample_reduce(tensor: torch.Tensor, mode: str) -> torch.Tensor:
     if mode == "all":
         return tensor
     from vllm.forward_context import get_forward_context
-    from vllm.steer_vectors.algorithms.utils import extract_samples_info
+    from vllm.steer_vectors.discovery import extract_samples_info
 
     ctx = get_forward_context()
     samples_info = (
@@ -172,14 +181,14 @@ class CaptureSession:
         self._attached = True
 
     def _attach_hidden_hooks(self, model: nn.Module) -> None:
-        from vllm.steer_vectors.config import SUPPORTED_DECODER_LAYERS
-        from vllm.steer_vectors.layers import (
-            _extract_hidden_states_and_residual,
+        from vllm.steer_vectors.discovery import (
+            SUPPORTED_DECODER_LAYERS,
             extract_layer_id_from_module_name,
+            find_decoder_layers,
+            split_decoder_output,
         )
-        from vllm.steer_vectors.models import find_decoder_layers_structurally
 
-        matches = find_decoder_layers_structurally(model)
+        matches = find_decoder_layers(model)
         if not matches:
             matches = {
                 name: module
@@ -200,7 +209,7 @@ class CaptureSession:
                 store = self._streams[HIDDEN_STATES]
                 if store is None or not store.wants_layer(_lid):
                     return
-                hidden, residual, _, _ = _extract_hidden_states_and_residual(output)
+                hidden, residual, _, _ = split_decoder_output(output)
                 if not isinstance(hidden, torch.Tensor):
                     return
                 complete = hidden + residual if residual is not None else hidden
@@ -219,17 +228,15 @@ class CaptureSession:
             )
 
     def _attach_gate_hooks(self, model: nn.Module) -> None:
-        from vllm.steer_vectors.layers import (
+        from vllm.steer_vectors.discovery import (
             extract_gate_logits,
             extract_layer_id_from_module_name,
-        )
-        from vllm.steer_vectors.models import (
-            find_moe_blocks_structurally,
+            find_moe_blocks,
             find_moe_gate,
             moe_gate_is_fused,
         )
 
-        blocks = find_moe_blocks_structurally(model)
+        blocks = find_moe_blocks(model)
         fallback_id = 0
         for name, block in blocks.items():
             gate = find_moe_gate(block)

@@ -9,7 +9,7 @@ class BaseSteerVectorAlgorithm(ABC):
 
     This class defines the core interface that all algorithm implementations must
     follow.
-    Parameter management is handled by InterventionController in parameter_control.py,
+    Parameter management is handled by TriggerController in triggers.py,
     allowing algorithm developers to focus purely on transformation logic.
     """
 

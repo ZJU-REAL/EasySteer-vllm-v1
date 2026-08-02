@@ -1,24 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""
-Parameter-driven intervention control for steer vector algorithms.
+"""Trigger state and position matching for steering algorithms.
 
-This module provides:
-1. InterventionController class - Manages all intervention parameters
-2. GPU-optimized functions - Determine WHERE to apply interventions based on parameters
+`TriggerController` holds the parameters that decide WHERE a vector
+applies (trigger tokens/positions, exclusions, first-k/after-k); the
+GPU batch functions turn them into token positions for the current
+step. Algorithms stay pure transformations over the positions computed
+here.
 """
 
 import torch
 
 
-class InterventionController:
-    """
-    Centralized controller for intervention parameters.
+class TriggerController:
+    """Holds one intervention's trigger parameters.
 
-    Manages all parameters that control WHERE interventions are applied,
-    including trigger tokens, positions, exclusion rules, and debug settings.
-
-    This class decouples parameter management from algorithm implementation,
-    allowing algorithm developers to focus only on transformation logic.
+    Decouples where-to-apply state from algorithm implementation:
+    trigger tokens, positions, exclusion rules, and debug settings.
     """
 
     def __init__(self):

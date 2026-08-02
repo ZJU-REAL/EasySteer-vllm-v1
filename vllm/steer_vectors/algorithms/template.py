@@ -5,8 +5,8 @@ from typing import Any
 import torch
 
 from .base import BaseSteerVectorAlgorithm
-from .parameter_control import InterventionController
-from .utils import extract_samples_info
+from .triggers import TriggerController
+from vllm.steer_vectors.discovery import extract_samples_info
 
 # Import forward context to get current token information
 try:
@@ -27,14 +27,14 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
     3. _transform(): Core transformation logic
 
     Parameter management (triggers, exclusions, etc.) is handled by
-    InterventionController,
+    TriggerController,
     completely decoupled from algorithm logic.
     """
 
     def __init__(self, layer_id: int | None = None, normalize: bool = False, **kwargs):
         super().__init__(layer_id)
         # Intervention parameters - directly exposed for clean access
-        self.params = InterventionController()
+        self.params = TriggerController()
 
         # Payload of any type (Tensor, dict, ...); format is defined by
         # the algorithm's load_from_path and consumed by _transform.

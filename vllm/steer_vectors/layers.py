@@ -4,10 +4,14 @@ import torch
 from torch import nn
 
 from vllm.steer_vectors import trace
+from vllm.steer_vectors.discovery import (
+    extract_gate_logits,
+    reconstruct_decoder_output,
+    split_decoder_output,
+)
 
 from .algorithms import create_algorithm
 
-# Import forward context to get current token information
 try:
     from vllm.forward_context import get_forward_context
 except ImportError:
@@ -16,125 +20,6 @@ except ImportError:
 # Sentinel for lazily-fetched forward-context info (None is a valid
 # "unavailable" fetch result).
 _CTX_UNSET = object()
-
-
-def extract_layer_id_from_module_name(module_name: str) -> int | None:
-    """
-    Extract layer ID from module name.
-
-    Args:
-        module_name: Module name like 'model.layers.0' or 'transformer.h.12'
-
-    Returns:
-        Layer ID as integer, or None if not found
-
-    Examples:
-        'model.layers.0' -> 0
-        'transformer.h.12' -> 12
-        'model.embed_tokens' -> None
-    """
-    parts = module_name.split(".")
-    for part in parts:
-        if part.isdigit():
-            return int(part)
-    return None
-
-
-class BaseLayerWithSteerVector(nn.Module):
-    pass
-
-
-def _extract_hidden_states_and_residual(output):
-    """
-    Extract hidden_states and residual from DecoderLayer output.
-
-    Args:
-        output: DecoderLayer output, possible formats:
-               - (hidden_states, residual)  # Qwen2 and similar models
-               - hidden_states              # Phi and similar models
-               - tuple with more elements   # Other possible formats
-
-    Returns:
-        (hidden_states, residual, other_outputs, original_format)
-    """
-    if isinstance(output, tuple):
-        if len(output) == 2:
-            # Assume (hidden_states, residual) format
-            hidden_states, residual = output
-            if (
-                isinstance(hidden_states, torch.Tensor)
-                and isinstance(residual, torch.Tensor)
-                and hidden_states.shape == residual.shape
-            ):
-                return hidden_states, residual, None, "tuple_2"
-            else:
-                # If shapes don't match, may not be (hidden_states, residual) format
-                return output[0], None, output[1:], "tuple_other"
-        elif len(output) > 2:
-            # More complex tuple, assume first element is hidden_states
-            return output[0], None, output[1:], "tuple_multi"
-        else:
-            # Single-element tuple
-            return output[0], None, None, "tuple_1"
-    elif isinstance(output, torch.Tensor):
-        # Direct tensor output, e.g., Phi models
-        return output, None, None, "tensor"
-    else:
-        # Other formats, try to extract from attributes
-        if hasattr(output, "hidden_states"):
-            hidden_states = output.hidden_states
-            residual = getattr(output, "residual", None)
-            return hidden_states, residual, output, "object"
-        else:
-            # Unrecognized format, return original output
-            return output, None, None, "unknown"
-
-
-def _reconstruct_output(
-    modified_hidden_states, residual, other_outputs, original_format, original_output
-):
-    """
-    Reconstruct output based on original format.
-
-    Args:
-        modified_hidden_states: Modified hidden_states
-        residual: Residual (if any)
-        other_outputs: Other output elements
-        original_format: Original format identifier
-        original_output: Original output (for reconstructing complex objects)
-
-    Returns:
-        Reconstructed output
-    """
-    if original_format == "tuple_2":
-        return (modified_hidden_states, residual)
-    elif original_format == "tuple_other":
-        return (modified_hidden_states,) + other_outputs
-    elif original_format == "tuple_multi":
-        return (modified_hidden_states,) + other_outputs
-    elif original_format == "tuple_1":
-        return (modified_hidden_states,)
-    elif original_format == "tensor":
-        return modified_hidden_states
-    elif original_format == "object":
-        # For object format, modify the corresponding attribute
-        if hasattr(original_output, "hidden_states"):
-            original_output.hidden_states = modified_hidden_states
-        return original_output
-    else:
-        # Unknown format, return modified hidden_states
-        return modified_hidden_states
-
-
-def extract_gate_logits(output):
-    """Pull the router-logits tensor out of a gate module's output.
-
-    vLLM linear layers typically return (logits, bias); some models
-    return a bare tensor.
-    """
-    if isinstance(output, tuple):
-        output = output[0]
-    return output if isinstance(output, torch.Tensor) else None
 
 
 def _resolve_conflicts(collected, mode: str):
@@ -173,7 +58,7 @@ def _resolve_conflicts(collected, mode: str):
     return filtered
 
 
-class SlotRoutedSteerController(BaseLayerWithSteerVector):
+class SlotRoutedSteerController(nn.Module):
     """Shared slot-routing engine for steering controllers.
 
     Every routing slot holds an ordered list of interventions (a
@@ -365,8 +250,8 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
         if self._op_key is None:
             return output
 
-        hidden_states, residual, other_outputs, original_format = (
-            _extract_hidden_states_and_residual(output)
+        hidden_states, residual, other_outputs, original_format = split_decoder_output(
+            output
         )
         if residual is not None:
             complete_hidden_states = hidden_states + residual
@@ -388,14 +273,14 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
 
         if residual is not None:
             zero_residual = torch.zeros_like(residual)
-            return _reconstruct_output(
+            return reconstruct_decoder_output(
                 complete_hidden_states,
                 zero_residual,
                 other_outputs,
                 original_format,
                 output,
             )
-        return _reconstruct_output(
+        return reconstruct_decoder_output(
             complete_hidden_states, None, other_outputs, original_format, output
         )
 

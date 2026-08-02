@@ -40,7 +40,7 @@ STEER_MOE_FIELDS: tuple[str, ...] = (
     "moe_topk",
 )
 
-# Trigger fields holding token-id lists; the InterventionController
+# Trigger fields holding token-id lists; the TriggerController
 # stores these as sets for O(1) membership tests.
 STEER_TOKEN_SET_FIELDS: frozenset[str] = frozenset(
     ("prefill_trigger_tokens", "prefill_exclude_tokens", "generate_trigger_tokens")
@@ -189,7 +189,7 @@ class SteerVectorRequest(
     frozen=False,  # type: ignore[call-arg]
 ):  # type: ignore[call-arg]
     """
-    Request for a Steer Vector adapter.
+    Request to apply a steering configuration.
     Supports both single-vector mode (backward compatible) and multi-vector mode.
 
     Args:
@@ -353,7 +353,7 @@ class SteerVectorRequest(
         """
         Overrides the equality method to compare SteerVectorRequest
         instances based on steer_vector_name. This allows for identification
-        and comparison of steer vector adapters across engines.
+        and comparison of steering configurations across engines.
         """
         return (
             isinstance(value, self.__class__)

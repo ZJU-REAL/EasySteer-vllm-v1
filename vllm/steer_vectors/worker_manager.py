@@ -9,9 +9,9 @@ import torch
 from vllm.config import SteerVectorConfig
 from vllm.logger import init_logger
 from vllm.steer_vectors.models import (
-    SteerVectorModel,
-    SteerVectorModelManager,
-    create_sv_manager,
+    LoadedSteerVector,
+    SteerControllerManager,
+    create_steer_controller_manager,
 )
 from vllm.steer_vectors.request import (
     STEER_APPLY_FIELDS,
@@ -68,16 +68,16 @@ class WorkerSteerVectorManager:
     Tier-1 full-graph buffers.
     """
 
-    _manager_cls: type[SteerVectorModelManager] = SteerVectorModelManager
+    _manager_cls: type[SteerControllerManager] = SteerControllerManager
 
     def __init__(
         self,
         device: torch.device,
         steer_vector_config: SteerVectorConfig,
-        steer_vector_model_cls: type[SteerVectorModel] = SteerVectorModel,
+        loaded_vector_cls: type[LoadedSteerVector] = LoadedSteerVector,
     ):
-        self._adapter_manager: SteerVectorModelManager | None = None
-        self._steer_vector_model_cls = steer_vector_model_cls
+        self._controller_manager: SteerControllerManager | None = None
+        self._loaded_vector_cls = loaded_vector_cls
         self.steer_vector_config = steer_vector_config
         self.device = device
         from vllm.steer_vectors.store import VectorStore
@@ -108,7 +108,7 @@ class WorkerSteerVectorManager:
 
     def _init_graph_tables(self) -> None:
         """Allocate Tier-1 buffers on every decoder controller."""
-        assert self._adapter_manager is not None
+        assert self._controller_manager is not None
         assert self._graph_params is not None, (
             "steer graph_mode=full requires enable_graph_mode() before model wrap"
         )
@@ -119,7 +119,7 @@ class WorkerSteerVectorManager:
             max_num_tokens, dtype=torch.long, device=self.device
         )
         capacity = self.steer_vector_config.max_steer_vectors
-        for module in self._adapter_manager.modules.values():
+        for module in self._controller_manager.modules.values():
             if isinstance(module, DecoderLayerWithSteerVector):
                 module.init_graph_table(
                     capacity,
@@ -174,10 +174,10 @@ class WorkerSteerVectorManager:
             )
 
     def _distribute_graph_config(
-        self, slot: int, model: SteerVectorModel, request: SteerVectorRequest
+        self, slot: int, model: LoadedSteerVector, request: SteerVectorRequest
     ) -> None:
         """Write a config's scaled payload into per-layer vector tables."""
-        assert self._adapter_manager is not None
+        assert self._controller_manager is not None
         if not self._free_rows:
             raise RuntimeError(
                 f"No free steering rows (capacity "
@@ -189,7 +189,7 @@ class WorkerSteerVectorManager:
         for layer_idx, payload in (model.layer_payloads or {}).items():
             if target_layers and layer_idx not in target_layers:
                 continue
-            for module in self._adapter_manager._get_modules_for_layer(
+            for module in self._controller_manager._get_modules_for_layer(
                 layer_idx, "decoder_layer"
             ):
                 module.set_graph_row(row, payload * request.scale)
@@ -266,8 +266,8 @@ class WorkerSteerVectorManager:
         del self._config_slots[fp]
         if slot in self._slot_rows:
             self._release_graph_config(slot)
-        elif self._adapter_manager is not None:
-            for module in self._adapter_manager.modules.values():
+        elif self._controller_manager is not None:
+            for module in self._controller_manager.modules.values():
                 module.reset_steer_vector(slot)
         self._free_slots.append(slot)
 
@@ -279,7 +279,7 @@ class WorkerSteerVectorManager:
         return None if entry is None else entry[0]
 
     def _distribute_config(
-        self, slot: int, model: SteerVectorModel, request: SteerVectorRequest
+        self, slot: int, model: LoadedSteerVector, request: SteerVectorRequest
     ) -> None:
         """Configure a single-vector request as a one-intervention slot."""
         fields = {**steer_params_dict(request), "debug": request.debug}
@@ -305,10 +305,10 @@ class WorkerSteerVectorManager:
         slot: int,
         specs: list,
         conflict_resolution: str,
-        wrapper_type: str = "decoder_layer",
+        controller_type: str = "decoder_layer",
     ) -> None:
         """Write an ordered intervention list into each targeted layer."""
-        assert self._adapter_manager is not None
+        assert self._controller_manager is not None
         layer_ids: set[int] = set()
         for fields, payloads in specs:
             tl = fields.get("target_layers")
@@ -327,12 +327,12 @@ class WorkerSteerVectorManager:
                 layer_specs.append({**fields, "payload": payload})
             if not layer_specs:
                 continue
-            for module in self._adapter_manager._get_modules_for_layer(
-                layer_idx, wrapper_type
+            for module in self._controller_manager._get_modules_for_layer(
+                layer_idx, controller_type
             ):
                 module.configure_slot(slot, layer_specs, conflict_resolution)
 
-    def _build_moe_model(self, request: SteerVectorRequest) -> SteerVectorModel:
+    def _build_moe_model(self, request: SteerVectorRequest) -> LoadedSteerVector:
         if not request.local_path:
             if request.moe_expert_ids is None:
                 raise ValueError(
@@ -349,13 +349,13 @@ class WorkerSteerVectorManager:
                 if moe_mode == "soft":
                     payload["lambda"] = request.moe_lambda
                 layer_payloads[layer_id] = payload
-            return self._steer_vector_model_cls(
+            return self._loaded_vector_cls(
                 steer_vector_id=request.steer_vector_id,
                 layer_payloads=layer_payloads,
                 scale_factor=1.0,
                 algorithm="moe_router",
             )
-        return self._steer_vector_model_cls.from_local_checkpoint(
+        return self._loaded_vector_cls.from_local_checkpoint(
             steer_vector_model_path=request.local_path,
             steer_vector_id=request.steer_vector_id,
             config=self.steer_vector_config,
@@ -377,7 +377,7 @@ class WorkerSteerVectorManager:
             slot,
             [(fields, model.layer_payloads or {})],
             "priority",
-            wrapper_type="moe_layer",
+            controller_type="moe_layer",
         )
 
     # ------------------------------------------------------------------
@@ -420,12 +420,12 @@ class WorkerSteerVectorManager:
         model: torch.nn.Module,
     ) -> Any:
         """Create and initialize the steer vector manager for the model."""
-        steer_vector_manager = create_sv_manager(
+        steer_vector_manager = create_steer_controller_manager(
             model,
             steer_vector_config=self.steer_vector_config,
             steer_vector_manager_cls=self._manager_cls,
         )
-        self._adapter_manager = steer_vector_manager
+        self._controller_manager = steer_vector_manager
         if self._graph_full:
             self._init_graph_tables()
         return steer_vector_manager.model

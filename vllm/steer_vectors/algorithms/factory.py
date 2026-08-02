@@ -1,17 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Registry and factory for steering algorithms."""
 
-# Forward declaration to avoid circular imports
-class BaseSteerVectorAlgorithm:
-    pass
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from .base import BaseSteerVectorAlgorithm
 
-# Global algorithm registry
 ALGORITHM_REGISTRY: dict[str, type["BaseSteerVectorAlgorithm"]] = {}
 
 
 def register_algorithm(name: str):
-    """
-    Decorator for registering algorithm classes to the global registry.
+    """Class decorator registering an algorithm under a unique name.
 
     Args:
         name: Unique name of the algorithm (e.g., "direct", "loreft").
@@ -19,8 +18,6 @@ def register_algorithm(name: str):
 
     def decorator(cls: type["BaseSteerVectorAlgorithm"]):
         if name in ALGORITHM_REGISTRY:
-            # In practice, can be changed to a more lenient strategy, e.g.,
-            # logging.warning
             raise ValueError(f"Algorithm '{name}' is already registered.")
         ALGORITHM_REGISTRY[name] = cls
         return cls
@@ -29,15 +26,7 @@ def register_algorithm(name: str):
 
 
 def create_algorithm(name: str, *args, **kwargs) -> "BaseSteerVectorAlgorithm":
-    """
-    Algorithm factory function that creates algorithm instances by name.
-
-    Args:
-        name: Name of the algorithm to create.
-        *args, **kwargs: Arguments passed to the algorithm constructor.
-
-    Returns:
-        An instance of BaseSteerVectorAlgorithm.
+    """Create an algorithm instance by registered name.
 
     Raises:
         ValueError: If the algorithm name is not registered.
@@ -47,12 +36,4 @@ def create_algorithm(name: str, *args, **kwargs) -> "BaseSteerVectorAlgorithm":
             f"Unknown algorithm: '{name}'. Available algorithms: "
             f"{list(ALGORITHM_REGISTRY.keys())}"
         )
-
-    # Import the actual definition of BaseSteerVectorAlgorithm
-    from .base import BaseSteerVectorAlgorithm as ConcreteBase
-
-    cls = ALGORITHM_REGISTRY[name]
-
-    # Ensure the returned instance type is correct
-    instance: ConcreteBase = cls(*args, **kwargs)
-    return instance
+    return ALGORITHM_REGISTRY[name](*args, **kwargs)

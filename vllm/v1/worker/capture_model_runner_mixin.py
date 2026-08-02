@@ -2,18 +2,18 @@
 """Model-runner mixin exposing hook-based capture (hidden states, MoE
 router logits) over collective_rpc.
 
-The capture mechanism lives in vllm.hidden_states.capture.CaptureSession;
+The capture mechanism lives in vllm.capture.session.CaptureSession;
 this mixin owns one session per worker, attaches its hooks at model load
 (eager engines only — hooks cannot run inside compiled graphs), and
 exposes stream lifecycle RPCs. The legacy per-feature RPC names are kept
 as thin shims over the stream API for existing easysteer clients.
 """
 
-from typing import Any, Dict
+from typing import Any
 
 from torch import nn
 
-from vllm.hidden_states.capture import (
+from vllm.capture.session import (
     HIDDEN_STATES,
     ROUTER_LOGITS,
     CaptureSession,
@@ -31,11 +31,11 @@ class CaptureModelRunnerMixin:
             self.capture_session = CaptureSession()
         return self.capture_session
 
-    def _wrap_model_for_capture(self, model: nn.Module) -> nn.Module:
+    def _attach_capture_hooks(self, model: nn.Module) -> nn.Module:
         """Attach capture hooks (once, at load). Model tree is untouched.
 
-        Must run after the steering wrap so gate-hook ordering makes
-        captured router logits post-steering.
+        Must run after the steering hooks are registered so gate-hook
+        ordering makes captured router logits post-steering.
         """
         session = self._capture_session()
         enforce_eager = (
@@ -52,13 +52,13 @@ class CaptureModelRunnerMixin:
         session.attach(model)
         return model
 
-    # Legacy wrap entry points (V1 runner calls both; attach() is
+    # Legacy attach entry points (V1 runner calls both; attach() is
     # idempotent and covers both streams).
     def _wrap_model_for_hidden_states(self, model: nn.Module) -> nn.Module:
-        return self._wrap_model_for_capture(model)
+        return self._attach_capture_hooks(model)
 
     def _wrap_model_for_moe_capture(self, model: nn.Module) -> nn.Module:
-        return self._wrap_model_for_capture(model)
+        return self._attach_capture_hooks(model)
 
     # ------------------------------------------------------------------
     # Stream API
@@ -79,10 +79,10 @@ class CaptureModelRunnerMixin:
 
     def fetch_captured(
         self, stream: str, clear: bool = True
-    ) -> Dict[int, Dict[str, Any]]:
+    ) -> dict[int, dict[str, Any]]:
         return self._capture_session().fetch_stream(stream, clear=clear)
 
-    def capture_status(self, stream: str) -> Dict[str, Any]:
+    def capture_status(self, stream: str) -> dict[str, Any]:
         return self._capture_session().stream_status(stream)
 
     # ------------------------------------------------------------------
@@ -95,14 +95,13 @@ class CaptureModelRunnerMixin:
     def disable_hidden_states_capture(self):
         self._capture_session().disable_stream(HIDDEN_STATES)
 
-    def get_captured_hidden_states(self) -> Dict[int, Dict[str, Any]]:
-        return self._capture_session().fetch_stream(
-            HIDDEN_STATES, clear=False)
+    def get_captured_hidden_states(self) -> dict[int, dict[str, Any]]:
+        return self._capture_session().fetch_stream(HIDDEN_STATES, clear=False)
 
     def clear_hidden_states(self):
         self._capture_session().clear_stream(HIDDEN_STATES)
 
-    def get_hidden_states_debug_info(self) -> Dict[str, Any]:
+    def get_hidden_states_debug_info(self) -> dict[str, Any]:
         return self._capture_session().stream_status(HIDDEN_STATES)
 
     def enable_moe_router_logits_capture(self, **config_kwargs):
@@ -111,17 +110,16 @@ class CaptureModelRunnerMixin:
     def disable_moe_router_logits_capture(self):
         self._capture_session().disable_stream(ROUTER_LOGITS)
 
-    def get_moe_router_logits(self) -> Dict[int, Dict[str, Any]]:
-        return self._capture_session().fetch_stream(
-            ROUTER_LOGITS, clear=False)
+    def get_moe_router_logits(self) -> dict[int, dict[str, Any]]:
+        return self._capture_session().fetch_stream(ROUTER_LOGITS, clear=False)
 
     def clear_moe_router_logits(self):
         self._capture_session().clear_stream(ROUTER_LOGITS)
 
-    def get_moe_debug_info(self) -> Dict[str, Any]:
+    def get_moe_debug_info(self) -> dict[str, Any]:
         return self._capture_session().stream_status(ROUTER_LOGITS)
 
-    def get_all_capture_status(self) -> Dict[str, Any]:
+    def get_all_capture_status(self) -> dict[str, Any]:
         session = self._capture_session()
         return {
             HIDDEN_STATES: session.stream_status(HIDDEN_STATES),

@@ -15,7 +15,7 @@ from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import SteerVectorConfig
-    from vllm.steer_vectors.models import SteerVectorModel
+    from vllm.steer_vectors.models import LoadedSteerVector
 
 logger = init_logger(__name__)
 
@@ -49,12 +49,12 @@ class VectorStore:
         self.device = device
         self.steer_vector_config = steer_vector_config
         self.capacity = max(1, steer_vector_config.max_steer_vectors)
-        self._entries: OrderedDict[tuple, SteerVectorModel] = OrderedDict()
+        self._entries: OrderedDict[tuple, LoadedSteerVector] = OrderedDict()
         self._warned_lazy: set[str] = set()
 
     def get(
         self, path: str, algorithm: str, *, lazy: bool = False
-    ) -> "SteerVectorModel":
+    ) -> "LoadedSteerVector":
         """Return the loaded entry for the file's current version, loading
         if needed.
 
@@ -83,9 +83,9 @@ class VectorStore:
                 path,
             )
 
-        from vllm.steer_vectors.models import SteerVectorModel
+        from vllm.steer_vectors.models import LoadedSteerVector
 
-        entry = SteerVectorModel.from_local_checkpoint(
+        entry = LoadedSteerVector.from_local_checkpoint(
             steer_vector_model_path=path,
             steer_vector_id=0,
             config=self.steer_vector_config,

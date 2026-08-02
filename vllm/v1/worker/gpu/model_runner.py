@@ -309,7 +309,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin,
             # Attach capture hooks (hidden states / router logits);
             # after the steering wrap so captured logits are
             # post-steering. Eager engines only.
-            self.model = self._wrap_model_for_capture(self.model)
+            self.model = self._attach_capture_hooks(self.model)
 
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None

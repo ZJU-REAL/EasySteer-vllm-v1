@@ -133,8 +133,8 @@ def fill_graph_steer_buffers(
     right configs without any per-step graph work; row 0 / mask 0 keep
     unsteered and padding tokens untouched.
     """
-    from vllm.steer_vectors.algorithms.parameter_control import (
-        InterventionController,
+    from vllm.steer_vectors.algorithms.triggers import (
+        TriggerController,
     )
 
     manager.zero_graph_masks()
@@ -198,7 +198,7 @@ def fill_graph_steer_buffers(
     for slot, (row, request, controllers) in entries.items():
         if slot not in batch_slots:
             continue
-        ctrl = InterventionController()
+        ctrl = TriggerController()
         ctrl.configure_from_dict(steer_params_dict(request))
         if ctrl.is_global_only_config():
             positions = (token_slots == slot).nonzero(
