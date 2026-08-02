@@ -66,13 +66,14 @@ logger = init_logger(__name__)
 
 
 def _resolve_steering(
-    steering: Sequence[SteeringSpec] | SteeringSpec | None,
+    steering: "Sequence[SteeringSpec | None] | SteeringSpec | None",
     steer_vector_request: Sequence[SteerVectorRequest] | SteerVectorRequest | None,
 ) -> Sequence[SteerVectorRequest] | SteerVectorRequest | None:
     """Translate the v2 `steering` argument into engine requests.
 
-    Rejects mixing with the deprecated `steer_vector_request` argument
-    and warns when only the deprecated form is used.
+    A sequence pairs one spec per prompt; None entries leave that prompt
+    unsteered. Rejects mixing with the deprecated `steer_vector_request`
+    argument and warns when only the deprecated form is used.
     """
     if steering is not None and steer_vector_request is not None:
         raise ValueError(
@@ -82,7 +83,10 @@ def _resolve_steering(
     if steering is not None:
         if isinstance(steering, SteeringSpec):
             return to_engine_request(steering)
-        return [to_engine_request(spec) for spec in steering]
+        return [
+            to_engine_request(spec) if spec is not None else None
+            for spec in steering
+        ]
     if steer_vector_request is not None:
         logger.warning_once(
             "steer_vector_request is deprecated; use "
@@ -443,7 +447,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         *,
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
-        steering: "Sequence[SteeringSpec] | SteeringSpec | None" = None,
+        steering: "Sequence[SteeringSpec | None] | SteeringSpec | None" = None,
         steer_vector_request: Sequence[SteerVectorRequest] | SteerVectorRequest | None = None,
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -515,7 +519,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         prompts: PromptType | Sequence[PromptType],
         sampling_params: SamplingParams | Sequence[SamplingParams] | None = None,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
-        steering: Sequence[SteeringSpec] | SteeringSpec | None = None,
+        steering: "Sequence[SteeringSpec | None] | SteeringSpec | None" = None,
         steer_vector_request: Sequence[SteerVectorRequest] | SteerVectorRequest | None = None,
         priority: list[int] | None = None,
         use_tqdm: bool | Callable[..., tqdm] = True,
