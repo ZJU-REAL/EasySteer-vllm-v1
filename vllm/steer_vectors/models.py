@@ -109,44 +109,34 @@ class LoadedSteerVector:
         Returns:
             Loaded LoadedSteerVector instance
         """
-        try:
-            # An algorithm can be embedded in the path ("path/to/vector|linear").
-            if "|" in steer_vector_model_path:
-                steer_vector_model_path, path_algorithm = steer_vector_model_path.split(
-                    "|", 1
-                )
-                algorithm = path_algorithm
+        # An algorithm can be embedded in the path ("path/to/vector|linear").
+        if "|" in steer_vector_model_path:
+            steer_vector_model_path, algorithm = steer_vector_model_path.split("|", 1)
 
-            if os.path.exists(steer_vector_model_path):
-                file_path = os.path.abspath(steer_vector_model_path)
-            else:
-                parts = steer_vector_model_path.split("/")
-                repo_id = "/".join(parts[:2])
-                file_name = "/".join(parts[2:])
-                file_path = hf_hub_download(
-                    repo_id=repo_id, filename=file_name, revision="main"
-                )
-
-            if algorithm not in ALGORITHM_REGISTRY:
-                raise ValueError(f"Unsupported algorithm for loading: '{algorithm}'")
-
-            algo_class = ALGORITHM_REGISTRY[algorithm]
-            loaded_params = algo_class.load_from_path(
-                file_path, device, config=config, target_layers=target_layers, **kwargs
+        if os.path.exists(steer_vector_model_path):
+            file_path = os.path.abspath(steer_vector_model_path)
+        else:
+            parts = steer_vector_model_path.split("/")
+            repo_id = "/".join(parts[:2])
+            file_name = "/".join(parts[2:])
+            file_path = hf_hub_download(
+                repo_id=repo_id, filename=file_name, revision="main"
             )
 
-            return cls(
-                steer_vector_id=steer_vector_id,
-                layer_payloads=loaded_params.get("layer_payloads"),
-                scale_factor=scale_factor,
-                algorithm=algorithm,
-            )
+        if algorithm not in ALGORITHM_REGISTRY:
+            raise ValueError(f"Unsupported algorithm for loading: '{algorithm}'")
 
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load steer vector from {steer_vector_model_path} "
-                f"with algorithm '{algorithm}'"
-            ) from e
+        algo_class = ALGORITHM_REGISTRY[algorithm]
+        loaded_params = algo_class.load_from_path(
+            file_path, device, config=config, target_layers=target_layers, **kwargs
+        )
+
+        return cls(
+            steer_vector_id=steer_vector_id,
+            layer_payloads=loaded_params.get("layer_payloads"),
+            scale_factor=scale_factor,
+            algorithm=algorithm,
+        )
 
 
 class SteerControllerManager:

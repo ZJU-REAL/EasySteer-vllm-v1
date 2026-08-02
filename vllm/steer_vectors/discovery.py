@@ -389,6 +389,26 @@ def extract_samples_info(attn_metadata) -> dict[str, torch.Tensor] | None:
     }
 
 
+def _forward_context_or_none():
+    """The current ForwardContext, or None outside a forward pass."""
+    if get_forward_context is None:
+        return None
+    try:
+        return get_forward_context()
+    except AssertionError:
+        # get_forward_context asserts when no context is set.
+        return None
+
+
+def _attn_metadata_field(attn_metadata, field: str):
+    """Read a field from per-layer attention metadata (dict or object)."""
+    if isinstance(attn_metadata, dict):
+        if not attn_metadata:
+            return None
+        attn_metadata = next(iter(attn_metadata.values()))
+    return getattr(attn_metadata, field, None)
+
+
 def get_query_start_loc(attn_metadata) -> torch.Tensor | None:
     """Extract query_start_loc (sample boundary offsets).
 
@@ -397,56 +417,23 @@ def get_query_start_loc(attn_metadata) -> torch.Tensor | None:
     Fallback: read from per-layer attention metadata (only works for
     backends that store query_start_loc directly, e.g. FlashAttn).
     """
-    try:
-        if get_forward_context is not None:
-            forward_ctx = get_forward_context()
-            if forward_ctx is not None and forward_ctx.query_start_loc is not None:
-                return forward_ctx.query_start_loc
-    except Exception:
-        pass
-
-    if isinstance(attn_metadata, dict):
-        if attn_metadata:
-            first_layer_metadata = next(iter(attn_metadata.values()))
-            return getattr(first_layer_metadata, "query_start_loc", None)
-    else:
-        return getattr(attn_metadata, "query_start_loc", None)
-    return None
+    ctx = _forward_context_or_none()
+    if ctx is not None and ctx.query_start_loc is not None:
+        return ctx.query_start_loc
+    return _attn_metadata_field(attn_metadata, "query_start_loc")
 
 
 def get_num_computed_tokens(attn_metadata) -> torch.Tensor | None:
     """Extract num_computed_tokens_cpu for prefix cache support."""
-    try:
-        if get_forward_context is None:
-            return None
-        forward_context = get_forward_context()
-        return forward_context.num_computed_tokens_cpu
-    except Exception:
-        if isinstance(attn_metadata, dict) and attn_metadata:
-            first_layer_metadata = next(iter(attn_metadata.values()))
-            return getattr(first_layer_metadata, "num_computed_tokens_cpu", None)
-        else:
-            return (
-                getattr(attn_metadata, "num_computed_tokens_cpu", None)
-                if attn_metadata
-                else None
-            )
+    ctx = _forward_context_or_none()
+    if ctx is not None:
+        return ctx.num_computed_tokens_cpu
+    return _attn_metadata_field(attn_metadata, "num_computed_tokens_cpu")
 
 
 def get_num_output_tokens(attn_metadata) -> torch.Tensor | None:
     """Extract num_output_tokens_cpu for generation position control."""
-    try:
-        if get_forward_context is None:
-            return None
-        forward_context = get_forward_context()
-        return forward_context.num_output_tokens_cpu
-    except Exception:
-        if isinstance(attn_metadata, dict) and attn_metadata:
-            first_layer_metadata = next(iter(attn_metadata.values()))
-            return getattr(first_layer_metadata, "num_output_tokens_cpu", None)
-        else:
-            return (
-                getattr(attn_metadata, "num_output_tokens_cpu", None)
-                if attn_metadata
-                else None
-            )
+    ctx = _forward_context_or_none()
+    if ctx is not None:
+        return ctx.num_output_tokens_cpu
+    return _attn_metadata_field(attn_metadata, "num_output_tokens_cpu")

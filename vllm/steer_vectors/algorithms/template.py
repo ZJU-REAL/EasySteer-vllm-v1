@@ -19,28 +19,25 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
     """
     Steer vector algorithm template class.
 
-    Provides a clean template for implementing new algorithms. Algorithm developers
-    only need to focus on 3 core methods:
-
-    1. _get_params(): Return algorithm parameters (vectors, matrices, etc.)
-    2. _is_valid(): Check if parameters are valid
-    3. _transform(): Core transformation logic
-
-    Parameter management (triggers, exclusions, etc.) is handled by
-    TriggerController,
-    completely decoupled from algorithm logic.
+    Algorithm implementations provide two methods: `_transform` (the
+    core math over selected token rows) and `load_from_path` (file
+    format -> per-layer payloads). Trigger state (where to apply) lives
+    in `self.triggers`, fully decoupled from the algorithm logic;
+    `_get_params`/`_is_valid` have sensible defaults and are rarely
+    overridden.
     """
 
     def __init__(self, layer_id: int | None = None, normalize: bool = False, **kwargs):
         super().__init__(layer_id)
-        # Intervention parameters - directly exposed for clean access
-        self.params = TriggerController()
+        self.triggers = TriggerController()
 
         # Payload of any type (Tensor, dict, ...); format is defined by
         # the algorithm's load_from_path and consumed by _transform.
         self._payload: Any | None = None
 
-        self.normalize = normalize  # Direct algorithm uses this
+        # Rescale transformed rows back to their original norm
+        # (see _renormalize); honored by the dense-vector algorithms.
+        self.normalize = normalize
 
     def set_payload(self, payload: Any, scale_factor: float = 1.0) -> None:
         """Store this intervention's payload.
@@ -80,12 +77,26 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
 
     @abstractmethod
     def _transform(self, hidden_state: torch.Tensor, params: Any) -> torch.Tensor:
-        """
-        Transform hidden state (MUST be implemented by subclass).
+        """Transform the selected token rows (the algorithm's core math).
 
-        This is the core logic of your algorithm - the only truly required method.
+        Args:
+            hidden_state: [num_positions, hidden_dim] selected rows
+            params: this intervention's payload (from _get_params)
         """
         pass
+
+    def _renormalize(
+        self, original: torch.Tensor, transformed: torch.Tensor
+    ) -> torch.Tensor:
+        """Rescale `transformed` rows to the norms of `original` rows.
+
+        Computed in float32: hidden-state norms can reach ~1e4, so the
+        intermediate product overflows float16 (max 65504).
+        """
+        norm_pre = torch.norm(original, dim=-1, keepdim=True).float()
+        norm_post = torch.norm(transformed, dim=-1, keepdim=True).float()
+        scaled = transformed.float() * norm_pre / (norm_post + 1e-8)
+        return scaled.to(original.dtype)
 
     def _get_forward_context_and_samples(self, hidden_states: torch.Tensor):
         """

@@ -115,7 +115,7 @@ class SlotRoutedSteerController(nn.Module):
             )
             scale = spec.get("scale")
             algo.set_payload(spec["payload"], 1.0 if scale is None else scale)
-            algo.params.configure_from_dict(spec)
+            algo.triggers.configure_from_dict(spec)
             entries.append(algo)
         self.slot_interventions[slot] = entries
         self.slot_conflict[slot] = conflict_resolution
@@ -150,9 +150,9 @@ class SlotRoutedSteerController(nn.Module):
                 params = algo._get_params()
                 if not algo._is_valid(params):
                     continue
-                if not algo.params.has_any_triggers():
+                if not algo.triggers.has_any_triggers():
                     continue
-                if algo.params.is_global_only_config():
+                if algo.triggers.is_global_only_config():
                     # All tokens of this slot's requests.
                     positions = (
                         (token_slots == slot).nonzero(as_tuple=False).squeeze(-1)
@@ -163,7 +163,7 @@ class SlotRoutedSteerController(nn.Module):
                     if ctx_info is None:
                         continue
                     _, samples_info, current_tokens = ctx_info
-                    positions = algo.params.collect_intervention_positions(
+                    positions = algo.triggers.collect_intervention_positions(
                         hidden_states=tensor,
                         current_tokens=current_tokens,
                         samples_info=samples_info,

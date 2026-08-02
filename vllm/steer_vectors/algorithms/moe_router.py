@@ -253,7 +253,15 @@ class MoERouterAlgorithm(AlgorithmTemplate):
         return scores
 
     @classmethod
-    def load_from_path(cls, path: str, device: str, **kwargs) -> dict:
+    def load_from_path(
+        cls,
+        path: str,
+        device: str,
+        *,
+        config=None,
+        target_layers: list[int] | None = None,
+        **kwargs,
+    ) -> dict:
         """
         Load MoE router intervention config from JSON file.
 
@@ -307,123 +315,103 @@ class MoERouterAlgorithm(AlgorithmTemplate):
         """
         import os
 
-        # Extract default parameters from kwargs (from SteerVectorRequest)
-        default_mode = kwargs.get("moe_mode", None)  # None means use JSON value
+        # Defaults from the SteerVectorRequest; a request-level moe_mode
+        # overrides the JSON per-layer modes.
+        default_mode = kwargs.get("moe_mode")
         default_lambda = kwargs.get("moe_lambda", 0.5)
         default_topk = kwargs.get("moe_topk", 8)
 
         if not os.path.exists(path):
             raise FileNotFoundError(f"MoE config file not found: {path}")
 
-        try:
-            with open(path) as f:
-                config = json.load(f)
+        with open(path) as f:
+            try:
+                moe_config = json.load(f)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Failed to parse MoE config {path}: {e}") from e
 
-            # Extract layer configurations
-            layer_configs = config.get("layer_configs", {})
+        layer_configs = moe_config.get("layer_configs", {})
+        layer_payloads = {}
+        for layer_str, params in layer_configs.items():
+            try:
+                layer_id = int(layer_str)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid layer id {layer_str!r} in MoE config {path}"
+                ) from None
 
-            # Convert string keys to int and validate
-            layer_payloads = {}
-            for layer_str, params in layer_configs.items():
-                try:
-                    layer_id = int(layer_str)
+            # Mode priority: request moe_mode > JSON > 'activate'.
+            mode = (
+                default_mode
+                if default_mode is not None
+                else params.get("mode", "activate")
+            )
+            canonical = cls.MODE_ALIASES.get(mode, mode)
+            if canonical not in (
+                "activate",
+                "deactivate",
+                "soft",
+                "soft_topk",
+                "soft_random",
+            ):
+                raise ValueError(
+                    f"Layer {layer_id}: unknown MoE mode {mode!r} (must be "
+                    "'activate', 'deactivate', 'soft', 'soft_topk' or "
+                    "'soft_random', or a deprecated alias)"
+                )
 
-                    # Set mode: SteerVectorRequest > JSON > default 'activate'
-                    # Priority: 1. default_mode from request (if specified)
-                    #           2. mode from JSON file
-                    #           3. fallback to 'activate'
-                    if default_mode is not None:
-                        mode = default_mode
-                        logger.info(
-                            "Layer %d: Using mode=%s from SteerVectorRequest",
-                            layer_id,
-                            mode,
-                        )
-                    else:
-                        mode = params.get("mode", "activate")
-                    canonical = cls.MODE_ALIASES.get(mode, mode)
+            if canonical in ("activate", "deactivate"):
+                if not (
+                    params.get("expert_ids")
+                    or params.get("activate_ids")
+                    or params.get("deactivate_ids")
+                ):
+                    raise ValueError(
+                        f"Layer {layer_id} {mode} config has no expert ids "
+                        "('expert_ids', 'activate_ids' or 'deactivate_ids')"
+                    )
+            elif "expert_ids" not in params:
+                raise ValueError(f"Layer {layer_id} is missing 'expert_ids'")
 
-                    # Validate required fields
-                    if canonical in ("activate", "deactivate"):
-                        if not (
-                            params.get("expert_ids")
-                            or params.get("activate_ids")
-                            or params.get("deactivate_ids")
-                        ):
-                            logger.warning(
-                                "Layer %d %s config has no expert ids "
-                                "('expert_ids', 'activate_ids' or "
-                                "'deactivate_ids'), skipping",
-                                layer_id,
-                                mode,
-                            )
-                            continue
-                    elif "expert_ids" not in params:
-                        logger.warning(
-                            "Layer %d missing 'expert_ids', skipping",
-                            layer_id,
-                        )
-                        continue
+            intervention_params = {
+                "expert_ids": params.get("expert_ids", []),
+                "mode": mode,
+            }
 
-                    intervention_params = {
-                        "expert_ids": params.get("expert_ids", []),
-                        "mode": mode,
-                    }
+            if canonical in ("activate", "deactivate"):
+                intervention_params["activate_ids"] = params.get("activate_ids", [])
+                intervention_params["deactivate_ids"] = params.get("deactivate_ids", [])
+                if "epsilon" in params:
+                    intervention_params["epsilon"] = params["epsilon"]
 
-                    if canonical in ("activate", "deactivate"):
-                        intervention_params["activate_ids"] = params.get(
-                            "activate_ids", []
-                        )
-                        intervention_params["deactivate_ids"] = params.get(
-                            "deactivate_ids", []
-                        )
-                        if "epsilon" in params:
-                            intervention_params["epsilon"] = params["epsilon"]
+            # lambda/topk: JSON value wins, else the request-level default.
+            if "lambda" in params:
+                intervention_params["lambda"] = params["lambda"]
+            elif canonical in ("soft", "soft_topk", "soft_random"):
+                intervention_params["lambda"] = default_lambda
+                logger.debug(
+                    "Layer %d: using default lambda=%s for %s mode",
+                    layer_id,
+                    default_lambda,
+                    mode,
+                )
 
-                    # Add lambda parameter:
-                    # 1. If present in JSON, use JSON value
-                    # 2. Otherwise, if mode is 'soft', 'soft_topk', or 'soft_random',
-                    # use default_lambda from request
-                    if "lambda" in params:
-                        intervention_params["lambda"] = params["lambda"]
-                    elif mode in ["soft", "soft_topk", "soft_random"]:
-                        intervention_params["lambda"] = default_lambda
-                        logger.info(
-                            "Layer %d: Using default lambda=%s for %s mode",
-                            layer_id,
-                            default_lambda,
-                            mode,
-                        )
+            if "topk" in params:
+                intervention_params["topk"] = params["topk"]
+            elif canonical == "soft_topk":
+                intervention_params["topk"] = default_topk
+                logger.debug(
+                    "Layer %d: using default topk=%s for soft_topk mode",
+                    layer_id,
+                    default_topk,
+                )
 
-                    # Add topk parameter for soft_topk mode:
-                    # 1. If present in JSON, use JSON value
-                    # 2. Otherwise, if mode is 'soft_topk', use default_topk from
-                    # request
-                    if "topk" in params:
-                        intervention_params["topk"] = params["topk"]
-                    elif mode == "soft_topk":
-                        intervention_params["topk"] = default_topk
-                        logger.info(
-                            "Layer %d: Using default topk=%s for soft_topk mode",
-                            layer_id,
-                            default_topk,
-                        )
+            layer_payloads[layer_id] = intervention_params
 
-                    layer_payloads[layer_id] = intervention_params
+        if not layer_payloads:
+            raise ValueError(f"No layer configurations found in {path}")
 
-                except ValueError:
-                    logger.warning("Invalid layer ID: %s, skipping", layer_str)
-                    continue
-
-            if not layer_payloads:
-                raise ValueError(f"No valid layer configurations found in {path}")
-
-            return {"layer_payloads": layer_payloads}
-
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to parse JSON config: {e}") from e
-        except Exception as e:
-            raise ValueError(f"Failed to load MoE config: {e}") from e
+        return {"layer_payloads": layer_payloads}
 
     def _is_valid(self, params: Any) -> bool:
         """Check if intervention parameters are valid."""

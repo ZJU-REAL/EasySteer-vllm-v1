@@ -9,8 +9,9 @@ class BaseSteerVectorAlgorithm(ABC):
 
     This class defines the core interface that all algorithm implementations must
     follow.
-    Parameter management is handled by TriggerController in triggers.py,
-    allowing algorithm developers to focus purely on transformation logic.
+    Trigger management (where a vector applies) is handled by TriggerController in
+    triggers.py, allowing algorithm developers to focus purely on transformation
+    logic.
     """
 
     def __init__(self, layer_id: int | None = None):
@@ -24,9 +25,29 @@ class BaseSteerVectorAlgorithm(ABC):
 
     @classmethod
     @abstractmethod
-    def load_from_path(cls, path: str, device: str, **kwargs) -> dict[str, Any]:
-        """Load steer vector data from file path and return a dictionary containing "
-        "parameters."""
+    def load_from_path(
+        cls,
+        path: str,
+        device: str,
+        *,
+        config,
+        target_layers: list[int] | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Load steer vector data from a file path.
+
+        Args:
+            path: Vector file or directory path.
+            device: Device to load tensors on.
+            config: The engine's SteerVectorConfig.
+            target_layers: Optional layer restriction from the request.
+            **kwargs: Algorithm-specific parameters (e.g. moe_mode).
+
+        Returns:
+            ``{"layer_payloads": {layer_idx: payload}}`` where each
+            payload is whatever this algorithm's ``_transform`` consumes
+            (tensor, dict, ...).
+        """
         pass
 
     @abstractmethod
