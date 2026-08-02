@@ -161,15 +161,15 @@ class ForwardContext:
     num_computed_tokens_cpu: torch.Tensor | None = None
     """Number of cached/computed tokens for each request in the batch.
     - Shape: (batch_size,)
-    - Used by steer vectors to correctly map prefill_trigger_positions 
-      when prefix caching is enabled
+    - Used by steer vectors to map apply_spec positions to absolute
+      sequence positions when prefix caching is enabled
     - Value 0 means no tokens are cached for that request
     """
 
     num_output_tokens_cpu: torch.Tensor | None = None
     """Number of output tokens already generated for each request in the batch.
     - Shape: (batch_size,)
-    - Used by steer vectors for generate_first_k_tokens and generate_after_k_tokens
+    - Used by steer vectors for apply_spec generation windows
     - Value 0 means the request is still prefilling (scheduler ground truth,
       also used to classify prefill vs decode tokens)
     """
@@ -177,15 +177,15 @@ class ForwardContext:
     num_prompt_tokens_cpu: torch.Tensor | None = None
     """Prompt length of each request in the batch.
     - Shape: (batch_size,)
-    - Used by steer vectors to resolve negative prefill trigger/exclude
-      positions against the full prompt (correct under chunked prefill)
+    - Used by steer vectors to resolve negative apply_spec positions
+      against the full prompt (correct under chunked prefill)
     """
 
     query_start_loc: torch.Tensor | None = None
     """Sample boundary offsets for the current batch.
     - Shape: (num_samples + 1,) - cumulative token counts per sample
     - Used by steer vectors to determine per-sample token boundaries
-      for position-based triggers (e.g. prefill_trigger_positions)
+      for position-based apply_spec filters
     - Backend-agnostic: stored here to avoid relying on per-layer
       attention metadata which varies across backends
     """

@@ -44,11 +44,6 @@ class SteerVectorConfig:
     steer_vector_dtype: SteerVectorDType = "auto"
     """Data type for steer vectors. If 'auto', will default to base model dtype."""
 
-    allow_cuda_graphs: bool = False
-    """DEPRECATED, ignored. Steering now always runs eagerly between
-    piecewise CUDA-graph segments under compiled execution
-    (vllm::steer_apply splitting op); no configs are baked into graphs."""
-
     require_preload: bool = False
     """When True, per-request steering configs referencing vectors that
     were not explicitly preloaded are rejected at the frontend instead of
@@ -66,32 +61,16 @@ class SteerVectorConfig:
     admitted (direct algorithm, no normalize, single-vector)."""
 
     steering_config: str | None = None
-    """Engine-default steering (v2 API): a SteeringSpec as inline JSON or
-    a path to a JSON file. Applied to every request; per-request steering
-    is rejected while it is active. Normalized to canonical JSON text at
+    """Engine-default steering: a SteeringSpec as inline JSON or a path
+    to a JSON file. Applied to every request; per-request steering is
+    rejected while it is active. Normalized to canonical JSON text at
     validation time so every consumer (salt, worker install, endpoint)
     sees identical content."""
 
-    # Deprecated v1 server-level steering flags; use steering_config.
-    server_vector_path: str | None = None
-    """Path to a steering vector file to load at startup."""
-
-    server_scale: float = 1.0
-    """Scaling factor for the server-level steering vector."""
-
-    server_target_layers: list[int] | None = None
-    """Which layers to steer. If None, the vector file determines layers."""
-
-    server_algorithm: str = "direct"
-    """Algorithm for server-level steering."""
-
-    server_normalize: bool = True
-    """Whether to normalize the server-level steering vector."""
-
     @property
     def has_server_config(self) -> bool:
-        """True when engine-default (server-level) steering is configured."""
-        return self.steering_config is not None or self.server_vector_path is not None
+        """True when engine-default steering is configured."""
+        return self.steering_config is not None
 
     def compute_hash(self) -> str:
         """
@@ -102,14 +81,8 @@ class SteerVectorConfig:
         factors: list[Any] = []
         factors.append(self.max_steer_vectors)
         factors.append(self.steer_vector_dtype)
-        factors.append(self.allow_cuda_graphs)
         factors.append(self.graph_mode)
         factors.append(self.steering_config)
-        factors.append(self.server_vector_path)
-        factors.append(self.server_scale)
-        factors.append(self.server_target_layers)
-        factors.append(self.server_algorithm)
-        factors.append(self.server_normalize)
 
         hash_str = hashlib.md5(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
@@ -148,11 +121,6 @@ class SteerVectorConfig:
                 f"must be >= max_steer_vectors ({self.max_steer_vectors})"
             )
         if self.steering_config is not None:
-            if self.server_vector_path is not None:
-                raise ValueError(
-                    "steering_config and the deprecated --steer-vector-path "
-                    "flags are mutually exclusive; use steering_config alone"
-                )
             import os
 
             from vllm.steer_vectors.api import SteeringSpec

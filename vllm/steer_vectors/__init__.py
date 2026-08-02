@@ -33,7 +33,7 @@ __all__ = [
     "LoadedSteerVector",
     "SteerControllerManager",
     "create_steer_controller_manager",
-    # Deprecated v1 request structs
+    # Internal engine request structs (produced by to_engine_request)
     "SteerVectorRequest",
     "VectorConfig",
     # Worker Manager

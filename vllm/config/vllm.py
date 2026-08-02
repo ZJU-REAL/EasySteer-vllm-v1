@@ -1194,15 +1194,6 @@ class VllmConfig:
         # vllm::steer_apply splitting op: steering executes eagerly between
         # piecewise CUDA-graph segments while the captured graphs stay
         # config-free (wired after set_splitting_ops_for_v1 below).
-        if (
-            self.steer_vector_config is not None
-            and self.steer_vector_config.allow_cuda_graphs
-        ):
-            logger.warning(
-                "steer_allow_cuda_graphs is deprecated and ignored: "
-                "steering now always runs between piecewise CUDA-graph "
-                "segments under compiled execution (no baked-in graphs)."
-            )
 
         if self.model_config is not None and self.model_config.enforce_eager:
             logger.warning(

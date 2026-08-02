@@ -810,18 +810,9 @@ def _register_steering_endpoints(app: FastAPI) -> None:
         })
 
     def _steering_status(steer_config) -> dict:
-        if steer_config.steering_config is not None:
-            return {
-                "active": True,
-                "spec": _json.loads(steer_config.steering_config),
-            }
         return {
             "active": True,
-            "vector_path": steer_config.server_vector_path,
-            "scale": steer_config.server_scale,
-            "target_layers": steer_config.server_target_layers,
-            "algorithm": steer_config.server_algorithm,
-            "normalize": steer_config.server_normalize,
+            "spec": _json.loads(steer_config.steering_config),
         }
 
     @app.get("/v1/steering")
@@ -837,13 +828,10 @@ def _register_steering_endpoints(app: FastAPI) -> None:
     async def update_steering_config(raw_request: Request):
         """Replace the engine-default steering config at runtime.
 
-        v2: ``{"spec": <SteeringSpec JSON>}`` replaces the whole config;
-        the prefix cache is reset afterwards so cached KV steered under
-        the old config is never reused. Backends validate the new spec at
+        ``{"spec": <SteeringSpec JSON>}`` replaces the whole config; the
+        prefix cache is reset afterwards so cached KV steered under the
+        old config is never reused. Backends validate the new spec at
         install and unsupported specs are rejected with 400.
-
-        Deprecated v1 (``--steer-vector-path`` engines only):
-        ``{"scale": x}`` updates the scale; other v1 fields are fixed.
         """
         vllm_config = raw_request.app.state.vllm_config
         steer_config = vllm_config.steer_vector_config
@@ -873,60 +861,41 @@ def _register_steering_endpoints(app: FastAPI) -> None:
             ):
                 await engine_client.reset_prefix_cache()
 
-        if "spec" in body:
-            from pydantic import ValidationError
+        if "spec" not in body:
+            return JSONResponse(
+                status_code=400,
+                content={"error": 'Body must be {"spec": <SteeringSpec>}.'},
+            )
 
-            from vllm.steer_vectors.api import SteeringSpec, to_engine_request
+        from pydantic import ValidationError
 
+        from vllm.steer_vectors.api import SteeringSpec, to_engine_request
+
+        try:
+            spec = SteeringSpec.model_validate(body["spec"])
+        except ValidationError as e:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Invalid SteeringSpec: {e}"},
+            )
+        async with _steering_update_lock:
             try:
-                spec = SteeringSpec.model_validate(body["spec"])
-            except ValidationError as e:
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": f"Invalid SteeringSpec: {e}"},
-                )
-            async with _steering_update_lock:
-                try:
-                    await engine_client.add_steer_vector(
-                        to_engine_request(spec, name="__server__", int_id=1)
-                    )
-                except Exception as e:
-                    # The workers rejected the spec (e.g. not graph-safe
-                    # on a full-graph engine); the old config stays live.
-                    return JSONResponse(
-                        status_code=400,
-                        content={"error": f"Spec rejected at install: {e}"},
-                    )
-                object.__setattr__(
-                    steer_config, "steering_config", spec.model_dump_json()
-                )
-                object.__setattr__(steer_config, "server_vector_path", None)
-                await _reset_prefix_cache_if_enabled()
-            return JSONResponse(content=_steering_status(steer_config))
-
-        new_scale = body.get("scale")
-        if new_scale is not None:
-            if steer_config.steering_config is not None:
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "This engine uses a v2 steering spec; "
-                                 "POST {\"spec\": {...}} to replace it "
-                                 "(scale lives inside the spec)."
-                    },
-                )
-            async with _steering_update_lock:
-                object.__setattr__(steer_config, "server_scale",
-                                   float(new_scale))
-
-                from vllm.steer_vectors.request import build_server_request
                 await engine_client.add_steer_vector(
-                    build_server_request(steer_config)
+                    to_engine_request(spec, name="__server__", int_id=1)
                 )
-                # Cached KV was steered under the old scale; drop it so
-                # new requests never reuse stale blocks.
-                await _reset_prefix_cache_if_enabled()
-
+            except Exception as e:
+                # The workers rejected the spec (e.g. not graph-safe
+                # on a full-graph engine); the old config stays live.
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Spec rejected at install: {e}"},
+                )
+            object.__setattr__(
+                steer_config, "steering_config", spec.model_dump_json()
+            )
+            # Cached KV was steered under the old config; drop it so
+            # new requests never reuse stale blocks.
+            await _reset_prefix_cache_if_enabled()
         return JSONResponse(content=_steering_status(steer_config))
 
 

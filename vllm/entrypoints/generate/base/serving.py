@@ -154,37 +154,18 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         self,
         request: AnyRequest,
     ) -> "SteerVectorRequest | None":
-        """Resolve the API request's steering config into an engine
-        SteerVectorRequest.
-
-        Accepts the v2 `steering` spec or the deprecated v1
-        `steer_vector_request` param (not both). Returns None when
-        neither is set.
+        """Resolve the API request's `steering` spec into an engine
+        SteerVectorRequest. Returns None when no steering is requested.
 
         Raises ValueError if per-request steering is rejected because
-        server-level steering is active (callers already catch ValueError).
+        engine-default steering is active (callers already catch
+        ValueError).
         """
         from vllm.steer_vectors.api import SteeringSpec, to_engine_request
-        from vllm.steer_vectors.request import (
-            STEER_APPLY_FIELDS,
-            STEER_MOE_FIELDS,
-            SteerVectorRequest,
-            SteerVectorRequestParam,
-            VectorConfig,
-            _next_steer_vector_id,
-            steer_params_dict,
-        )
-        from vllm.utils import random_uuid
 
         spec: SteeringSpec | None = getattr(request, "steering", None)
-        param: SteerVectorRequestParam | None = getattr(
-            request, "steer_vector_request", None
-        )
-        if spec is not None and param is not None:
-            raise ValueError(
-                "Pass either 'steering' or the deprecated "
-                "'steer_vector_request', not both."
-            )
+        if spec is None:
+            return None
 
         steer_vector_config = getattr(
             self.engine_client.vllm_config, "steer_vector_config", None
@@ -192,46 +173,14 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         if (
             steer_vector_config is not None
             and steer_vector_config.has_server_config
-            and (spec is not None or param is not None)
         ):
             raise ValueError(
-                "Per-request steering is not allowed when server-level "
+                "Per-request steering is not allowed when engine-default "
                 "steering is active (--steering-config). Use POST "
-                "/v1/steering to change the server steering config."
+                "/v1/steering to change the engine steering config."
             )
 
-        if spec is not None:
-            return to_engine_request(spec)
-
-        if param is None:
-            return None
-
-        logger.warning_once(
-            "steer_vector_request is deprecated; use 'steering' "
-            "(see STEERING_API_V2.md)."
-        )
-
-        # Auto-generate name and ID if not provided
-        steer_name = param.steer_vector_name or f"sv_{random_uuid()[:8]}"
-        steer_id = param.steer_vector_int_id or _next_steer_vector_id()
-
-        # Convert VectorConfigParam list to VectorConfig list
-        vector_configs = None
-        if param.vector_configs is not None:
-            vector_configs = [
-                VectorConfig(path=vc.path, **steer_params_dict(vc))
-                for vc in param.vector_configs
-            ]
-
-        return SteerVectorRequest(
-            steer_vector_name=steer_name,
-            steer_vector_int_id=steer_id,
-            steer_vector_local_path=param.steer_vector_local_path,
-            debug=param.debug,
-            conflict_resolution=param.conflict_resolution,
-            vector_configs=vector_configs,
-            **steer_params_dict(param, STEER_APPLY_FIELDS + STEER_MOE_FIELDS),
-        )
+        return to_engine_request(spec)
 
     def create_streaming_error_response(
         self,
