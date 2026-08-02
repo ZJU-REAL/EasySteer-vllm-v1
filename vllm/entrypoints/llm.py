@@ -852,6 +852,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         self.llm_engine.collective_rpc(
             "preload_steer_vectors", args=(paths, algorithm)
         )
+        self.llm_engine.input_processor.note_steer_vectors_preloaded(paths)
 
     def get_metrics(self) -> list["Metric"]:
         """Return a snapshot of aggregated metrics from Prometheus.

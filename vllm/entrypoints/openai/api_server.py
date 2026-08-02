@@ -758,6 +758,57 @@ def _register_steering_endpoints(app: FastAPI) -> None:
     from starlette.requests import Request
     from starlette.responses import JSONResponse
 
+    @app.get("/v1/steering/vectors")
+    async def list_steering_vectors(raw_request: Request):
+        """List vector paths preloaded into the steering store."""
+        engine_client = raw_request.app.state.engine_client
+        if raw_request.app.state.vllm_config.steer_vector_config is None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "SteerVector is not enabled."},
+            )
+        return JSONResponse(content={
+            "preloaded": engine_client.list_preloaded_steer_vectors(),
+        })
+
+    @app.post("/v1/steering/vectors")
+    async def preload_steering_vectors(raw_request: Request):
+        """Preload steering vectors: {"paths": [...], "algorithm": "direct"}.
+
+        With --steer-require-preload, only preloaded vectors are accepted
+        in per-request steering configs.
+        """
+        if raw_request.app.state.vllm_config.steer_vector_config is None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "SteerVector is not enabled."},
+            )
+        try:
+            body = await raw_request.json()
+        except _json.JSONDecodeError as e:
+            return JSONResponse(
+                status_code=400, content={"error": f"Invalid JSON: {e}"}
+            )
+        paths = body.get("paths")
+        if not isinstance(paths, list) or not paths:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "'paths' must be a non-empty list."},
+            )
+        engine_client = raw_request.app.state.engine_client
+        try:
+            await engine_client.preload_steer_vectors(
+                paths, body.get("algorithm", "direct")
+            )
+        except Exception as e:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Preload failed: {e}"},
+            )
+        return JSONResponse(content={
+            "preloaded": engine_client.list_preloaded_steer_vectors(),
+        })
+
     @app.get("/v1/steering")
     async def get_steering_config(raw_request: Request):
         """Return the current server-level steering configuration."""

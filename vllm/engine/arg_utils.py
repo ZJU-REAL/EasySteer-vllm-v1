@@ -608,6 +608,7 @@ class EngineArgs:
     max_steer_vectors: int = 8
     steer_allow_cuda_graphs: bool = False
     steer_graph_mode: str = "piecewise"
+    steer_require_preload: bool = False
     steer_vector_path: str | None = None
     steer_scale: float = 1.0
     steer_target_layers: list[int] | None = None
@@ -1398,6 +1399,15 @@ class EngineArgs:
                 "steering runs between graph segments) or 'full' (keeps full "
                 "CUDA graphs via a data-driven in-graph kernel; graph-safe "
                 "configs only)."
+            ),
+        )
+        steer_vector_group.add_argument(
+            "--steer-require-preload",
+            action=argparse.BooleanOptionalAction,
+            help=(
+                "Reject per-request steering configs whose vectors were not "
+                "explicitly preloaded, instead of lazily loading from disk "
+                "at request admission."
             ),
         )
         steer_vector_group.add_argument(
@@ -2332,6 +2342,7 @@ class EngineArgs:
                 max_steer_vectors=self.max_steer_vectors,
                 allow_cuda_graphs=allow_cuda,
                 graph_mode=self.steer_graph_mode,
+                require_preload=bool(self.steer_require_preload),
                 server_vector_path=self.steer_vector_path,
                 server_scale=self.steer_scale,
                 server_target_layers=self.steer_target_layers,

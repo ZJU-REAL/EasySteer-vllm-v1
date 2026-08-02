@@ -45,6 +45,9 @@ class InputProcessor:
         self.vllm_config = vllm_config
         self.model_config = model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
+        # Vector paths preloaded into the workers' steering stores
+        # (frontend mirror for the require_preload check).
+        self._steer_preloaded_paths: set[str] = set()
         self.lora_config = vllm_config.lora_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
@@ -163,6 +166,11 @@ class InputProcessor:
                 "[lora_path]` to use the LoRA tokenizer."
             )
 
+    def note_steer_vectors_preloaded(self, paths: list[str]) -> None:
+        """Record vector paths preloaded into the workers' stores (used by
+        the require_preload frontend check)."""
+        self._steer_preloaded_paths.update(paths)
+
     def _validate_steer_vector(self, steer_vector_request: SteerVectorRequest | None) -> None:
         if steer_vector_request is None:
             return
@@ -171,6 +179,26 @@ class InputProcessor:
             raise ValueError(
                 f"Got steer_vector_request {steer_vector_request} but SteerVector is not enabled!"
             )
+
+        if self.vllm_config.steer_vector_config.require_preload:
+            if steer_vector_request.is_multi_vector:
+                paths = [
+                    vc.path for vc in steer_vector_request.vector_configs
+                ]
+            elif steer_vector_request.local_path:
+                paths = [steer_vector_request.local_path]
+            else:
+                paths = []
+            missing = [
+                p for p in paths if p not in self._steer_preloaded_paths
+            ]
+            if missing:
+                raise ValueError(
+                    f"steer_require_preload is set and these vectors are "
+                    f"not preloaded: {missing}. Preload them via "
+                    f"LLM.preload_steer_vectors([...]) or "
+                    f"POST /v1/steering/vectors."
+                )
 
         # Reject non-graph-safe configs at the frontend so a bad request
         # errors instead of reaching (and killing) the engine core.

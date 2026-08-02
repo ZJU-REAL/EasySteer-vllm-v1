@@ -977,6 +977,18 @@ class AsyncLLM(EngineClient):
             steer_vector_request
         )
 
+    async def preload_steer_vectors(
+        self, paths: list[str], algorithm: str = "direct"
+    ) -> None:
+        """Load steering vectors into all workers' stores ahead of use."""
+        await self.collective_rpc(
+            "preload_steer_vectors", args=(list(paths), algorithm)
+        )
+        self.input_processor.note_steer_vectors_preloaded(paths)
+
+    def list_preloaded_steer_vectors(self) -> list[str]:
+        return sorted(self.input_processor._steer_preloaded_paths)
+
     async def collective_rpc(
         self,
         method: str,

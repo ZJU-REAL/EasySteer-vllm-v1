@@ -49,6 +49,13 @@ class SteerVectorConfig:
     piecewise CUDA-graph segments under compiled execution
     (vllm::steer_apply splitting op); no configs are baked into graphs."""
 
+    require_preload: bool = False
+    """When True, per-request steering configs referencing vectors that
+    were not explicitly preloaded are rejected at the frontend instead of
+    lazily loading from disk during request admission. Recommended for
+    latency-sensitive serving; leave False for dynamic-vector research
+    workflows. (Not part of compute_hash: does not affect the graph.)"""
+
     graph_mode: str = "piecewise"
     """CUDA-graph execution mode for steering: "piecewise" (default)
     splits compiled graphs at every steered layer and runs steering
