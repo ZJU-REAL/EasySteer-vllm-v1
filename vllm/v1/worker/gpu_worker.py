@@ -1258,10 +1258,23 @@ class Worker(WorkerBase):
     def remove_steer_vector(self, steer_vector_id: int) -> bool:
         return self.model_runner.remove_steer_vector(steer_vector_id)
 
-    # Hidden States Capture Methods
-    def enable_hidden_states_capture(self) -> None:
+    # Capture stream RPCs
+    def start_capture(self, stream: str, **config_kwargs) -> bool:
+        return self.model_runner.start_capture(stream, **config_kwargs)
+
+    def stop_capture(self, stream: str) -> bool:
+        return self.model_runner.stop_capture(stream)
+
+    def fetch_captured(self, stream: str, clear: bool = True) -> dict:
+        return self.model_runner.fetch_captured(stream, clear=clear)
+
+    def capture_status(self, stream: str) -> dict:
+        return self.model_runner.capture_status(stream)
+
+    # Hidden States Capture Methods (legacy names)
+    def enable_hidden_states_capture(self, **config_kwargs) -> None:
         """Enable hidden states capture in the model runner."""
-        self.model_runner.enable_hidden_states_capture()
+        self.model_runner.enable_hidden_states_capture(**config_kwargs)
 
     def disable_hidden_states_capture(self) -> None:
         """Disable hidden states capture in the model runner."""
@@ -1279,10 +1292,10 @@ class Worker(WorkerBase):
         """Clear captured hidden states in the model runner."""
         self.model_runner.clear_hidden_states()
 
-    # MoE Router Logits Capture Methods
-    def enable_moe_router_logits_capture(self) -> None:
+    # MoE Router Logits Capture Methods (legacy names)
+    def enable_moe_router_logits_capture(self, **config_kwargs) -> None:
         """Enable MoE router logits capture in the model runner."""
-        self.model_runner.enable_moe_router_logits_capture()
+        self.model_runner.enable_moe_router_logits_capture(**config_kwargs)
 
     def disable_moe_router_logits_capture(self) -> None:
         """Disable MoE router logits capture in the model runner."""

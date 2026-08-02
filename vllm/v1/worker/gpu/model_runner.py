@@ -118,6 +118,9 @@ from vllm.v1.worker.gpu.steer_vector_utils import (
 )
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.capture_model_runner_mixin import (
+    CaptureModelRunnerMixin,
+)
 from vllm.v1.worker.steer_vector_model_runner_mixin import (
     SteerVectorModelRunnerMixin,
 )
@@ -126,7 +129,8 @@ from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 logger = init_logger(__name__)
 
 
-class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin):
+class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin,
+                     CaptureModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -299,9 +303,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin):
                 self.model = self.load_lora_model(
                     self.model, self.vllm_config, self.device
                 )
-            # Wrap model with steer vector support if enabled (in-place
-            # decoder-layer replacement; eager execution only).
+            # Wrap model with steer vector support if enabled
+            # (hook-based; the model tree is untouched).
             self.model = self._wrap_model_with_steer_vectors(self.model)
+            # Attach capture hooks (hidden states / router logits);
+            # after the steering wrap so captured logits are
+            # post-steering. Eager engines only.
+            self.model = self._wrap_model_for_capture(self.model)
 
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
@@ -1401,6 +1409,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, SteerVectorModelRunnerMixin):
                         -1 if manager is None else manager.server_slot
                     ),
                 )
+            if not steer_vector_kwargs and not dummy_run:
+                # Capture-only runs still need sample boundaries in the
+                # forward context (per-sample position reductions).
+                capture_session = getattr(self, "capture_session", None)
+                if capture_session is not None and capture_session.any_enabled():
+                    steer_vector_kwargs = {
+                        "query_start_loc": input_batch.query_start_loc[
+                            : input_batch.num_reqs + 1
+                        ],
+                    }
 
             with set_forward_context(
                 attn_metadata,
