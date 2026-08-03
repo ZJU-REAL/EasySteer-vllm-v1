@@ -6,16 +6,6 @@ from typing import Any
 import numpy as np
 import torch
 
-_DTYPE_MAP = {
-    "torch.float32": torch.float32,
-    "torch.float16": torch.float16,
-    "torch.bfloat16": torch.bfloat16,
-    "torch.float64": torch.float64,
-    "torch.int32": torch.int32,
-    "torch.int64": torch.int64,
-}
-
-
 _NUMPY_RAW = {
     "torch.float32": np.float32,
     "torch.float16": np.float16,
@@ -24,41 +14,6 @@ _NUMPY_RAW = {
     "torch.int32": np.int32,
     "torch.int64": np.int64,
 }
-
-
-def deserialize_hidden_states(
-    serialized_data: dict[int, dict[str, Any]],
-) -> dict[int, torch.Tensor]:
-    """Rebuild per-layer tensors from the capture RPC wire format.
-
-    Handles both encodings: 'raw' ships the stored dtype's bytes
-    unchanged (bf16 reinterpreted from int16); the legacy format ships
-    float32 bytes and is converted back to the original dtype.
-
-    Returns:
-        layer_id -> tensor restored to its original dtype.
-    """
-    tensors = {}
-    for layer_id, info in serialized_data.items():
-        shape = tuple(info["shape"])
-        dtype = _DTYPE_MAP.get(info["dtype"], torch.float32)
-        if info.get("encoding") == "raw":
-            np_dtype = _NUMPY_RAW[info["dtype"]]
-            array = np.frombuffer(info["data"], dtype=np_dtype).reshape(shape)
-            tensor = torch.from_numpy(array.copy())
-            if info["dtype"] == "torch.bfloat16":
-                tensor = tensor.view(torch.bfloat16)
-        else:
-            array = np.frombuffer(info["data"], dtype=np.float32).reshape(shape)
-            tensor = torch.from_numpy(array.copy())
-            if dtype != tensor.dtype:
-                tensor = tensor.to(dtype)
-        tensors[layer_id] = tensor
-    return tensors
-
-
-# Router-logit captures use the same wire format.
-deserialize_moe_router_logits = deserialize_hidden_states
 
 
 def match_capture_request_id(label_req_id: str, request_id: str) -> bool:
@@ -110,18 +65,41 @@ def deserialize_captured(
 ) -> tuple[dict[int, torch.Tensor], dict[int, CaptureMeta] | None]:
     """Rebuild per-layer tensors AND their row labels.
 
+    Tensors arrive as raw bytes of their stored dtype (bf16 rides as
+    int16 bytes and is reinterpreted here) — see StreamStore.serialize.
+
     Returns ``(tensors, meta)`` where ``meta[layer]`` labels each row of
     ``tensors[layer]`` with (request id, absolute position, token id).
     ``meta`` is None when the engine captured rows without batch
-    geometry (it warns engine-side) or when talking to an engine
-    predating labelled rows.
+    geometry (it warns engine-side).
     """
-    tensors = deserialize_hidden_states(serialized_data)
+    tensors: dict[int, torch.Tensor] = {}
     meta: dict[int, CaptureMeta] = {}
+    labelled = True
     for layer_id, info in serialized_data.items():
+        encoding = info.get("encoding")
+        if encoding != "raw":
+            raise ValueError(
+                f"unknown capture wire encoding {encoding!r} for layer "
+                f"{layer_id}; engine and client versions do not match"
+            )
+        wire_dtype = info["dtype"]
+        if wire_dtype not in _NUMPY_RAW:
+            raise ValueError(
+                f"unknown capture wire dtype {wire_dtype!r} for layer "
+                f"{layer_id}"
+            )
+        shape = tuple(info["shape"])
+        array = np.frombuffer(info["data"], dtype=_NUMPY_RAW[wire_dtype])
+        tensor = torch.from_numpy(array.reshape(shape).copy())
+        if wire_dtype == "torch.bfloat16":
+            tensor = tensor.view(torch.bfloat16)
+        tensors[layer_id] = tensor
+
         m = info.get("meta")
         if m is None:
-            return tensors, None
+            labelled = False
+            continue
         req_idx = np.frombuffer(m["req_idx"], dtype=np.int32)
         table = m["req_table"]
         meta[layer_id] = CaptureMeta(
@@ -133,20 +111,6 @@ def deserialize_captured(
                 np.frombuffer(m["token_ids"], dtype=np.int32).copy()
             ),
         )
-    return tensors, (meta if meta else None)
-
-
-def print_hidden_states_summary(
-    hidden_states: dict[int, torch.Tensor],
-) -> None:
-    """Print a per-layer summary of captured tensors."""
-    print(f"Captured {len(hidden_states)} layers:")
-    for layer_id in sorted(hidden_states):
-        tensor = hidden_states[layer_id]
-        print(
-            f"  Layer {layer_id:2d}: shape {tuple(tensor.shape)}, "
-            f"dtype {tensor.dtype}, device {tensor.device}"
-        )
-
-
-print_moe_router_logits_summary = print_hidden_states_summary
+    if not labelled or not meta:
+        return tensors, None
+    return tensors, meta

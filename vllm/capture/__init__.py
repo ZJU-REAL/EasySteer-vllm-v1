@@ -4,38 +4,30 @@ Capture of intermediate model state for vLLM.
 
 Hook-based capture of decoder-layer hidden states and MoE router logits
 (see vllm.capture.session.CaptureSession). Worker-side RPCs live in
-vllm.v1.worker.capture_model_runner_mixin. Importable as
-``vllm.hidden_states`` for backward compatibility.
+vllm.v1.worker.capture_model_runner_mixin.
 """
 
 from vllm.capture.serde import (
     CaptureMeta,
     deserialize_captured,
-    deserialize_hidden_states,
-    deserialize_moe_router_logits,
     match_capture_request_id,
-    print_hidden_states_summary,
-    print_moe_router_logits_summary,
 )
 from vllm.capture.session import (
     HIDDEN_STATES,
     ROUTER_LOGITS,
     CaptureSession,
-    StreamConfig,
 )
+from vllm.capture.store import StreamConfig, StreamStore
 
 __all__ = [
     "HIDDEN_STATES",
     "ROUTER_LOGITS",
     "CaptureSession",
     "StreamConfig",
+    "StreamStore",
     "CaptureMeta",
     "deserialize_captured",
     "match_capture_request_id",
-    "deserialize_hidden_states",
-    "print_hidden_states_summary",
-    "deserialize_moe_router_logits",
-    "print_moe_router_logits_summary",
 ]
 
 __version__ = "2.0.0"

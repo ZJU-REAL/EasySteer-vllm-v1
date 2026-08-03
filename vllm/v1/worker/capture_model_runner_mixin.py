@@ -5,19 +5,14 @@ router logits) over collective_rpc.
 The capture mechanism lives in vllm.capture.session.CaptureSession;
 this mixin owns one session per worker, attaches its hooks at model load
 (eager engines only — hooks cannot run inside compiled graphs), and
-exposes stream lifecycle RPCs. The legacy per-feature RPC names are kept
-as thin shims over the stream API for existing easysteer clients.
+exposes stream lifecycle RPCs.
 """
 
 from typing import Any
 
 from torch import nn
 
-from vllm.capture.session import (
-    HIDDEN_STATES,
-    ROUTER_LOGITS,
-    CaptureSession,
-)
+from vllm.capture.session import CaptureSession
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -80,14 +75,6 @@ class CaptureModelRunnerMixin:
         session.attach(model)
         return model
 
-    # Legacy attach entry points (V1 runner calls both; attach() is
-    # idempotent and covers both streams).
-    def _wrap_model_for_hidden_states(self, model: nn.Module) -> nn.Module:
-        return self._attach_capture_hooks(model)
-
-    def _wrap_model_for_moe_capture(self, model: nn.Module) -> nn.Module:
-        return self._attach_capture_hooks(model)
-
     # ------------------------------------------------------------------
     # Stream API
     # ------------------------------------------------------------------
@@ -97,11 +84,8 @@ class CaptureModelRunnerMixin:
 
         config_kwargs: layers (list|None), dtype (e.g. 'float16'),
         select (SelectSpec wire dict — the shared where-clause language,
-        see vllm.steer_vectors.SelectSpec.to_wire()), positions
-        ('all'|'last'|'mean'; a list of absolute positions is legacy
-        sugar for a select clause, negatives from the prompt end),
-        token_ids (legacy sugar: rows whose input token id matches,
-        unions with a positions list), max_tokens (int|None).
+        see vllm.steer_vectors.SelectSpec.to_wire()), reduce
+        ('all'|'last'|'mean'), budget_rows (int|None).
         """
         self._check_capture_compatible()
         self._capture_session().enable_stream(stream, **config_kwargs)
@@ -129,52 +113,10 @@ class CaptureModelRunnerMixin:
             stream, clear=clear, layers=layers, req_ids=req_ids
         )
 
+    def clear_captured(self, stream: str) -> bool:
+        """Drop captured rows, keeping the stream enabled."""
+        self._capture_session().clear_stream(stream)
+        return True
+
     def capture_status(self, stream: str) -> dict[str, Any]:
         return self._capture_session().stream_status(stream)
-
-    # ------------------------------------------------------------------
-    # Legacy RPC shims (existing easysteer clients)
-    # ------------------------------------------------------------------
-
-    def enable_hidden_states_capture(self, **config_kwargs):
-        self._check_capture_compatible()
-        self._capture_session().enable_stream(HIDDEN_STATES, **config_kwargs)
-
-    def disable_hidden_states_capture(self):
-        self._capture_session().disable_stream(HIDDEN_STATES)
-
-    def get_captured_hidden_states(self) -> dict[int, dict[str, Any]]:
-        return self._capture_session().fetch_stream(HIDDEN_STATES, clear=False)
-
-    def clear_hidden_states(self):
-        self._capture_session().clear_stream(HIDDEN_STATES)
-
-    def get_hidden_states_debug_info(self) -> dict[str, Any]:
-        return self._capture_session().stream_status(HIDDEN_STATES)
-
-    def enable_moe_router_logits_capture(self, **config_kwargs):
-        self._check_capture_compatible()
-        self._capture_session().enable_stream(ROUTER_LOGITS, **config_kwargs)
-
-    def disable_moe_router_logits_capture(self):
-        self._capture_session().disable_stream(ROUTER_LOGITS)
-
-    def get_moe_router_logits(self) -> dict[int, dict[str, Any]]:
-        return self._capture_session().fetch_stream(ROUTER_LOGITS, clear=False)
-
-    def clear_moe_router_logits(self):
-        self._capture_session().clear_stream(ROUTER_LOGITS)
-
-    def get_moe_debug_info(self) -> dict[str, Any]:
-        return self._capture_session().stream_status(ROUTER_LOGITS)
-
-    def get_all_capture_status(self) -> dict[str, Any]:
-        session = self._capture_session()
-        return {
-            HIDDEN_STATES: session.stream_status(HIDDEN_STATES),
-            ROUTER_LOGITS: session.stream_status(ROUTER_LOGITS),
-        }
-
-    def clear_all_captures(self):
-        self.clear_hidden_states()
-        self.clear_moe_router_logits()

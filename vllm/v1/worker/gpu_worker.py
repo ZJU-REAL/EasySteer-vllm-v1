@@ -1279,50 +1279,11 @@ class Worker(WorkerBase):
             stream, clear=clear, layers=layers, req_ids=req_ids
         )
 
+    def clear_captured(self, stream: str) -> bool:
+        return self.model_runner.clear_captured(stream)
+
     def capture_status(self, stream: str) -> dict:
         return self.model_runner.capture_status(stream)
-
-    # Hidden States Capture Methods (legacy names)
-    def enable_hidden_states_capture(self, **config_kwargs) -> None:
-        """Enable hidden states capture in the model runner."""
-        self.model_runner.enable_hidden_states_capture(**config_kwargs)
-
-    def disable_hidden_states_capture(self) -> None:
-        """Disable hidden states capture in the model runner."""
-        self.model_runner.disable_hidden_states_capture()
-
-    def get_captured_hidden_states(self) -> dict:
-        """Get captured hidden states from the model runner."""
-        return self.model_runner.get_captured_hidden_states()
-
-    def get_hidden_states_debug_info(self) -> dict:
-        """Get debug information about hidden states capture."""
-        return self.model_runner.get_hidden_states_debug_info()
-
-    def clear_hidden_states(self) -> None:
-        """Clear captured hidden states in the model runner."""
-        self.model_runner.clear_hidden_states()
-
-    # MoE Router Logits Capture Methods (legacy names)
-    def enable_moe_router_logits_capture(self, **config_kwargs) -> None:
-        """Enable MoE router logits capture in the model runner."""
-        self.model_runner.enable_moe_router_logits_capture(**config_kwargs)
-
-    def disable_moe_router_logits_capture(self) -> None:
-        """Disable MoE router logits capture in the model runner."""
-        self.model_runner.disable_moe_router_logits_capture()
-
-    def get_moe_router_logits(self) -> dict:
-        """Get captured MoE router logits from the model runner."""
-        return self.model_runner.get_moe_router_logits()
-
-    def get_moe_debug_info(self) -> dict:
-        """Get debug information about MoE router logits capture."""
-        return self.model_runner.get_moe_debug_info()
-
-    def clear_moe_router_logits(self) -> None:
-        """Clear captured MoE router logits in the model runner."""
-        self.model_runner.clear_moe_router_logits()
 
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.

@@ -5286,10 +5286,6 @@ class GPUModelRunner(
                     )
                 # Wrap model with steer vector support if enabled
                 self.model = self._wrap_model_with_steer_vectors(self.model)
-                # Wrap model for hidden states capture
-                self.model = self._wrap_model_for_hidden_states(self.model)
-                # Wrap model for MoE router logits capture
-                self.model = self._wrap_model_for_moe_capture(self.model)
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     if hasattr(self.drafter, "load_model"):
