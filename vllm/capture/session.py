@@ -51,17 +51,48 @@ class StreamConfig:
         self,
         layers: list[int] | None = None,
         dtype: str | None = None,
-        positions: str = "all",
+        positions: "str | list[int]" = "all",
+        token_ids: list[int] | None = None,
         max_tokens: int | None = None,
     ):
-        if positions not in ("all", "last", "mean"):
+        if isinstance(positions, (list, tuple)):
+            if not positions:
+                raise ValueError(
+                    "positions list must be non-empty ('all' captures "
+                    "every position)"
+                )
+            positions = list(positions)
+        elif positions not in ("all", "last", "mean"):
             raise ValueError(
-                f"positions must be 'all', 'last' or 'mean', got {positions}"
+                "positions must be 'all', 'last', 'mean' or a list of "
+                f"absolute positions, got {positions}"
+            )
+        if token_ids is not None and not token_ids:
+            raise ValueError("token_ids must be None or non-empty")
+        if token_ids is not None and isinstance(positions, str) and (
+            positions in ("last", "mean")
+        ):
+            raise ValueError(
+                "token_ids cannot combine with the 'last'/'mean' "
+                "reductions; use positions='all' or a position list"
             )
         self.layers = set(layers) if layers is not None else None
         self.dtype = getattr(torch, dtype) if dtype else None
         self.positions = positions
+        self.token_ids = list(token_ids) if token_ids is not None else None
         self.max_tokens = max_tokens
+        if positions == "all" and token_ids is None and max_tokens is None:
+            logger.warning_once(
+                "Capture enabled with positions='all' and no max_tokens "
+                "budget: every position of every request accumulates in "
+                "CPU memory. Prefer a position list, token_ids, a "
+                "reduction, or an explicit budget for long corpora."
+            )
+
+    @property
+    def selects_rows(self) -> bool:
+        """Whether a source-side row selection (not a reduction) is set."""
+        return isinstance(self.positions, list) or self.token_ids is not None
 
 
 class StreamStore:
@@ -76,6 +107,7 @@ class StreamStore:
         self._layer_rows: dict[int, int] = {}
         self.tokens_dropped = 0
         self._warned_budget = False
+        self._pending: list[tuple[int, torch.Tensor, str]] = []
         self.lock = threading.Lock()
 
     @property
@@ -86,8 +118,18 @@ class StreamStore:
         return self.config.layers is None or layer_id in self.config.layers
 
     def append(self, layer_id: int, tensor: torch.Tensor, layer_name: str):
+        """Stage one layer's selected rows for this step (GPU side).
+
+        The device-to-host copy happens once per step in ``flush()``:
+        per-layer synchronous ``.cpu()`` calls stall the GPU stream once
+        per hooked layer, which serializes capture-heavy runs.
+        """
         with self.lock:
             stored = self._layer_rows.get(layer_id, 0)
+            pending = sum(
+                t.shape[0] for lid, t, _ in self._pending if lid == layer_id
+            )
+            stored += pending
             if self.config.max_tokens is not None and stored >= self.config.max_tokens:
                 self.tokens_dropped += tensor.shape[0]
                 if not self._warned_budget:
@@ -105,27 +147,140 @@ class StreamStore:
                     tensor = tensor[:keep]
             if self.config.dtype is not None:
                 tensor = tensor.to(self.config.dtype)
-            chunk = tensor.detach().cpu()
-            self.chunks.setdefault(layer_id, []).append(chunk)
-            self.layer_names[layer_id] = layer_name
-            self._layer_rows[layer_id] = stored + chunk.shape[0]
+            # `tensor` is owned by the hook (freshly materialized), so an
+            # async copy in flush() cannot race buffer reuse.
+            self._pending.append((layer_id, tensor.detach(), layer_name))
 
-    def serialize(self) -> dict[int, dict[str, Any]]:
-        """Concatenate chunks and pack for RPC transmission."""
+    def flush(self):
+        """Move this step's staged rows to CPU in one coalesced pass.
+
+        Copies go through pinned staging buffers with non_blocking=True
+        (one stream sync at the end), amortizing D2H latency across all
+        hooked layers instead of paying it per layer.
+        """
+        with self.lock:
+            if not self._pending:
+                return
+            pinned = []
+            for layer_id, tensor, layer_name in self._pending:
+                if tensor.is_cuda:
+                    host = torch.empty_like(tensor, device="cpu", pin_memory=True)
+                    host.copy_(tensor, non_blocking=True)
+                else:
+                    host = tensor
+                pinned.append((layer_id, host, layer_name))
+            if any(t.is_cuda for _, t, _ in self._pending):
+                torch.cuda.current_stream().synchronize()
+            self._pending.clear()
+            for layer_id, host, layer_name in pinned:
+                self.chunks.setdefault(layer_id, []).append(host)
+                self.layer_names[layer_id] = layer_name
+                self._layer_rows[layer_id] = (
+                    self._layer_rows.get(layer_id, 0) + host.shape[0]
+                )
+
+    def serialize(
+        self, layers: list[int] | None = None
+    ) -> dict[int, dict[str, Any]]:
+        """Concatenate chunks and pack for RPC transmission.
+
+        Tensors ship as raw bytes of their stored dtype (bf16 rides as
+        int16 bytes and is reinterpreted client-side) — no float32
+        upcast, so the wire volume equals the stored volume. Passing
+        ``layers`` serializes a subset, letting clients fetch layer by
+        layer instead of one monolithic message.
+        """
         with self.lock:
             result: dict[int, dict[str, Any]] = {}
-            for layer_id in sorted(self.chunks):
-                tensor = torch.cat(self.chunks[layer_id], dim=0)
+            wanted = sorted(self.chunks) if layers is None else [
+                lid for lid in layers if lid in self.chunks
+            ]
+            for layer_id in wanted:
+                tensor = torch.cat(self.chunks[layer_id], dim=0).contiguous()
                 orig_dtype = tensor.dtype
-                if tensor.dtype in (torch.bfloat16, torch.float16):
-                    tensor = tensor.to(torch.float32)
+                if tensor.dtype == torch.bfloat16:
+                    wire = tensor.view(torch.int16)
+                else:
+                    wire = tensor
                 result[layer_id] = {
-                    "data": tensor.numpy().tobytes(),
+                    "data": wire.numpy().tobytes(),
                     "shape": list(tensor.shape),
                     "dtype": str(orig_dtype),
+                    "encoding": "raw",
                     "layer_name": self.layer_names.get(layer_id, ""),
                 }
             return result
+
+    def drop_layers(self, layers: list[int]) -> None:
+        with self.lock:
+            for layer_id in layers:
+                self.chunks.pop(layer_id, None)
+
+
+def _select_rows(tensor: torch.Tensor, config: StreamConfig) -> torch.Tensor:
+    """Select the configured rows of a [tokens, dim] step tensor.
+
+    Source-side selection: only rows at the configured absolute
+    positions (negatives resolve from each sample's prompt end, stable
+    across prefill chunks) and/or rows whose input token id is in
+    ``token_ids`` are kept — everything else never leaves the GPU. The
+    two filters union when both are set. Falls back to keeping all rows
+    when batch geometry is unavailable.
+    """
+    from vllm.forward_context import get_forward_context
+    from vllm.steer_vectors.algorithms.triggers import (
+        _isin_token_set,
+        _match_positions,
+    )
+    from vllm.steer_vectors.discovery import extract_samples_info
+
+    ctx = get_forward_context()
+    samples_info = (
+        extract_samples_info(ctx.attn_metadata)
+        if ctx is not None and ctx.attn_metadata is not None
+        else None
+    )
+    if samples_info is None:
+        logger.warning_once(
+            "Capture row selection requested but batch geometry is "
+            "unavailable; keeping all rows for this step."
+        )
+        return tensor
+    device = tensor.device
+    qsl = samples_info["query_start_loc"].to(device)
+    total = tensor.shape[0]
+    all_positions = torch.arange(total, device=device)
+    sample_ids = torch.searchsorted(qsl, all_positions, right=True) - 1
+    relative = all_positions - qsl[:-1][sample_ids]
+    num_computed = samples_info.get("num_computed")
+    if num_computed is not None:
+        abs_positions = relative + num_computed.to(device)[sample_ids]
+    else:
+        abs_positions = relative
+    num_prompt = samples_info.get("num_prompt_tokens")
+    neg_base = (
+        num_prompt.to(device)
+        if num_prompt is not None
+        else qsl[1:] - qsl[:-1]
+    )
+
+    mask = torch.zeros(total, dtype=torch.bool, device=device)
+    if isinstance(config.positions, list):
+        mask |= _match_positions(
+            abs_positions, config.positions, neg_base, sample_ids
+        )
+    if config.token_ids is not None:
+        current_tokens = getattr(ctx, "current_tokens", None)
+        if current_tokens is None:
+            logger.warning_once(
+                "Capture token_ids selection requested but the runner "
+                "did not provide current_tokens; keeping all rows."
+            )
+            return tensor
+        mask |= _isin_token_set(
+            current_tokens[:total].to(device), config.token_ids
+        )
+    return tensor[mask]
 
 
 def _sample_reduce(tensor: torch.Tensor, mode: str) -> torch.Tensor:
@@ -203,6 +358,16 @@ class CaptureSession:
             return
         self._attach_hidden_hooks(model)
         self._attach_gate_hooks(model)
+
+        def flush_hook(mod, args, output):
+            for store in self._streams.values():
+                if store is not None:
+                    store.flush()
+
+        # One post-forward flush per step: per-layer hooks only stage
+        # GPU rows; the D2H copies coalesce here (pinned, non-blocking,
+        # single sync).
+        self._hook_handles.append(model.register_forward_hook(flush_hook))
         self._attached = True
 
     def _attach_hidden_hooks(self, model: nn.Module) -> None:
@@ -238,11 +403,11 @@ class CaptureSession:
                 if not isinstance(hidden, torch.Tensor):
                     return
                 complete = hidden + residual if residual is not None else hidden
-                store.append(
-                    _lid,
-                    _sample_reduce(complete, store.config.positions),
-                    _name,
-                )
+                if store.config.selects_rows:
+                    selected = _select_rows(complete, store.config)
+                else:
+                    selected = _sample_reduce(complete, store.config.positions)
+                store.append(_lid, selected, _name)
 
             self._hook_handles.append(module.register_forward_hook(hook))
         self._hidden_layers = len(matches)
@@ -292,11 +457,11 @@ class CaptureSession:
                 logits = extract_gate_logits(output)
                 if logits is None:
                     return
-                store.append(
-                    _lid,
-                    _sample_reduce(logits, store.config.positions),
-                    _name,
-                )
+                if store.config.selects_rows:
+                    selected = _select_rows(logits, store.config)
+                else:
+                    selected = _sample_reduce(logits, store.config.positions)
+                store.append(_lid, selected, _name)
 
             # NOTE: registered after any steering gate hook (steering wrap
             # runs first at load), so captured logits are post-steering.
@@ -342,15 +507,22 @@ class CaptureSession:
             self._streams[stream] = None
 
     def fetch_stream(
-        self, stream: str, clear: bool = True
+        self,
+        stream: str,
+        clear: bool = True,
+        layers: list[int] | None = None,
     ) -> dict[int, dict[str, Any]]:
         store = self._streams.get(stream)
         if store is None:
             return {}
-        result = store.serialize()
+        store.flush()  # capture any rows staged since the last step
+        result = store.serialize(layers=layers)
         if clear:
-            # Keep capturing into a fresh store with the same config.
-            self._streams[stream] = StreamStore(store.config)
+            if layers is None:
+                # Keep capturing into a fresh store with the same config.
+                self._streams[stream] = StreamStore(store.config)
+            else:
+                store.drop_layers(list(result))
         return result
 
     def clear_stream(self, stream: str) -> None:

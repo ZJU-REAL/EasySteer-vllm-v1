@@ -1268,8 +1268,13 @@ class Worker(WorkerBase):
     def stop_capture(self, stream: str) -> bool:
         return self.model_runner.stop_capture(stream)
 
-    def fetch_captured(self, stream: str, clear: bool = True) -> dict:
-        return self.model_runner.fetch_captured(stream, clear=clear)
+    def fetch_captured(
+        self,
+        stream: str,
+        clear: bool = True,
+        layers: list[int] | None = None,
+    ) -> dict:
+        return self.model_runner.fetch_captured(stream, clear=clear, layers=layers)
 
     def capture_status(self, stream: str) -> dict:
         return self.model_runner.capture_status(stream)

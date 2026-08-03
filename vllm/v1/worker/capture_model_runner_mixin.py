@@ -87,7 +87,10 @@ class CaptureModelRunnerMixin:
         """Enable a capture stream ('hidden_states' or 'router_logits').
 
         config_kwargs: layers (list|None), dtype (e.g. 'float16'),
-        positions ('all'|'last'|'mean'), max_tokens (int|None).
+        positions ('all'|'last'|'mean'|list of absolute positions,
+        negatives from the prompt end), token_ids (list|None — capture
+        only rows whose input token id matches; unions with a positions
+        list), max_tokens (int|None).
         """
         self._check_capture_compatible()
         self._capture_session().enable_stream(stream, **config_kwargs)
@@ -98,9 +101,14 @@ class CaptureModelRunnerMixin:
         return True
 
     def fetch_captured(
-        self, stream: str, clear: bool = True
+        self,
+        stream: str,
+        clear: bool = True,
+        layers: list[int] | None = None,
     ) -> dict[int, dict[str, Any]]:
-        return self._capture_session().fetch_stream(stream, clear=clear)
+        return self._capture_session().fetch_stream(
+            stream, clear=clear, layers=layers
+        )
 
     def capture_status(self, stream: str) -> dict[str, Any]:
         return self._capture_session().stream_status(stream)
