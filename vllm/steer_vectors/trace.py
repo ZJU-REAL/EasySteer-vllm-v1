@@ -53,10 +53,6 @@ def _emit(record: dict) -> None:
         _get_file().write(json.dumps(record) + "\n")
 
 
-def current_step() -> int:
-    return _step
-
-
 def begin_step(
     req_ids,
     slots,

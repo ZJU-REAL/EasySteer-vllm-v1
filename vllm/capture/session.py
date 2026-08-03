@@ -109,8 +109,8 @@ class CaptureSession:
     def attach(self, model: nn.Module) -> None:
         if self._attached:
             return
-        self._attach_hidden_hooks(model)
-        self._attach_gate_hooks(model)
+        self._hidden_layers = self._attach_hidden_hooks(model)
+        self._gate_layers = self._attach_gate_hooks(model)
 
         def flush_hook(mod, args, output):
             for store in self._streams.values():
@@ -123,65 +123,87 @@ class CaptureSession:
         self._hook_handles.append(model.register_forward_hook(flush_hook))
         self._attached = True
 
-    def _attach_hidden_hooks(self, model: nn.Module) -> None:
-        from vllm.steer_vectors.discovery import (
-            SUPPORTED_DECODER_LAYERS,
-            extract_layer_id_from_module_name,
-            find_decoder_layers,
-            split_decoder_output,
-        )
+    def _attach_stream_hooks(
+        self,
+        stream: str,
+        matches: dict[str, nn.Module],
+        resolve_target,
+        extract_rows,
+        log_fmt: str,
+    ) -> int:
+        """Hook one stream's modules; returns the number of hooks placed.
 
-        matches = find_decoder_layers(model)
-        if not matches:
-            matches = {
-                name: module
-                for name, module in model.named_modules()
-                if any(
-                    cls in module.__class__.__name__ for cls in SUPPORTED_DECODER_LAYERS
-                )
-            }
+        `resolve_target(name, module)` picks the submodule to hook (None
+        skips the module, after warning); `extract_rows(output)` pulls
+        the [tokens, dim] tensor out of the hook output (None skips the
+        step). Modules without a numeric layer id in their name get
+        sequential fallback ids.
+        """
+        from vllm.steer_vectors.discovery import extract_layer_id_from_module_name
 
+        count = 0
         fallback_id = 0
         for name, module in matches.items():
+            target = resolve_target(name, module)
+            if target is None:
+                continue
             layer_id = extract_layer_id_from_module_name(name)
             if layer_id is None:
                 layer_id = fallback_id
             fallback_id = layer_id + 1
 
             def hook(mod, args, output, _lid=layer_id, _name=name):
-                store = self._streams[HIDDEN_STATES]
+                store = self._streams[stream]
                 if store is None or not store.wants_layer(_lid):
                     return
-                hidden, residual, _, _ = split_decoder_output(output)
-                if not isinstance(hidden, torch.Tensor):
+                tensor = extract_rows(output)
+                if tensor is None:
                     return
-                complete = hidden + residual if residual is not None else hidden
                 rows, meta = prepare_rows(
-                    complete, store, HIDDEN_STATES, self._request_selects
+                    tensor, store, stream, self._request_selects
                 )
                 if rows is not None:
                     store.append(_lid, rows, meta, _name)
 
-            self._hook_handles.append(module.register_forward_hook(hook))
-        self._hidden_layers = len(matches)
-        if matches:
-            logger.info(
-                "[Capture] hooked %d decoder layers for hidden states",
-                len(matches),
-            )
+            self._hook_handles.append(target.register_forward_hook(hook))
+            count += 1
+        if count:
+            logger.info(log_fmt, count)
+        return count
 
-    def _attach_gate_hooks(self, model: nn.Module) -> None:
+    def _attach_hidden_hooks(self, model: nn.Module) -> int:
+        from vllm.steer_vectors.discovery import (
+            SUPPORTED_DECODER_LAYERS,
+            find_decoder_layers,
+            find_layers_with_fallback,
+            split_decoder_output,
+        )
+
+        def extract_rows(output):
+            hidden, residual, _, _ = split_decoder_output(output)
+            if not isinstance(hidden, torch.Tensor):
+                return None
+            return hidden + residual if residual is not None else hidden
+
+        return self._attach_stream_hooks(
+            HIDDEN_STATES,
+            find_layers_with_fallback(
+                model, find_decoder_layers, SUPPORTED_DECODER_LAYERS, "decoder_layer"
+            ),
+            lambda name, module: module,
+            extract_rows,
+            "[Capture] hooked %d decoder layers for hidden states",
+        )
+
+    def _attach_gate_hooks(self, model: nn.Module) -> int:
         from vllm.steer_vectors.discovery import (
             extract_gate_logits,
-            extract_layer_id_from_module_name,
             find_moe_blocks,
             find_moe_gate,
             moe_gate_is_fused,
         )
 
-        blocks = find_moe_blocks(model)
-        fallback_id = 0
-        for name, block in blocks.items():
+        def resolve_target(name, block):
             gate = find_moe_gate(block)
             if gate is None:
                 logger.warning(
@@ -189,7 +211,7 @@ class CaptureSession:
                     "its router logits cannot be captured.",
                     name,
                 )
-                continue
+                return None
             if moe_gate_is_fused(block):
                 logger.warning(
                     "[Capture] MoE block %s fuses gate weights into the "
@@ -197,34 +219,19 @@ class CaptureSession:
                     "logits cannot be captured.",
                     name,
                 )
-                continue
-            layer_id = extract_layer_id_from_module_name(name)
-            if layer_id is None:
-                layer_id = fallback_id
-            fallback_id = layer_id + 1
+                return None
+            return gate
 
-            def hook(mod, args, output, _lid=layer_id, _name=name):
-                store = self._streams[ROUTER_LOGITS]
-                if store is None or not store.wants_layer(_lid):
-                    return
-                logits = extract_gate_logits(output)
-                if logits is None:
-                    return
-                rows, meta = prepare_rows(
-                    logits, store, ROUTER_LOGITS, self._request_selects
-                )
-                if rows is not None:
-                    store.append(_lid, rows, meta, _name)
-
-            # NOTE: registered after any steering gate hook (steering wrap
-            # runs first at load), so captured logits are post-steering.
-            self._hook_handles.append(gate.register_forward_hook(hook))
-            self._gate_layers += 1
-        if self._gate_layers:
-            logger.info(
-                "[Capture] hooked %d MoE gates for router logits",
-                self._gate_layers,
-            )
+        # NOTE: gate hooks are registered after any steering gate hook
+        # (steering attaches first at load), so captured logits are
+        # post-steering.
+        return self._attach_stream_hooks(
+            ROUTER_LOGITS,
+            find_moe_blocks(model),
+            resolve_target,
+            extract_gate_logits,
+            "[Capture] hooked %d MoE gates for router logits",
+        )
 
     def detach(self) -> None:
         for handle in self._hook_handles:

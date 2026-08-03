@@ -39,7 +39,10 @@ def prepare_rows(
     from vllm.steer_vectors.algorithms.triggers import (
         collect_positions_apply_spec,
     )
-    from vllm.steer_vectors.discovery import extract_samples_info
+    from vllm.steer_vectors.discovery import (
+        extract_samples_info,
+        resolve_batch_positions,
+    )
 
     config = store.config
     ctx = get_forward_context()
@@ -76,16 +79,14 @@ def prepare_rows(
     qsl = samples_info["query_start_loc"].to(device)
     total = int(qsl[-1].item())
     total = min(total, tensor.shape[0])
-    num_computed = samples_info.get("num_computed")
     num_prompt = samples_info.get("num_prompt_tokens")
 
+    # Kept alongside resolve_batch_positions: the "all" path below uses
+    # this exact object as a keep-every-row sentinel to skip the gather.
     all_positions = torch.arange(total, device=device)
-    sample_ids = torch.searchsorted(qsl, all_positions, right=True) - 1
-    relative = all_positions - qsl[:-1][sample_ids]
-    if num_computed is not None:
-        abs_positions = relative + num_computed.to(device)[sample_ids]
-    else:
-        abs_positions = relative
+    sample_ids, abs_positions, num_computed = resolve_batch_positions(
+        samples_info, total, device
+    )
 
     if overrides:
         # Rows of samples WITHOUT an override follow the global config

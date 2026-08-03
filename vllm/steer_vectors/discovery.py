@@ -14,13 +14,19 @@ Three groups of helpers:
   current batch, read from the forward context.
 """
 
+from collections.abc import Callable
+
 import torch
 from torch import nn
+
+from vllm.logger import init_logger
 
 try:
     from vllm.forward_context import get_forward_context
 except ImportError:
     get_forward_context = None
+
+logger = init_logger(__name__)
 
 SUPPORTED_DECODER_LAYERS: list[str] = [
     # A
@@ -239,6 +245,39 @@ def find_moe_blocks(model: nn.Module) -> dict[str, nn.Module]:
     return matches
 
 
+def find_layers_with_fallback(
+    model: nn.Module,
+    structural_finder: Callable[[nn.Module], dict[str, nn.Module]],
+    class_names: list[str],
+    kind: str,
+) -> dict[str, nn.Module]:
+    """Structural discovery with the class-name-list fallback.
+
+    Structural discovery (anchor-based, architecture agnostic) is
+    primary; the per-family class-name lists are the fallback for
+    layouts it cannot identify.
+    """
+    matches = structural_finder(model)
+    if matches:
+        return matches
+    matches = {
+        module_name: module
+        for module_name, module in model.named_modules()
+        if any(
+            class_name in module.__class__.__name__ for class_name in class_names
+        )
+    }
+    if matches:
+        logger.info(
+            "Structural discovery found no %s modules; using the "
+            "class-name list fallback (%d modules, e.g. %s).",
+            kind,
+            len(matches),
+            next(iter(matches)),
+        )
+    return matches
+
+
 def find_moe_gate(moe_block: nn.Module) -> nn.Module | None:
     """Return the routing (gate) submodule of a sparse-MoE block.
 
@@ -361,7 +400,7 @@ def extract_samples_info(attn_metadata) -> dict[str, torch.Tensor] | None:
     """
     # Primary path: the runner's BatchGeometry on the forward context —
     # scheduler ground truth, backend-agnostic, one producer.
-    ctx = _forward_context_or_none()
+    ctx = forward_context_or_none()
     geo = getattr(ctx, "batch_geometry", None) if ctx is not None else None
     if geo is not None:
         return geo.samples_info()
@@ -383,7 +422,37 @@ def extract_samples_info(attn_metadata) -> dict[str, torch.Tensor] | None:
     }
 
 
-def _forward_context_or_none():
+def resolve_batch_positions(
+    samples_info: dict[str, torch.Tensor],
+    total_tokens: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Map the step's flat token indices to per-sample coordinates.
+
+    Returns ``(sample_ids, abs_positions, num_computed)`` for the first
+    `total_tokens` rows of the batch: each token's sample index, its
+    absolute position in that sample (chunk-relative position plus the
+    sample's cached-token count when available), and `num_computed` as a
+    device tensor (coerced from a list if needed) or None.
+    """
+    query_start_loc = samples_info["query_start_loc"].to(device)
+    num_computed = samples_info["num_computed"]
+    if num_computed is not None:
+        if not isinstance(num_computed, torch.Tensor):
+            num_computed = torch.tensor(num_computed, device=device, dtype=torch.long)
+        else:
+            num_computed = num_computed.to(device)
+    all_positions = torch.arange(total_tokens, device=device)
+    sample_ids = torch.searchsorted(query_start_loc, all_positions, right=True) - 1
+    relative_positions = all_positions - query_start_loc[:-1][sample_ids]
+    if num_computed is not None:
+        abs_positions = relative_positions + num_computed[sample_ids]
+    else:
+        abs_positions = relative_positions
+    return sample_ids, abs_positions, num_computed
+
+
+def forward_context_or_none():
     """The current ForwardContext, or None outside a forward pass."""
     if get_forward_context is None:
         return None
@@ -392,6 +461,10 @@ def _forward_context_or_none():
     except AssertionError:
         # get_forward_context asserts when no context is set.
         return None
+
+
+# Backwards-compat alias for the pre-promotion private name.
+_forward_context_or_none = forward_context_or_none
 
 
 def _attn_metadata_field(attn_metadata, field: str):

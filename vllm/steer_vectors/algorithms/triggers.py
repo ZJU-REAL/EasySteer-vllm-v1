@@ -19,6 +19,8 @@ There are no sentinel values and nothing bypasses exclusions.
 
 import torch
 
+from vllm.steer_vectors.discovery import resolve_batch_positions
+
 
 class TriggerController:
     """Holds one intervention's where-clause and debug flag."""
@@ -139,7 +141,6 @@ def collect_positions_apply_spec(
 ) -> torch.Tensor | None:
     """Collect intervention positions for an `apply_spec` where-clause."""
     query_start_loc = samples_info["query_start_loc"]
-    num_computed = samples_info["num_computed"]
     is_decode_mask = samples_info["is_decode_mask"]
     device = current_tokens.device
     # Size the masks from current_tokens: under piecewise cudagraphs the
@@ -147,18 +148,11 @@ def collect_positions_apply_spec(
     # and query_start_loc always cover the real tokens.
     total_tokens = current_tokens.shape[0]
 
-    if num_computed is not None and not isinstance(num_computed, torch.Tensor):
-        num_computed = torch.tensor(num_computed, device=device, dtype=torch.long)
-
-    all_positions = torch.arange(total_tokens, device=device)
-    sample_ids = torch.searchsorted(query_start_loc, all_positions, right=True) - 1
-    relative_positions = all_positions - query_start_loc[:-1][sample_ids]
-    if num_computed is not None:
-        abs_positions = relative_positions + num_computed[sample_ids]
-        total_len = (query_start_loc[1:] - query_start_loc[:-1]) + num_computed
-    else:
-        abs_positions = relative_positions
-        total_len = query_start_loc[1:] - query_start_loc[:-1]
+    sample_ids, abs_positions, num_computed = resolve_batch_positions(
+        samples_info, total_tokens, device
+    )
+    chunk_len = query_start_loc[1:] - query_start_loc[:-1]
+    total_len = chunk_len if num_computed is None else chunk_len + num_computed
     num_prompt = samples_info.get("num_prompt_tokens")
     neg_base = total_len if num_prompt is None else num_prompt.to(device)
     is_decode_token = is_decode_mask[sample_ids]

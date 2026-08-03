@@ -19,8 +19,9 @@ from vllm.utils.torch_utils import direct_register_custom_op
 if TYPE_CHECKING:
     from vllm.steer_vectors.layers import DecoderLayerWithSteerVector
 
-# Name used in CompilationConfig.splitting_ops.
+# Names used in CompilationConfig.splitting_ops.
 STEER_APPLY_OP = "vllm::steer_apply"
+STEER_MOE_GATE_OP = "vllm::steer_moe_gate"
 
 # layer key (module name) -> controller for the currently loaded model.
 # One model per worker process; re-registration on model reload overwrites.
@@ -35,49 +36,43 @@ def unregister_controller(key: str) -> None:
     _CONTROLLERS.pop(key, None)
 
 
-def steer_apply(hidden: torch.Tensor, layer_name: str) -> None:
-    """Apply steering for `layer_name` to `hidden` (complete hidden states,
-    i.e. hidden + residual) in place."""
+def _steer_dispatch(tensor: torch.Tensor, layer_name: str, method_name: str) -> None:
+    """Apply the controller's steering method to `tensor` in place."""
     controller = _CONTROLLERS.get(layer_name)
     if controller is None:
         return
-    result = controller.apply_steering(hidden)
-    if result is not None and result is not hidden:
-        hidden.copy_(result)
+    result = getattr(controller, method_name)(tensor)
+    if result is not None and result is not tensor:
+        tensor.copy_(result)
 
 
-def steer_apply_fake(hidden: torch.Tensor, layer_name: str) -> None:
-    return
+def _register_steer_op(op_name: str, arg_name: str, method_name: str) -> None:
+    """Register `vllm::{op_name}({arg_name}, layer_name)` and its no-op fake.
+
+    The op mutates its tensor argument in place via the layer's
+    registered controller. The tensor parameter name is load-bearing:
+    direct_register_custom_op infers the op schema from the impl's real
+    signature, and `mutates_args` must name that parameter — so the op
+    and fake functions are generated with the exact signature.
+    """
+    src = (
+        f"def {op_name}({arg_name}: torch.Tensor, layer_name: str) -> None:\n"
+        f"    _steer_dispatch({arg_name}, layer_name, {method_name!r})\n"
+        f"def {op_name}_fake({arg_name}: torch.Tensor, layer_name: str) -> None:\n"
+        f"    return\n"
+    )
+    ns = {"torch": torch, "_steer_dispatch": _steer_dispatch}
+    exec(src, ns)
+    direct_register_custom_op(
+        op_name=op_name,
+        op_func=ns[op_name],
+        mutates_args=[arg_name],
+        fake_impl=ns[f"{op_name}_fake"],
+    )
 
 
-direct_register_custom_op(
-    op_name="steer_apply",
-    op_func=steer_apply,
-    mutates_args=["hidden"],
-    fake_impl=steer_apply_fake,
-)
-
-# Name used in CompilationConfig.splitting_ops.
-STEER_MOE_GATE_OP = "vllm::steer_moe_gate"
-
-
-def steer_moe_gate(logits: torch.Tensor, layer_name: str) -> None:
-    """Apply MoE router-logits steering for `layer_name` in place."""
-    controller = _CONTROLLERS.get(layer_name)
-    if controller is None:
-        return
-    result = controller.apply_gate_steering(logits)
-    if result is not None and result is not logits:
-        logits.copy_(result)
-
-
-def steer_moe_gate_fake(logits: torch.Tensor, layer_name: str) -> None:
-    return
-
-
-direct_register_custom_op(
-    op_name="steer_moe_gate",
-    op_func=steer_moe_gate,
-    mutates_args=["logits"],
-    fake_impl=steer_moe_gate_fake,
-)
+# steer_apply: decoder-layer steering on `hidden` (complete hidden
+# states, i.e. hidden + residual), in place.
+_register_steer_op("steer_apply", "hidden", "apply_steering")
+# steer_moe_gate: MoE router-logits steering on `logits`, in place.
+_register_steer_op("steer_moe_gate", "logits", "apply_gate_steering")
