@@ -61,6 +61,81 @@ def deserialize_hidden_states(
 deserialize_moe_router_logits = deserialize_hidden_states
 
 
+def match_capture_request_id(label_req_id: str, request_id: str) -> bool:
+    """Whether a captured row's label belongs to a client request.
+
+    Rows are labelled with the engine-internal request id, which is the
+    client-visible id plus an 8-hex-char uniqueness suffix
+    (``{request_id}-{8 hex}``, see InputProcessor) — or identical to it
+    when suffixing is disabled.
+    """
+    if label_req_id == request_id:
+        return True
+    return (
+        label_req_id.startswith(request_id + "-")
+        and len(label_req_id) == len(request_id) + 9
+        and all(c in "0123456789abcdef" for c in label_req_id[-8:])
+    )
+
+
+class CaptureMeta:
+    """Row labels for one captured layer.
+
+    Attributes:
+        req_ids: engine-internal request id string per row (the
+            client-visible id plus an 8-hex uniqueness suffix; match
+            with :func:`match_capture_request_id`).
+        positions: absolute sequence position per row (int32; -1 for
+            synthesized rows such as 'mean' reductions).
+        token_ids: input token id per row (int32; -1 for synthesized
+            rows).
+    """
+
+    def __init__(
+        self,
+        req_ids: list[str],
+        positions: torch.Tensor,
+        token_ids: torch.Tensor,
+    ):
+        self.req_ids = req_ids
+        self.positions = positions
+        self.token_ids = token_ids
+
+    def __len__(self) -> int:
+        return len(self.req_ids)
+
+
+def deserialize_captured(
+    serialized_data: dict[int, dict[str, Any]],
+) -> tuple[dict[int, torch.Tensor], dict[int, CaptureMeta] | None]:
+    """Rebuild per-layer tensors AND their row labels.
+
+    Returns ``(tensors, meta)`` where ``meta[layer]`` labels each row of
+    ``tensors[layer]`` with (request id, absolute position, token id).
+    ``meta`` is None when the engine captured rows without batch
+    geometry (it warns engine-side) or when talking to an engine
+    predating labelled rows.
+    """
+    tensors = deserialize_hidden_states(serialized_data)
+    meta: dict[int, CaptureMeta] = {}
+    for layer_id, info in serialized_data.items():
+        m = info.get("meta")
+        if m is None:
+            return tensors, None
+        req_idx = np.frombuffer(m["req_idx"], dtype=np.int32)
+        table = m["req_table"]
+        meta[layer_id] = CaptureMeta(
+            req_ids=[table[i] for i in req_idx],
+            positions=torch.from_numpy(
+                np.frombuffer(m["positions"], dtype=np.int32).copy()
+            ),
+            token_ids=torch.from_numpy(
+                np.frombuffer(m["token_ids"], dtype=np.int32).copy()
+            ),
+        )
+    return tensors, (meta if meta else None)
+
+
 def print_hidden_states_summary(
     hidden_states: dict[int, torch.Tensor],
 ) -> None:

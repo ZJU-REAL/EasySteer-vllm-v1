@@ -8,6 +8,7 @@ steer vectors, allowing dynamic control over model behavior.
 
 from vllm.steer_vectors.api import (
     ApplySpec,
+    SelectSpec,
     SteeringSpec,
     VectorSpec,
     to_engine_request,
@@ -24,6 +25,7 @@ from vllm.steer_vectors.worker_manager import WorkerSteerVectorManager
 __all__ = [
     # v2 user-facing API
     "ApplySpec",
+    "SelectSpec",
     "SteeringSpec",
     "VectorSpec",
     "to_engine_request",

@@ -190,6 +190,13 @@ class ForwardContext:
       attention metadata which varies across backends
     """
 
+    req_ids: list[str] | None = None
+    """Request id per batch sample, ordered by batch index.
+    - Length: num_samples (aligned with query_start_loc segments)
+    - Used by capture to label stored rows with a stable per-request
+      identity across scheduler steps
+    """
+
     steer_token_slots: torch.Tensor | None = None
     """Per-request steering routing: [total_tokens] config slot id for each
     batch token (-1 = unsteered). None when no per-request configs are live.
@@ -273,6 +280,7 @@ def create_forward_context(
     num_output_tokens_cpu: torch.Tensor | None = None,
     num_prompt_tokens_cpu: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    req_ids: list[str] | None = None,
     steer_token_slots: torch.Tensor | None = None,
     steer_active_slots: list[int] | None = None,
 ):
@@ -298,6 +306,7 @@ def create_forward_context(
         num_output_tokens_cpu=num_output_tokens_cpu,
         num_prompt_tokens_cpu=num_prompt_tokens_cpu,
         query_start_loc=query_start_loc,
+        req_ids=req_ids,
         steer_token_slots=steer_token_slots,
         steer_active_slots=steer_active_slots,
     )
@@ -335,6 +344,7 @@ def set_forward_context(
     num_output_tokens_cpu: torch.Tensor | None = None,
     num_prompt_tokens_cpu: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    req_ids: list[str] | None = None,
     steer_token_slots: torch.Tensor | None = None,
     steer_active_slots: list[int] | None = None,
 ):
@@ -411,6 +421,7 @@ def set_forward_context(
         num_output_tokens_cpu=num_output_tokens_cpu,
         num_prompt_tokens_cpu=num_prompt_tokens_cpu,
         query_start_loc=query_start_loc,
+        req_ids=req_ids,
         steer_token_slots=steer_token_slots,
         steer_active_slots=steer_active_slots,
     )

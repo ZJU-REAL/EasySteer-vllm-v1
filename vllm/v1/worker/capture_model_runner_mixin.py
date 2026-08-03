@@ -87,10 +87,12 @@ class CaptureModelRunnerMixin:
         """Enable a capture stream ('hidden_states' or 'router_logits').
 
         config_kwargs: layers (list|None), dtype (e.g. 'float16'),
-        positions ('all'|'last'|'mean'|list of absolute positions,
-        negatives from the prompt end), token_ids (list|None — capture
-        only rows whose input token id matches; unions with a positions
-        list), max_tokens (int|None).
+        select (SelectSpec wire dict — the shared where-clause language,
+        see vllm.steer_vectors.SelectSpec.to_wire()), positions
+        ('all'|'last'|'mean'; a list of absolute positions is legacy
+        sugar for a select clause, negatives from the prompt end),
+        token_ids (legacy sugar: rows whose input token id matches,
+        unions with a positions list), max_tokens (int|None).
         """
         self._check_capture_compatible()
         self._capture_session().enable_stream(stream, **config_kwargs)

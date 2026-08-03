@@ -48,18 +48,23 @@ def _require_nonempty(name: str, value: list | None) -> None:
         raise ValueError(f"{name} must be None or non-empty (None disables the filter)")
 
 
-class ApplySpec(BaseModel):
-    """Where and when a vector applies.
+class SelectSpec(BaseModel):
+    """The shared token-selection language (where-clause).
+
+    One selection semantics used by both steering (`ApplySpec`, "which
+    tokens to steer") and capture ("which rows to extract"): resolved
+    identically by the trigger collector, so a clause means the same
+    thing in both systems.
 
     Args:
-        phases: Which token kinds to steer ("prompt", "generation").
-            Required and non-empty; with no other filters the vector
-            applies to every token of the listed phases.
+        phases: Which token kinds to select ("prompt", "generation").
+            Required and non-empty; with no other filters the clause
+            selects every token of the listed phases.
         tokens: Token-id allowlist (real ids, >= 0).
         positions: Absolute sequence positions; negative values are
             Python-style from the end of the prompt.
-        exclude_tokens: Token ids to never steer.
-        exclude_positions: Positions to never steer (same convention).
+        exclude_tokens: Token ids to never select.
+        exclude_positions: Positions to never select (same convention).
         generation_window: Half-open (start, stop) over 0-based decode
             steps; stop=None means unbounded. Requires "generation" in
             phases.
@@ -78,7 +83,7 @@ class ApplySpec(BaseModel):
     generation_window: tuple[int, int | None] | None = None
 
     @model_validator(mode="after")
-    def _validate(self) -> "ApplySpec":
+    def _validate(self) -> "SelectSpec":
         if not self.phases:
             raise ValueError("phases must be non-empty")
         if len(set(self.phases)) != len(self.phases):
@@ -124,6 +129,42 @@ class ApplySpec(BaseModel):
             "exclude_positions": self.exclude_positions,
             "window": window,
         }
+
+    @classmethod
+    def from_wire(cls, wire: dict[str, Any]) -> "SelectSpec":
+        """Validate and rebuild a spec from its `to_wire()` dict.
+
+        Used engine-side to reject malformed selection clauses at
+        enable time instead of failing mid-forward.
+        """
+        known = {
+            "phases",
+            "tokens",
+            "positions",
+            "exclude_tokens",
+            "exclude_positions",
+            "window",
+        }
+        unknown = set(wire) - known
+        if unknown:
+            raise ValueError(f"unknown selection fields: {sorted(unknown)}")
+        window = wire.get("window")
+        return cls(
+            phases=wire.get("phases", []),
+            tokens=wire.get("tokens"),
+            positions=wire.get("positions"),
+            exclude_tokens=wire.get("exclude_tokens"),
+            exclude_positions=wire.get("exclude_positions"),
+            generation_window=tuple(window) if window is not None else None,
+        )
+
+
+class ApplySpec(SelectSpec):
+    """Where and when a steering vector applies.
+
+    The selection language itself lives in `SelectSpec` (shared with
+    capture); `ApplySpec` is the steering-facing name.
+    """
 
 
 class VectorSpec(BaseModel):

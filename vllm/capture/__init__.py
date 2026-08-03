@@ -13,8 +13,11 @@ from vllm.capture.request import (
     MoERouterLogitsCaptureRequest,
 )
 from vllm.capture.serde import (
+    CaptureMeta,
+    deserialize_captured,
     deserialize_hidden_states,
     deserialize_moe_router_logits,
+    match_capture_request_id,
     print_hidden_states_summary,
     print_moe_router_logits_summary,
 )
@@ -32,6 +35,9 @@ __all__ = [
     "StreamConfig",
     "HiddenStatesCaptureRequest",
     "MoERouterLogitsCaptureRequest",
+    "CaptureMeta",
+    "deserialize_captured",
+    "match_capture_request_id",
     "deserialize_hidden_states",
     "print_hidden_states_summary",
     "deserialize_moe_router_logits",

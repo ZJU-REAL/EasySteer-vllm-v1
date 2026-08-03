@@ -83,6 +83,8 @@ def make_steer_vector_forward_kwargs(
         "num_output_tokens_cpu": torch.from_numpy(num_output),
         "num_prompt_tokens_cpu": torch.from_numpy(np.ascontiguousarray(prefill_len)),
         "query_start_loc": input_batch.query_start_loc[: num_reqs + 1],
+        # Capture labels each stored row with its owning request.
+        "req_ids": list(input_batch.req_ids[:num_reqs]),
     }
 
     if state is not None and (state.has_routed() or default_slot >= 0):

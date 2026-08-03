@@ -4426,6 +4426,12 @@ class GPUModelRunner(
         except Exception:
             query_start_loc_tensor = None
 
+        req_ids_list: list[str] | None = None
+        if self.input_batch.num_reqs > 0:
+            req_ids_list = [""] * self.input_batch.num_reqs
+            for req_id, req_index in self.input_batch.req_id_to_index.items():
+                req_ids_list[req_index] = req_id
+
         with (
             set_forward_context(
                 attn_metadata,
@@ -4441,6 +4447,7 @@ class GPUModelRunner(
                 num_computed_tokens_cpu=num_computed_tokens_cpu_tensor,
                 num_output_tokens_cpu=num_output_tokens_cpu_tensor,
                 query_start_loc=query_start_loc_tensor,
+                req_ids=req_ids_list,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
