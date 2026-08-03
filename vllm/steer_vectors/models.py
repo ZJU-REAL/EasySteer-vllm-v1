@@ -204,6 +204,13 @@ class SteerControllerManager:
                 layer_id = extract_layer_id_from_module_name(module_name)
                 if layer_id is not None:
                     controller.set_layer_id(layer_id)
+                else:
+                    logger.warning(
+                        "Decoder layer %s has no numeric layer id in its "
+                        "module name; it can never be targeted by "
+                        "layer-indexed steering configs.",
+                        module_name,
+                    )
                 controller._op_key = module_name
                 steer_ops.register_controller(module_name, controller)
                 handle = module.register_forward_hook(controller.process_output_hook)
@@ -240,6 +247,13 @@ class SteerControllerManager:
                 layer_id = extract_layer_id_from_module_name(module_name)
                 if layer_id is not None:
                     controller.set_layer_id(layer_id)
+                else:
+                    logger.warning(
+                        "MoE block %s has no numeric layer id in its "
+                        "module name; it can never be targeted by "
+                        "layer-indexed steering configs.",
+                        module_name,
+                    )
                 controller._op_key = op_key
                 steer_ops.register_controller(op_key, controller)
                 handle = gate.register_forward_hook(controller.process_gate_output_hook)

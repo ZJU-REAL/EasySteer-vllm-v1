@@ -33,10 +33,9 @@ class CaptureModelRunnerMixin:
         their hidden states / router logits cannot be captured (verified:
         a warm-cache request captures only the uncached suffix).
         """
-        vllm_config = getattr(self, "vllm_config", None)
+        vllm_config = self.vllm_config
         if (
-            vllm_config is not None
-            and vllm_config.cache_config is not None
+            vllm_config.cache_config is not None
             and vllm_config.cache_config.enable_prefix_caching
         ):
             raise RuntimeError(
@@ -44,7 +43,7 @@ class CaptureModelRunnerMixin:
                 "hits skip recomputation, so the cached tokens' states "
                 "would be silently missing from the capture."
             )
-        if vllm_config is not None and not vllm_config.use_v2_model_runner:
+        if not vllm_config.use_v2_model_runner:
             raise RuntimeError(
                 "Capture requires the V2 model runner (the V1 runner "
                 "provides degraded batch geometry: no prompt lengths, no "
@@ -62,8 +61,7 @@ class CaptureModelRunnerMixin:
         """
         session = self._capture_session()
         enforce_eager = (
-            getattr(self, "vllm_config", None) is not None
-            and self.vllm_config.model_config is not None
+            self.vllm_config.model_config is not None
             and self.vllm_config.model_config.enforce_eager
         )
         if not enforce_eager:

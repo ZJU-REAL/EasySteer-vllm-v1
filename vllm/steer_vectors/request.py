@@ -278,6 +278,20 @@ class SteerVectorRequest(
                     "Must specify steer_vector_local_path in single-vector mode "
                     "(except for moe_router algorithm)"
                 )
+            if self.algorithm == "moe_router" and self.moe_mode is not None:
+                from vllm.steer_vectors.algorithms.moe_router import (
+                    MoERouterAlgorithm,
+                )
+
+                known = (
+                    set(MoERouterAlgorithm.CANONICAL_MODES)
+                    | set(MoERouterAlgorithm.MODE_ALIASES)
+                )
+                if self.moe_mode not in known:
+                    raise ValueError(
+                        f"unknown moe_mode {self.moe_mode!r}; expected "
+                        f"one of {sorted(known)}"
+                    )
             if self.algorithm == "moe_router" and not self.steer_vector_local_path:
                 if not self.moe_expert_ids:
                     raise ValueError(

@@ -48,14 +48,13 @@ class DirectAlgorithm(AlgorithmTemplate):
     def _load_from_pt(
         cls, path: str, device: str, config, target_layers: list[int] | None
     ) -> dict:
-        """Load a single-layer direction vector from a .pt file.
+        """Load a direction vector from a .pt file.
 
-        The file holds one tensor; it is assigned to the first (and
-        only) entry of target_layers.
+        The file holds one tensor; it is applied to every entry of
+        target_layers (matching the linear and lm_steer loaders).
         """
         if not target_layers:
             raise ValueError("Loading .pt files requires non-empty target_layers")
-        target_layer = target_layers[0]
 
         # weights_only=False: vectors may be saved as numpy arrays.
         vector = torch.load(path, map_location=device, weights_only=False)
@@ -66,7 +65,9 @@ class DirectAlgorithm(AlgorithmTemplate):
                 f"PT file does not contain a tensor or numpy array: {type(vector)}"
             )
         vector = vector.to(device).to(config.adapter_dtype)
-        return {"layer_payloads": {target_layer: vector}}
+        return {
+            "layer_payloads": {layer: vector for layer in target_layers}
+        }
 
     @classmethod
     def _load_from_reft_dir(

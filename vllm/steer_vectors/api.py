@@ -210,6 +210,21 @@ class VectorSpec(BaseModel):
                 f"unknown params for algorithm '{self.algorithm}': "
                 f"{sorted(unknown)} (allowed: {sorted(allowed) or 'none'})"
             )
+        if self.algorithm == "moe_router" and "mode" in self.params:
+            from vllm.steer_vectors.algorithms.moe_router import (
+                MoERouterAlgorithm,
+            )
+
+            mode = self.params["mode"]
+            known = (
+                set(MoERouterAlgorithm.CANONICAL_MODES)
+                | set(MoERouterAlgorithm.MODE_ALIASES)
+            )
+            if mode not in known:
+                raise ValueError(
+                    f"unknown moe_router mode {mode!r}; expected one of "
+                    f"{sorted(known)}"
+                )
         if self.algorithm == "moe_router" and self.source is None:
             if not self.params.get("expert_ids"):
                 raise ValueError(

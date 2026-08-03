@@ -30,9 +30,17 @@ class SteerVectorState:
     ) -> None:
         if steer_vector_request is None:
             return
+        if manager is None:
+            # Admission should have rejected this; routing the request to
+            # the server config (or to nothing) would silently steer with
+            # the wrong vector.
+            raise RuntimeError(
+                f"request {req_id} carries a steering config but this "
+                "worker has no steer vector manager (engine launched "
+                "without enable_steer_vector=True)"
+            )
         self._requests[req_id] = steer_vector_request
-        if manager is not None:
-            self._slots[req_id] = manager.acquire_config(req_id, steer_vector_request)
+        self._slots[req_id] = manager.acquire_config(req_id, steer_vector_request)
 
     def remove_request(self, req_id: str, manager) -> None:
         if self._requests.pop(req_id, None) is None:

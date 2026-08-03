@@ -84,11 +84,16 @@ class ConceptReplaceAlgorithm(AlgorithmTemplate):
                 h1_path = f
             elif basename == "h2.gguf" or "_h2" in basename:
                 h2_path = f
-        # Fallback: first two files alphabetically.
-        if h1_path is None:
-            h1_path = gguf_files[0]
-        if h2_path is None:
-            h2_path = next(f for f in gguf_files if f != h1_path)
+        # The substitution h + λ(h1 - h2) is direction-sensitive, so the
+        # roles must be named explicitly — guessing (e.g. alphabetical
+        # order) can silently run the replacement backwards.
+        if h1_path is None or h2_path is None:
+            raise ValueError(
+                "ConceptReplaceAlgorithm could not identify the h1/h2 "
+                f"roles among {sorted(os.path.basename(f) for f in gguf_files)}; "
+                "name the files 'h1.gguf'/'h2.gguf' (or '*_h1*'/'*_h2*') "
+                "— h1 is the concept steered toward, h2 the one replaced."
+            )
 
         logger.debug("Loading concept vectors: h1=%s, h2=%s", h1_path, h2_path)
         h1_weights = read_gguf_directions(h1_path, device, config.adapter_dtype)

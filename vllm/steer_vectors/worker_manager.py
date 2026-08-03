@@ -327,6 +327,7 @@ class WorkerSteerVectorManager:
             layer_ids.update(
                 layer_idx for layer_idx in payloads if not tl or layer_idx in tl
             )
+        configured = 0
         for layer_idx in sorted(layer_ids):
             layer_specs = []
             for fields, payloads in specs:
@@ -343,6 +344,15 @@ class WorkerSteerVectorManager:
                 layer_idx, controller_type
             ):
                 module.configure_slot(slot, layer_specs, conflict_resolution)
+                configured += 1
+        if configured == 0:
+            payload_layers = sorted({l for _, p in specs for l in p})
+            targets = [fields.get("target_layers") for fields, _ in specs]
+            raise ValueError(
+                "steering config targets no modules — the request would "
+                f"steer nothing (vector payload layers {payload_layers}, "
+                f"target_layers {targets}, controller {controller_type!r})"
+            )
 
     def _build_moe_model(self, request: SteerVectorRequest) -> LoadedSteerVector:
         if not request.local_path:

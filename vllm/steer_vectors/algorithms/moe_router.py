@@ -61,6 +61,8 @@ class MoERouterAlgorithm(AlgorithmTemplate):
     }
     """
 
+    CANONICAL_MODES = ("activate", "deactivate", "soft", "soft_topk",
+                       "soft_random")
     MODE_ALIASES = {
         "boost": "activate",
         "soft_hard": "activate",
@@ -237,9 +239,27 @@ class MoERouterAlgorithm(AlgorithmTemplate):
             activate_ids += expert_ids
         else:
             deactivate_ids += expert_ids
+        invalid = [
+            e for e in activate_ids + deactivate_ids
+            if not 0 <= e < n_experts
+        ]
+        if invalid:
+            # Raising here would kill the engine mid-forward; warn loudly
+            # instead — a silently ignored expert id reads as "steering
+            # has no effect".
+            logger.warning_once(
+                "moe_router: expert ids %s are outside [0, %d) for this "
+                "model and are ignored.",
+                sorted(set(invalid)),
+                n_experts,
+            )
         activate_ids = [e for e in activate_ids if 0 <= e < n_experts]
         deactivate_ids = [e for e in deactivate_ids if 0 <= e < n_experts]
         if not activate_ids and not deactivate_ids:
+            logger.warning_once(
+                "moe_router: no in-range expert ids remain; expert "
+                "steering is a no-op."
+            )
             return router_logits
         epsilon = params.get("epsilon", 0.01)
 

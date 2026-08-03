@@ -787,7 +787,7 @@ class GPUModelRunner(
             self.prompt_logprobs_worker.remove_request(req_id)
         self.lora_state.remove_request(req_id)
         self.steer_vector_state.remove_request(
-            req_id, getattr(self, "steer_vector_manager", None)
+            req_id, self.steer_vector_manager
         )
         capture_session = getattr(self, "capture_session", None)
         if capture_session is not None:
@@ -848,7 +848,7 @@ class GPUModelRunner(
             self.steer_vector_state.add_request(
                 req_id,
                 new_req_data.steer_vector_request,
-                getattr(self, "steer_vector_manager", None),
+                self.steer_vector_manager,
             )
             if new_req_data.capture_select is not None:
                 self._capture_session().add_request(
@@ -1407,7 +1407,7 @@ class GPUModelRunner(
                         "vllm::steer_apply in splitting_ops. Launch with "
                         "enforce_eager=True or default config validation."
                     )
-                manager = getattr(self, "steer_vector_manager", None)
+                manager = self.steer_vector_manager
                 steer_vector_kwargs = make_steer_vector_forward_kwargs(
                     input_batch,
                     self.steer_vector_state,
