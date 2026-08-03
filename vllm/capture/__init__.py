@@ -8,10 +8,6 @@ vllm.v1.worker.capture_model_runner_mixin. Importable as
 ``vllm.hidden_states`` for backward compatibility.
 """
 
-from vllm.capture.request import (
-    HiddenStatesCaptureRequest,
-    MoERouterLogitsCaptureRequest,
-)
 from vllm.capture.serde import (
     CaptureMeta,
     deserialize_captured,
@@ -33,8 +29,6 @@ __all__ = [
     "ROUTER_LOGITS",
     "CaptureSession",
     "StreamConfig",
-    "HiddenStatesCaptureRequest",
-    "MoERouterLogitsCaptureRequest",
     "CaptureMeta",
     "deserialize_captured",
     "match_capture_request_id",

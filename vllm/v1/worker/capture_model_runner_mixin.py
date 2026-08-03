@@ -49,6 +49,15 @@ class CaptureModelRunnerMixin:
                 "hits skip recomputation, so the cached tokens' states "
                 "would be silently missing from the capture."
             )
+        if vllm_config is not None and not vllm_config.use_v2_model_runner:
+            raise RuntimeError(
+                "Capture requires the V2 model runner (the V1 runner "
+                "provides degraded batch geometry: no prompt lengths, no "
+                "request identity on its graph path). Set "
+                "VLLM_USE_V2_MODEL_RUNNER=1 — architectures outside the "
+                "default-V2 list either work or fail explicitly at "
+                "engine build."
+            )
 
     def _attach_capture_hooks(self, model: nn.Module) -> nn.Module:
         """Attach capture hooks (once, at load). Model tree is untouched.

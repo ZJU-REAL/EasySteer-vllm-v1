@@ -66,12 +66,26 @@ class StreamConfig:
         self,
         layers: list[int] | None = None,
         dtype: str | None = None,
-        positions: "str | list[int]" = "all",
+        reduce: str = "all",
+        select: dict | None = None,
+        budget_rows: int | None = None,
+        positions: "str | list[int] | None" = None,
         token_ids: list[int] | None = None,
         max_tokens: int | None = None,
-        select: dict | None = None,
     ):
         from vllm.steer_vectors.api import SelectSpec
+
+        # Legacy aliases: positions ("all"/"last"/"mean") -> reduce;
+        # a positions LIST/token_ids -> select clause; max_tokens ->
+        # budget_rows.
+        if max_tokens is not None:
+            budget_rows = max_tokens
+        if positions is not None:
+            pass  # handled below (string reduce or legacy list)
+        elif reduce != "all":
+            positions = reduce
+        else:
+            positions = "all"
 
         legacy_positions: list[int] | None = None
         if isinstance(positions, (list, tuple)):
@@ -118,10 +132,10 @@ class StreamConfig:
 
         self.layers = set(layers) if layers is not None else None
         self.dtype = getattr(torch, dtype) if dtype else None
-        self.positions = positions
+        self.reduce = positions
         self.select = select
-        self.max_tokens = max_tokens
-        if positions == "all" and select is None and max_tokens is None:
+        self.budget_rows = budget_rows
+        if positions == "all" and select is None and budget_rows is None:
             logger.warning_once(
                 "Capture enabled with positions='all', no select clause "
                 "and no max_tokens budget: every position of every "
@@ -210,18 +224,18 @@ class StreamStore:
                 t.shape[0] for lid, t, _, _ in self._pending if lid == layer_id
             )
             stored += pending
-            if self.config.max_tokens is not None and stored >= self.config.max_tokens:
+            if self.config.budget_rows is not None and stored >= self.config.budget_rows:
                 self.tokens_dropped += tensor.shape[0]
                 if not self._warned_budget:
                     self._warned_budget = True
                     logger.warning(
                         "Capture token budget (%d rows per layer) "
                         "reached; further tokens are dropped.",
-                        self.config.max_tokens,
+                        self.config.budget_rows,
                     )
                 return
-            if self.config.max_tokens is not None:
-                keep = self.config.max_tokens - stored
+            if self.config.budget_rows is not None:
+                keep = self.config.budget_rows - stored
                 if tensor.shape[0] > keep:
                     self.tokens_dropped += tensor.shape[0] - keep
                     tensor = tensor[:keep]
@@ -419,8 +433,9 @@ def _prepare_rows(
         if ctx is not None and ctx.attn_metadata is not None
         else None
     )
-    current_tokens = getattr(ctx, "current_tokens", None) if ctx else None
-    ctx_req_ids = getattr(ctx, "req_ids", None) if ctx else None
+    geo = getattr(ctx, "batch_geometry", None) if ctx else None
+    current_tokens = geo.token_ids if geo is not None else None
+    ctx_req_ids = geo.req_ids if geo is not None else None
 
     # Per-request selection overrides for this stream, keyed by the
     # batch sample index (request ids in the context are the
@@ -434,7 +449,7 @@ def _prepare_rows(
 
     needs_selection = config.selects_rows or bool(overrides)
     if samples_info is None or (needs_selection and current_tokens is None):
-        if needs_selection or config.positions != "all":
+        if needs_selection or config.reduce != "all":
             logger.warning_once(
                 "Capture selection/reduction requested but batch "
                 "geometry is unavailable; keeping all rows unlabelled "
@@ -508,7 +523,7 @@ def _prepare_rows(
         )
         if indices is None:
             return None, None
-    elif config.positions == "last":
+    elif config.reduce == "last":
         starts = qsl[:-1].clamp(max=total)
         ends = qsl[1:].clamp(max=total)
         indices = (ends - 1).clamp(min=0)
@@ -518,7 +533,7 @@ def _prepare_rows(
                 num_prompt.to(ends.device)
             )
             indices = indices[final]
-    elif config.positions == "mean":
+    elif config.reduce == "mean":
         return _mean_reduce(tensor, store, ctx, qsl, total, num_computed, num_prompt)
     else:  # "all"
         indices = all_positions
@@ -540,7 +555,8 @@ def _row_labels(
     total: int,
 ) -> torch.Tensor | None:
     """Build int32 [rows, 3] (req_idx, position, token_id) labels."""
-    req_ids = getattr(ctx, "req_ids", None) if ctx else None
+    geo = getattr(ctx, "batch_geometry", None) if ctx else None
+    req_ids = geo.req_ids if geo is not None else None
     if req_ids is None or current_tokens is None:
         logger.warning_once(
             "Capture cannot label rows: the runner did not provide "
@@ -590,7 +606,8 @@ def _mean_reduce(
     for s, e in zip(starts.tolist(), ends.tolist()):
         rows.append(tensor[s:e].mean(dim=0) if e > s else torch.zeros_like(tensor[0]))
     stacked = torch.stack(rows)
-    req_ids = getattr(ctx, "req_ids", None) if ctx else None
+    geo = getattr(ctx, "batch_geometry", None) if ctx else None
+    req_ids = geo.req_ids if geo is not None else None
     if req_ids is None:
         logger.warning_once(
             "Capture cannot label rows: the runner did not provide "
@@ -642,11 +659,11 @@ class CaptureSession:
                     stream,
                 )
                 continue
-            if store.config.positions != "all":
+            if store.config.reduce != "all":
                 logger.warning_once(
                     "Per-request capture selects cannot combine with "
                     "the %r reduction; the override is ignored.",
-                    store.config.positions,
+                    store.config.reduce,
                 )
                 continue
             accepted[stream] = wire
@@ -853,7 +870,7 @@ class CaptureSession:
             "layers_captured": len(store.chunks),
             "tokens_stored": store.tokens_stored,
             "tokens_dropped": store.tokens_dropped,
-            "positions": store.config.positions,
+            "reduce": store.config.reduce,
             "select": store.config.select,
             "meta_complete": store.meta_complete,
         }

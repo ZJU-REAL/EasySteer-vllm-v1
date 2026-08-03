@@ -4384,54 +4384,9 @@ class GPUModelRunner(
                 ubatch_slices_padded,
             )
 
-        # Prepare current_tokens for steer vectors (supports continuous batching)
-        current_tokens_tensor = None
-        try:
-            if input_ids is not None:
-                current_tokens_tensor = input_ids
-                if current_tokens_tensor.dim() > 1:
-                    current_tokens_tensor = current_tokens_tensor.view(-1)
-            elif hasattr(self, 'input_ids') and hasattr(self.input_ids, 'gpu'):
-                num_scheduled = scheduler_output.total_num_scheduled_tokens
-                current_tokens_tensor = self.input_ids.gpu[:num_scheduled]
-        except Exception:
-            current_tokens_tensor = None
-
-        num_computed_tokens_cpu_tensor = None
-        if hasattr(self.input_batch, "num_computed_tokens_cpu"):
-            num_reqs = self.input_batch.num_reqs
-            num_computed_tokens_cpu_tensor = self.input_batch.num_computed_tokens_cpu[:num_reqs]
-
-        num_output_tokens_cpu_tensor = None
-        try:
-            if self.input_batch.num_reqs > 0:
-                num_output_tokens_list = [0] * self.input_batch.num_reqs
-                for req_id, req_index in self.input_batch.req_id_to_index.items():
-                    req_state = self.requests.get(req_id)
-                    if req_state is not None:
-                        num_output_tokens_list[req_index] = len(req_state.output_token_ids)
-
-                num_output_tokens_cpu_tensor = torch.tensor(
-                    num_output_tokens_list,
-                    dtype=torch.int32,
-                    device='cpu',
-                    pin_memory=self.pin_memory
-                )
-        except Exception:
-            num_output_tokens_cpu_tensor = None
-
-        query_start_loc_tensor = None
-        try:
-            query_start_loc_tensor = self.query_start_loc.gpu[: num_reqs + 1]
-        except Exception:
-            query_start_loc_tensor = None
-
-        req_ids_list: list[str] | None = None
-        if self.input_batch.num_reqs > 0:
-            req_ids_list = [""] * self.input_batch.num_reqs
-            for req_id, req_index in self.input_batch.req_id_to_index.items():
-                req_ids_list[req_index] = req_id
-
+        # Steering and capture both require the V2 runner (enforced at
+        # config validation and capture enable respectively), so this
+        # runner provides no steering/capture forward-context fields.
         with (
             set_forward_context(
                 attn_metadata,
@@ -4443,11 +4398,6 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
-                current_tokens=current_tokens_tensor,
-                num_computed_tokens_cpu=num_computed_tokens_cpu_tensor,
-                num_output_tokens_cpu=num_output_tokens_cpu_tensor,
-                query_start_loc=query_start_loc_tensor,
-                req_ids=req_ids_list,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -6138,39 +6088,8 @@ class GPUModelRunner(
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
 
-            # Prepare current_tokens for steer vectors (supports continuous batching)
-            # In V1 continuous batching, input_ids contains all tokens (decode + prefill) concatenated.
-            # Steer vector algorithms will use query_start_loc to slice out per-sample tokens.
-            current_tokens_tensor = None
-            try:
-                if input_ids is not None:
-                    current_tokens_tensor = input_ids
-                    # Flatten if multi-dimensional
-                    if current_tokens_tensor.dim() > 1:
-                        current_tokens_tensor = current_tokens_tensor.view(-1)
-                elif hasattr(self, 'input_ids') and hasattr(self.input_ids, 'gpu'):
-                    # Fallback for multimodal/VL models where input_ids may be None
-                    # Use self.input_ids.gpu which contains ALL positions (including image placeholders)
-                    # This ensures alignment with hidden_states dimensions
-                    # Note: Image positions will have placeholder token IDs, but the is_token_ids mask
-                    # (if available) can be used by algorithms to distinguish text vs image tokens
-                    current_tokens_tensor = self.input_ids.gpu[:num_tokens_after_padding]
-            except Exception:
-                current_tokens_tensor = None
-            
-            # Prepare num_computed_tokens_cpu for prefix cache support in steer vectors (CUDA graph path)
-            num_computed_tokens_cpu_tensor = None
-            if hasattr(self.input_batch, "num_computed_tokens_cpu"):
-                num_reqs = num_reqs  # Already defined earlier in this function
-                num_computed_tokens_cpu_tensor = self.input_batch.num_computed_tokens_cpu[:num_reqs]
-
-            # Prepare query_start_loc for steer vectors (CUDA graph path)
-            query_start_loc_tensor = None
-            try:
-                query_start_loc_tensor = self.query_start_loc.gpu[: num_reqs + 1]
-            except Exception:
-                query_start_loc_tensor = None
-
+            # Steering/capture forward-context fields are V2-runner-only
+            # (both features are gated onto V2), so none are set here.
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
                 set_forward_context(
@@ -6182,9 +6101,6 @@ class GPUModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
-                    current_tokens=current_tokens_tensor,
-                    num_computed_tokens_cpu=num_computed_tokens_cpu_tensor,
-                    query_start_loc=query_start_loc_tensor,
                 ),
             ):
                 outputs = self.model(

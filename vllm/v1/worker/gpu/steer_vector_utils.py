@@ -48,24 +48,15 @@ class SteerVectorState:
         return bool(self._slots)
 
 
-def make_steer_vector_forward_kwargs(
-    input_batch: InputBatch,
-    state: SteerVectorState | None = None,
-    default_slot: int = -1,
-) -> dict:
-    """Build the ForwardContext fields consumed by steering algorithms.
+def build_batch_geometry(input_batch: InputBatch) -> "BatchGeometry":
+    """Build the per-step BatchGeometry from the runner's InputBatch.
 
-    All arrays are in batch order, matching query_start_loc boundaries:
-    - current_tokens: flat token ids of the (unpadded) batch
-    - num_computed_tokens_cpu: cached/computed tokens per request
-    - num_output_tokens_cpu: tokens generated so far per request
-    - query_start_loc: per-request token boundaries
-    - steer_token_slots / steer_active_slots: per-request config routing
-      (only when routed configs are live)
-
-    `default_slot` is the server-level config's slot (-1 when absent);
-    requests without their own steering config are routed to it.
+    The single producer of batch geometry: steering triggers, capture
+    row selection/labels, and the full-graph buffer filler all consume
+    this object (directly or via `geometry_samples_info`).
     """
+    from vllm.forward_context import BatchGeometry
+
     num_reqs = input_batch.num_reqs
     num_computed = input_batch.num_computed_tokens_np[:num_reqs]
     prefill_len = input_batch.prefill_len_np[:num_reqs]
@@ -77,15 +68,33 @@ def make_steer_vector_forward_kwargs(
     num_output = np.where(is_prefilling, 0, num_computed - prefill_len + 1).astype(
         np.int32
     )
-    kwargs = {
-        "current_tokens": input_batch.input_ids[: input_batch.num_tokens],
-        "num_computed_tokens_cpu": torch.from_numpy(np.ascontiguousarray(num_computed)),
-        "num_output_tokens_cpu": torch.from_numpy(num_output),
-        "num_prompt_tokens_cpu": torch.from_numpy(np.ascontiguousarray(prefill_len)),
-        "query_start_loc": input_batch.query_start_loc[: num_reqs + 1],
-        # Capture labels each stored row with its owning request.
-        "req_ids": list(input_batch.req_ids[:num_reqs]),
-    }
+    return BatchGeometry(
+        query_start_loc=input_batch.query_start_loc[: num_reqs + 1],
+        num_computed=torch.from_numpy(np.ascontiguousarray(num_computed)),
+        num_prompt=torch.from_numpy(np.ascontiguousarray(prefill_len)),
+        num_output=torch.from_numpy(num_output),
+        req_ids=list(input_batch.req_ids[:num_reqs]),
+        token_ids=input_batch.input_ids[: input_batch.num_tokens],
+    )
+
+
+def make_steer_vector_forward_kwargs(
+    input_batch: InputBatch,
+    state: SteerVectorState | None = None,
+    default_slot: int = -1,
+) -> dict:
+    """Build the ForwardContext fields consumed by steering and capture.
+
+    - batch_geometry: the per-step BatchGeometry (see build_batch_geometry)
+    - steer_token_slots / steer_active_slots: per-request config routing
+      (only when routed configs are live)
+
+    `default_slot` is the server-level config's slot (-1 when absent);
+    requests without their own steering config are routed to it.
+    """
+    num_reqs = input_batch.num_reqs
+    geo = build_batch_geometry(input_batch)
+    kwargs = {"batch_geometry": geo}
 
     if state is not None and (state.has_routed() or default_slot >= 0):
         slots_np = np.fromiter(
@@ -108,9 +117,9 @@ def make_steer_vector_forward_kwargs(
                 req_ids=input_batch.req_ids,
                 slots=slots_np.tolist(),
                 query_start_loc=input_batch.query_start_loc_np[: num_reqs + 1].tolist(),
-                token_ids=kwargs["current_tokens"].cpu().tolist(),
-                num_computed=num_computed.tolist(),
-                num_output=num_output.tolist(),
+                token_ids=geo.token_ids.cpu().tolist(),
+                num_computed=geo.num_computed.tolist(),
+                num_output=geo.num_output.tolist(),
             )
     return kwargs
 
@@ -165,30 +174,11 @@ def fill_graph_steer_buffers(
         device, non_blocking=True
     )
 
-    # Batch geometry for the trigger collector, from scheduler ground
-    # truth (is_prefilling_np), matching extract_samples_info.
-    current_tokens = input_batch.input_ids[: input_batch.num_tokens]
-    num_computed_np = input_batch.num_computed_tokens_np[:num_reqs]
-    prefill_len_np = input_batch.prefill_len_np[:num_reqs]
-    is_prefilling_np = input_batch.is_prefilling_np[:num_reqs]
-    num_output_np = np.where(
-        is_prefilling_np, 0, num_computed_np - prefill_len_np + 1
-    ).astype(np.int32)
-    samples_info = {
-        "query_start_loc": input_batch.query_start_loc[: num_reqs + 1],
-        "num_computed": torch.from_numpy(np.ascontiguousarray(num_computed_np)).to(
-            device, non_blocking=True
-        ),
-        "is_decode_mask": torch.from_numpy(np.ascontiguousarray(~is_prefilling_np)).to(
-            device, non_blocking=True
-        ),
-        "num_output_tokens": torch.from_numpy(num_output_np).to(
-            device, non_blocking=True
-        ),
-        "num_prompt_tokens": torch.from_numpy(np.ascontiguousarray(prefill_len_np)).to(
-            device, non_blocking=True
-        ),
-    }
+    # Batch geometry for the trigger collector: the same object the
+    # forward context carries, from the single producer.
+    geo = build_batch_geometry(input_batch)
+    current_tokens = geo.token_ids
+    samples_info = geo.samples_info()
 
     batch_slots = set(slots_np.tolist())
     for slot, (row, request, controllers) in entries.items():

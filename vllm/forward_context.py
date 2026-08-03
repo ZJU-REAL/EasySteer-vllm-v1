@@ -129,6 +129,51 @@ class DPMetadata:
 
 
 @dataclass
+class BatchGeometry:
+    """Per-step batch geometry consumed by steering triggers and capture.
+
+    All arrays are in batch order, aligned with query_start_loc
+    segments. Built once per step from the runner's InputBatch (see
+    vllm.v1.worker.gpu.steer_vector_utils.build_batch_geometry) — the
+    single source of truth replacing per-layer attention-metadata
+    parsing.
+    """
+
+    query_start_loc: torch.Tensor
+    """(num_samples + 1,) cumulative token counts per sample."""
+    num_computed: torch.Tensor
+    """(num_samples,) cached/computed tokens per request (prefix offset)."""
+    num_prompt: torch.Tensor
+    """(num_samples,) prompt length per request (negative positions,
+    chunked-prefill-stable)."""
+    num_output: torch.Tensor
+    """(num_samples,) tokens generated so far (0 while prefilling; also
+    classifies prompt vs generation phase)."""
+    req_ids: list[str]
+    """Engine-internal request id per sample (capture row labels)."""
+    token_ids: torch.Tensor
+    """(total_tokens,) flat input token ids of the unpadded batch."""
+
+    def samples_info(self) -> dict[str, torch.Tensor]:
+        """The trigger collector's samples_info view of this geometry.
+
+        Consumers index the per-sample tensors with GPU sample ids, so
+        everything is moved to query_start_loc's device once here.
+        """
+        device = self.query_start_loc.device
+        num_computed = self.num_computed.to(device, non_blocking=True)
+        num_output = self.num_output.to(device, non_blocking=True)
+        num_prompt = self.num_prompt.to(device, non_blocking=True)
+        return {
+            "query_start_loc": self.query_start_loc,
+            "num_computed": num_computed,
+            "is_decode_mask": num_output > 0,
+            "num_output_tokens": num_output,
+            "num_prompt_tokens": num_prompt,
+        }
+
+
+@dataclass
 class ForwardContext:
     # copy from vllm_config.compilation_config.static_forward_context
     no_compile_layers: dict[str, Any]
@@ -150,51 +195,11 @@ class ForwardContext:
 
     ubatch_slices: UBatchSlices | None = None
 
-    # Steer vector support: current tokens being processed
-    current_tokens: torch.Tensor | None = None
-    """Current batch token IDs being processed.
-    - Shape: (total_tokens,) - concatenated tokens from all samples in the batch
-    - Used by steer vectors for token-based triggers
-    - In V1 continuous batching, contains both decode and prefill tokens concatenated
-    """
-
-    num_computed_tokens_cpu: torch.Tensor | None = None
-    """Number of cached/computed tokens for each request in the batch.
-    - Shape: (batch_size,)
-    - Used by steer vectors to map apply_spec positions to absolute
-      sequence positions when prefix caching is enabled
-    - Value 0 means no tokens are cached for that request
-    """
-
-    num_output_tokens_cpu: torch.Tensor | None = None
-    """Number of output tokens already generated for each request in the batch.
-    - Shape: (batch_size,)
-    - Used by steer vectors for apply_spec generation windows
-    - Value 0 means the request is still prefilling (scheduler ground truth,
-      also used to classify prefill vs decode tokens)
-    """
-
-    num_prompt_tokens_cpu: torch.Tensor | None = None
-    """Prompt length of each request in the batch.
-    - Shape: (batch_size,)
-    - Used by steer vectors to resolve negative apply_spec positions
-      against the full prompt (correct under chunked prefill)
-    """
-
-    query_start_loc: torch.Tensor | None = None
-    """Sample boundary offsets for the current batch.
-    - Shape: (num_samples + 1,) - cumulative token counts per sample
-    - Used by steer vectors to determine per-sample token boundaries
-      for position-based apply_spec filters
-    - Backend-agnostic: stored here to avoid relying on per-layer
-      attention metadata which varies across backends
-    """
-
-    req_ids: list[str] | None = None
-    """Request id per batch sample, ordered by batch index.
-    - Length: num_samples (aligned with query_start_loc segments)
-    - Used by capture to label stored rows with a stable per-request
-      identity across scheduler steps
+    batch_geometry: "BatchGeometry | None" = None
+    """Per-step batch geometry for steering triggers and capture.
+    One cohesive object (see BatchGeometry) built once per step by the
+    V2 runner's steering/capture kwargs builder; backend-agnostic, so
+    consumers never parse per-layer attention metadata.
     """
 
     steer_token_slots: torch.Tensor | None = None
@@ -275,12 +280,7 @@ def create_forward_context(
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
-    current_tokens: torch.Tensor | None = None,
-    num_computed_tokens_cpu: torch.Tensor | None = None,
-    num_output_tokens_cpu: torch.Tensor | None = None,
-    num_prompt_tokens_cpu: torch.Tensor | None = None,
-    query_start_loc: torch.Tensor | None = None,
-    req_ids: list[str] | None = None,
+    batch_geometry: "BatchGeometry | None" = None,
     steer_token_slots: torch.Tensor | None = None,
     steer_active_slots: list[int] | None = None,
 ):
@@ -301,12 +301,7 @@ def create_forward_context(
         skip_compiled=skip_compiled,
         additional_kwargs=additional_kwargs or {},
         is_padding=is_padding,
-        current_tokens=current_tokens,
-        num_computed_tokens_cpu=num_computed_tokens_cpu,
-        num_output_tokens_cpu=num_output_tokens_cpu,
-        num_prompt_tokens_cpu=num_prompt_tokens_cpu,
-        query_start_loc=query_start_loc,
-        req_ids=req_ids,
+        batch_geometry=batch_geometry,
         steer_token_slots=steer_token_slots,
         steer_active_slots=steer_active_slots,
     )
@@ -339,12 +334,7 @@ def set_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
-    current_tokens: torch.Tensor | None = None,
-    num_computed_tokens_cpu: torch.Tensor | None = None,
-    num_output_tokens_cpu: torch.Tensor | None = None,
-    num_prompt_tokens_cpu: torch.Tensor | None = None,
-    query_start_loc: torch.Tensor | None = None,
-    req_ids: list[str] | None = None,
+    batch_geometry: "BatchGeometry | None" = None,
     steer_token_slots: torch.Tensor | None = None,
     steer_active_slots: list[int] | None = None,
 ):
@@ -416,12 +406,7 @@ def set_forward_context(
         additional_kwargs,
         skip_compiled,
         is_padding=is_padding,
-        current_tokens=current_tokens,
-        num_computed_tokens_cpu=num_computed_tokens_cpu,
-        num_output_tokens_cpu=num_output_tokens_cpu,
-        num_prompt_tokens_cpu=num_prompt_tokens_cpu,
-        query_start_loc=query_start_loc,
-        req_ids=req_ids,
+        batch_geometry=batch_geometry,
         steer_token_slots=steer_token_slots,
         steer_active_slots=steer_active_slots,
     )

@@ -359,41 +359,27 @@ def extract_samples_info(attn_metadata) -> dict[str, torch.Tensor] | None:
             'num_output_tokens': [num_samples] tensor of generated counts (or None)
         or None if query_start_loc is unavailable
     """
-    query_start_loc = get_query_start_loc(attn_metadata)
+    # Primary path: the runner's BatchGeometry on the forward context —
+    # scheduler ground truth, backend-agnostic, one producer.
+    ctx = _forward_context_or_none()
+    geo = getattr(ctx, "batch_geometry", None) if ctx is not None else None
+    if geo is not None:
+        return geo.samples_info()
 
+    # Fallback: backend attention metadata carries only query_start_loc
+    # (no real backend metadata class provides the per-request counts),
+    # so phases degrade to the single-token-chunk heuristic.
+    query_start_loc = _attn_metadata_field(attn_metadata, "query_start_loc")
     if query_start_loc is None or len(query_start_loc) <= 1:
         return None
-
-    num_computed_tokens_cpu = get_num_computed_tokens(attn_metadata)
-    num_output_tokens_cpu = get_num_output_tokens(attn_metadata)
-    num_prompt_tokens_cpu = get_num_prompt_tokens(attn_metadata)
-
-    # Downstream consumers index these with GPU sample ids; the runner
-    # provides CPU tensors, so move them to the batch device here once.
-    device = query_start_loc.device
-    if num_computed_tokens_cpu is not None:
-        num_computed_tokens_cpu = num_computed_tokens_cpu.to(device, non_blocking=True)
-    if num_output_tokens_cpu is not None:
-        num_output_tokens_cpu = num_output_tokens_cpu.to(device, non_blocking=True)
-    if num_prompt_tokens_cpu is not None:
-        num_prompt_tokens_cpu = num_prompt_tokens_cpu.to(device, non_blocking=True)
-
-    if num_output_tokens_cpu is not None:
-        # Scheduler ground truth: a request has generated output iff it
-        # finished prefilling. Correct for 1-token prompts and chunked
-        # prefill, where the length heuristic below misclassifies.
-        is_decode_mask = num_output_tokens_cpu > 0
-    else:
-        starts = query_start_loc[:-1]
-        ends = query_start_loc[1:]
-        is_decode_mask = (ends - starts) == 1
-
+    starts = query_start_loc[:-1]
+    ends = query_start_loc[1:]
     return {
         "query_start_loc": query_start_loc,
-        "num_computed": num_computed_tokens_cpu,
-        "is_decode_mask": is_decode_mask,
-        "num_output_tokens": num_output_tokens_cpu,
-        "num_prompt_tokens": num_prompt_tokens_cpu,
+        "num_computed": None,
+        "is_decode_mask": (ends - starts) == 1,
+        "num_output_tokens": None,
+        "num_prompt_tokens": None,
     }
 
 
@@ -416,40 +402,3 @@ def _attn_metadata_field(attn_metadata, field: str):
         attn_metadata = next(iter(attn_metadata.values()))
     return getattr(attn_metadata, field, None)
 
-
-def get_query_start_loc(attn_metadata) -> torch.Tensor | None:
-    """Extract query_start_loc (sample boundary offsets).
-
-    Primary path: read from ForwardContext.query_start_loc which is
-    backend-agnostic (works with FlashInfer, FlashAttn, Triton, etc.).
-    Fallback: read from per-layer attention metadata (only works for
-    backends that store query_start_loc directly, e.g. FlashAttn).
-    """
-    ctx = _forward_context_or_none()
-    if ctx is not None and ctx.query_start_loc is not None:
-        return ctx.query_start_loc
-    return _attn_metadata_field(attn_metadata, "query_start_loc")
-
-
-def get_num_computed_tokens(attn_metadata) -> torch.Tensor | None:
-    """Extract num_computed_tokens_cpu for prefix cache support."""
-    ctx = _forward_context_or_none()
-    if ctx is not None:
-        return ctx.num_computed_tokens_cpu
-    return _attn_metadata_field(attn_metadata, "num_computed_tokens_cpu")
-
-
-def get_num_output_tokens(attn_metadata) -> torch.Tensor | None:
-    """Extract num_output_tokens_cpu for generation position control."""
-    ctx = _forward_context_or_none()
-    if ctx is not None:
-        return ctx.num_output_tokens_cpu
-    return _attn_metadata_field(attn_metadata, "num_output_tokens_cpu")
-
-
-def get_num_prompt_tokens(attn_metadata) -> torch.Tensor | None:
-    """Extract num_prompt_tokens_cpu (per-request prompt length)."""
-    ctx = _forward_context_or_none()
-    if ctx is not None:
-        return ctx.num_prompt_tokens_cpu
-    return _attn_metadata_field(attn_metadata, "num_prompt_tokens_cpu")

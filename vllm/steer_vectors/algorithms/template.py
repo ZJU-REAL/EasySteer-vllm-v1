@@ -120,7 +120,8 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
         if forward_ctx is None:
             return None
 
-        current_tokens = forward_ctx.current_tokens
+        geo = forward_ctx.batch_geometry
+        current_tokens = geo.token_ids if geo is not None else None
         attn_metadata = forward_ctx.attn_metadata
 
         if current_tokens is None or attn_metadata is None:
