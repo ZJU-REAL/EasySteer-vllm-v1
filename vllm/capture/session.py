@@ -276,7 +276,10 @@ class StreamStore:
                 )
 
     def serialize(
-        self, layers: list[int] | None = None
+        self,
+        layers: list[int] | None = None,
+        req_ids: list[str] | None = None,
+        clear_selected: bool = False,
     ) -> dict[int, dict[str, Any]]:
         """Concatenate chunks and pack for RPC transmission.
 
@@ -290,12 +293,39 @@ class StreamStore:
         (``req_table`` request-id strings + int32 ``req_idx`` /
         ``positions`` / ``token_ids`` columns), or ``meta: None`` when
         any row was captured without batch geometry.
+
+        ``req_ids`` (client-visible ids) restricts the payload to rows
+        of those requests; with ``clear_selected`` the emitted rows are
+        also removed from the store, so clients can drain request by
+        request with bounded peak message size. Request filtering
+        requires labelled rows and raises otherwise.
         """
+        from vllm.capture.serde import match_capture_request_id
+
         with self.lock:
             if not self.meta_complete:
+                if req_ids is not None:
+                    raise RuntimeError(
+                        "Per-request fetch requires labelled rows, but "
+                        "this store holds rows captured without batch "
+                        "geometry."
+                    )
                 logger.warning_once(
                     "Capture rows were stored without batch geometry; "
                     "row labels (meta) are unavailable for this store."
+                )
+            table_match = None
+            if req_ids is not None:
+                table_match = torch.tensor(
+                    [
+                        i
+                        for i, rid in enumerate(self.req_table)
+                        if any(
+                            match_capture_request_id(rid, ext)
+                            for ext in req_ids
+                        )
+                    ],
+                    dtype=torch.int32,
                 )
             result: dict[int, dict[str, Any]] = {}
             wanted = sorted(self.chunks) if layers is None else [
@@ -303,16 +333,30 @@ class StreamStore:
             ]
             for layer_id in wanted:
                 tensor = torch.cat(self.chunks[layer_id], dim=0).contiguous()
+                meta = None
+                if self.meta_complete and layer_id in self.meta_chunks:
+                    meta = torch.cat(
+                        self.meta_chunks[layer_id], dim=0
+                    ).contiguous()
+                if table_match is not None:
+                    assert meta is not None
+                    row_mask = torch.isin(meta[:, 0], table_match)
+                    if clear_selected:
+                        keep = ~row_mask
+                        self.chunks[layer_id] = [tensor[keep]]
+                        self.meta_chunks[layer_id] = [meta[keep]]
+                        self._layer_rows[layer_id] = int(keep.sum())
+                    tensor = tensor[row_mask].contiguous()
+                    meta = meta[row_mask].contiguous()
+                    if tensor.shape[0] == 0:
+                        continue
                 orig_dtype = tensor.dtype
                 if tensor.dtype == torch.bfloat16:
                     wire = tensor.view(torch.int16)
                 else:
                     wire = tensor
                 meta_wire = None
-                if self.meta_complete and layer_id in self.meta_chunks:
-                    meta = torch.cat(
-                        self.meta_chunks[layer_id], dim=0
-                    ).contiguous()
+                if meta is not None:
                     meta_wire = {
                         "req_table": list(self.req_table),
                         "req_idx": meta[:, 0].numpy().tobytes(),
@@ -337,7 +381,10 @@ class StreamStore:
 
 
 def _prepare_rows(
-    tensor: torch.Tensor, store: StreamStore
+    tensor: torch.Tensor,
+    store: StreamStore,
+    stream: str = "",
+    request_selects: "dict[str, dict[str, dict]] | None" = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Select/reduce a [tokens, dim] step tensor and label the rows.
 
@@ -373,10 +420,21 @@ def _prepare_rows(
         else None
     )
     current_tokens = getattr(ctx, "current_tokens", None) if ctx else None
-    if samples_info is None or (
-        config.selects_rows and current_tokens is None
-    ):
-        if config.selects_rows or config.positions != "all":
+    ctx_req_ids = getattr(ctx, "req_ids", None) if ctx else None
+
+    # Per-request selection overrides for this stream, keyed by the
+    # batch sample index (request ids in the context are the
+    # engine-internal ids, the same namespace add_request sees).
+    overrides: dict[int, dict] = {}
+    if request_selects and ctx_req_ids is not None:
+        for i, rid in enumerate(ctx_req_ids):
+            per_req = request_selects.get(rid)
+            if per_req is not None and stream in per_req:
+                overrides[i] = per_req[stream]
+
+    needs_selection = config.selects_rows or bool(overrides)
+    if samples_info is None or (needs_selection and current_tokens is None):
+        if needs_selection or config.positions != "all":
             logger.warning_once(
                 "Capture selection/reduction requested but batch "
                 "geometry is unavailable; keeping all rows unlabelled "
@@ -399,7 +457,50 @@ def _prepare_rows(
     else:
         abs_positions = relative
 
-    if config.selects_rows:
+    if overrides:
+        # Rows of samples WITHOUT an override follow the global config
+        # ("all" or a global select clause; reductions cannot combine
+        # with overrides, enforced at add_request). Each override group
+        # replaces its samples' selection with its own clause.
+        tokens_dev = current_tokens[:total].to(device)
+        mask = torch.zeros(total, dtype=torch.bool, device=device)
+        if config.selects_rows:
+            base = collect_positions_apply_spec(
+                current_tokens=tokens_dev,
+                samples_info=samples_info,
+                spec=config.select,
+            )
+            if base is not None:
+                mask[base] = True
+        else:
+            mask[:] = True
+        override_samples = torch.tensor(
+            sorted(overrides), dtype=sample_ids.dtype, device=device
+        )
+        mask &= ~torch.isin(sample_ids, override_samples)
+        groups: dict[str, tuple[dict, list[int]]] = {}
+        for i, wire in overrides.items():
+            key = repr(sorted(wire.items()))
+            groups.setdefault(key, (wire, []))[1].append(i)
+        for wire, samples in groups.values():
+            idx = collect_positions_apply_spec(
+                current_tokens=tokens_dev,
+                samples_info=samples_info,
+                spec=wire,
+            )
+            if idx is None:
+                continue
+            gmask = torch.zeros(total, dtype=torch.bool, device=device)
+            gmask[idx] = True
+            gmask &= torch.isin(
+                sample_ids,
+                torch.tensor(samples, dtype=sample_ids.dtype, device=device),
+            )
+            mask |= gmask
+        indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+        if indices.numel() == 0:
+            return None, None
+    elif config.selects_rows:
         indices = collect_positions_apply_spec(
             current_tokens=current_tokens[:total].to(device),
             samples_info=samples_info,
@@ -513,10 +614,47 @@ class CaptureSession:
             HIDDEN_STATES: None,
             ROUTER_LOGITS: None,
         }
+        # Engine-internal request id -> {stream: SelectSpec wire dict}.
+        self._request_selects: dict[str, dict[str, dict]] = {}
         self._hook_handles: list = []
         self._hidden_layers = 0
         self._gate_layers = 0
         self._attached = False
+
+    # ------------------------------------------------------------------
+    # Per-request selection overrides (runner add/remove lifecycle)
+    # ------------------------------------------------------------------
+
+    def add_request(self, req_id: str, capture_select: dict[str, dict]) -> None:
+        """Register a request's selection override ({stream: wire}).
+
+        Clause structure is validated at admission (input processor); a
+        raise here would take down the engine core, so worker-side
+        conflicts warn and drop the override instead.
+        """
+        accepted = {}
+        for stream, wire in capture_select.items():
+            store = self._streams.get(stream)
+            if stream not in self._streams or store is None:
+                logger.warning_once(
+                    "Request carries a capture select for stream %r, "
+                    "which is not enabled; the override is ignored.",
+                    stream,
+                )
+                continue
+            if store.config.positions != "all":
+                logger.warning_once(
+                    "Per-request capture selects cannot combine with "
+                    "the %r reduction; the override is ignored.",
+                    store.config.positions,
+                )
+                continue
+            accepted[stream] = wire
+        if accepted:
+            self._request_selects[req_id] = accepted
+
+    def remove_request(self, req_id: str) -> None:
+        self._request_selects.pop(req_id, None)
 
     # ------------------------------------------------------------------
     # Hook attachment (once, at model load; inert until a stream enables)
@@ -572,7 +710,9 @@ class CaptureSession:
                 if not isinstance(hidden, torch.Tensor):
                     return
                 complete = hidden + residual if residual is not None else hidden
-                rows, meta = _prepare_rows(complete, store)
+                rows, meta = _prepare_rows(
+                    complete, store, HIDDEN_STATES, self._request_selects
+                )
                 if rows is not None:
                     store.append(_lid, rows, meta, _name)
 
@@ -624,7 +764,9 @@ class CaptureSession:
                 logits = extract_gate_logits(output)
                 if logits is None:
                     return
-                rows, meta = _prepare_rows(logits, store)
+                rows, meta = _prepare_rows(
+                    logits, store, ROUTER_LOGITS, self._request_selects
+                )
                 if rows is not None:
                     store.append(_lid, rows, meta, _name)
 
@@ -676,11 +818,16 @@ class CaptureSession:
         stream: str,
         clear: bool = True,
         layers: list[int] | None = None,
+        req_ids: list[str] | None = None,
     ) -> dict[int, dict[str, Any]]:
         store = self._streams.get(stream)
         if store is None:
             return {}
         store.flush()  # capture any rows staged since the last step
+        if req_ids is not None:
+            return store.serialize(
+                layers=layers, req_ids=req_ids, clear_selected=clear
+            )
         result = store.serialize(layers=layers)
         if clear:
             if layers is None:

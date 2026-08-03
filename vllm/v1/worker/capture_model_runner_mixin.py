@@ -107,9 +107,17 @@ class CaptureModelRunnerMixin:
         stream: str,
         clear: bool = True,
         layers: list[int] | None = None,
+        req_ids: list[str] | None = None,
     ) -> dict[int, dict[str, Any]]:
+        """Fetch (and by default clear) captured rows.
+
+        layers restricts to a layer subset; req_ids (client-visible
+        request ids) restricts to those requests' rows, with clear
+        removing only the emitted rows — the per-request drain that
+        bounds peak message size for large corpora.
+        """
         return self._capture_session().fetch_stream(
-            stream, clear=clear, layers=layers
+            stream, clear=clear, layers=layers, req_ids=req_ids
         )
 
     def capture_status(self, stream: str) -> dict[str, Any]:

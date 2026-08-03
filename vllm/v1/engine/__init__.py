@@ -138,6 +138,11 @@ class EngineCoreRequest(
     # KV-transfer request is rejected on the D node before engine admission.
     abort_immediately: bool = False
 
+    # Per-request capture selection override: {stream_name: SelectSpec
+    # wire dict}. Applies on top of an enabled capture stream; requests
+    # without an override use the stream's global selection.
+    capture_select: dict[str, dict] | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""

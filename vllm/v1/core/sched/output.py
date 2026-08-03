@@ -42,6 +42,7 @@ class NewRequestData:
     num_computed_tokens: int
     lora_request: LoRARequest | None
     steer_vector_request: SteerVectorRequest | None = None
+    capture_select: dict[str, dict] | None = None
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
 
@@ -65,6 +66,7 @@ class NewRequestData:
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             steer_vector_request=request.steer_vector_request,
+            capture_select=request.capture_select,
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,

@@ -436,6 +436,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
         steering: "Sequence[SteeringSpec | None] | SteeringSpec | None" = None,
+        capture_select: "Sequence[dict | None] | dict | None" = None,
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
@@ -463,6 +464,11 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             steering: Steering configuration (`SteeringSpec`) applied to
                 the request(s); a sequence pairs one spec per prompt
                 (None entries leave that prompt unsteered).
+            capture_select: Per-request capture selection override
+                ({stream: SelectSpec wire dict}); a sequence pairs one
+                override per prompt (None entries use the enabled
+                stream's global selection). Requires the capture stream
+                to be enabled.
             priority: The priority of the requests, if any.
                 Only applicable when priority scheduling policy is enabled.
                 If provided, must be a list of integers matching the length
@@ -495,6 +501,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             use_tqdm=use_tqdm,
             lora_request=lora_request,
             steer_vector_request=steer_vector_request,
+            capture_select=capture_select,
             tokenization_kwargs=tokenization_kwargs,
             priority=priority,
             mm_processor_kwargs=mm_processor_kwargs,

@@ -319,6 +319,7 @@ class OfflineInferenceMixin:
         steer_vector_request: Sequence[SteerVectorRequest]
         | SteerVectorRequest
         | None = None,
+        capture_select: "Sequence[dict | None] | dict | None" = None,
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
@@ -330,6 +331,15 @@ class OfflineInferenceMixin:
             steer_vector_request, len(seq_prompts)
         )
         seq_priority = self._priority_to_seq(priority, len(seq_prompts))
+        if capture_select is None or isinstance(capture_select, dict):
+            seq_capture_selects = [capture_select] * len(seq_prompts)
+        else:
+            if len(capture_select) != len(seq_prompts):
+                raise ValueError(
+                    f"capture_select ({len(capture_select)}) must match "
+                    f"the number of prompts ({len(seq_prompts)})"
+                )
+            seq_capture_selects = list(capture_select)
 
         return self._render_and_add_requests(
             prompts=(
@@ -347,6 +357,7 @@ class OfflineInferenceMixin:
             params=seq_params,
             lora_requests=seq_lora_requests,
             steer_vector_requests=seq_steer_vector_requests,
+            capture_selects=seq_capture_selects,
             priorities=seq_priority,
         )
 
@@ -363,6 +374,7 @@ class OfflineInferenceMixin:
         steer_vector_request: Sequence[SteerVectorRequest]
         | SteerVectorRequest
         | None = None,
+        capture_select: "Sequence[dict | None] | dict | None" = None,
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
@@ -373,6 +385,7 @@ class OfflineInferenceMixin:
             use_tqdm=use_tqdm,
             lora_request=lora_request,
             steer_vector_request=steer_vector_request,
+            capture_select=capture_select,
             priority=priority,
             tokenization_kwargs=tokenization_kwargs,
             mm_processor_kwargs=mm_processor_kwargs,
@@ -558,6 +571,7 @@ class OfflineInferenceMixin:
         *,
         lora_requests: Sequence[LoRARequest | None] | None = None,
         steer_vector_requests: Sequence[SteerVectorRequest | None] | None = None,
+        capture_selects: "Sequence[dict | None] | None" = None,
         priorities: Sequence[int] | None = None,
     ) -> list[str]:
         added_request_ids: list[str] = []
@@ -574,6 +588,9 @@ class OfflineInferenceMixin:
                     steer_vector_request=None
                     if steer_vector_requests is None
                     else steer_vector_requests[i],
+                    capture_select=None
+                    if capture_selects is None
+                    else capture_selects[i],
                     priority=0 if priorities is None else priorities[i],
                 )
                 added_request_ids.append(request_id)
@@ -590,6 +607,7 @@ class OfflineInferenceMixin:
         params: SamplingParams | PoolingParams,
         lora_request: LoRARequest | None = None,
         steer_vector_request: SteerVectorRequest | None = None,
+        capture_select: dict | None = None,
         priority: int = 0,
     ) -> str:
         if isinstance(params, SamplingParams):
@@ -604,6 +622,7 @@ class OfflineInferenceMixin:
             params,
             lora_request=lora_request,
             steer_vector_request=steer_vector_request,
+            capture_select=capture_select,
             priority=priority,
         )
 

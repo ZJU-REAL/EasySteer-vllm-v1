@@ -79,6 +79,7 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        capture_select: dict[str, dict] | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -87,6 +88,7 @@ class Request:
         self.pooling_params = pooling_params
         self.lora_request = lora_request
         self.steer_vector_request = steer_vector_request
+        self.capture_select = capture_select
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
             sampling_params
         )
@@ -243,6 +245,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            capture_select=request.capture_select,
         )
 
     def append_output_token_ids(

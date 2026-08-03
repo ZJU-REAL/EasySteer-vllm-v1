@@ -789,6 +789,9 @@ class GPUModelRunner(
         self.steer_vector_state.remove_request(
             req_id, getattr(self, "steer_vector_manager", None)
         )
+        capture_session = getattr(self, "capture_session", None)
+        if capture_session is not None:
+            capture_session.remove_request(req_id)
         return True
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
@@ -847,6 +850,10 @@ class GPUModelRunner(
                 new_req_data.steer_vector_request,
                 getattr(self, "steer_vector_manager", None),
             )
+            if new_req_data.capture_select is not None:
+                self._capture_session().add_request(
+                    req_id, new_req_data.capture_select
+                )
 
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
                 assert self.sampler is not None

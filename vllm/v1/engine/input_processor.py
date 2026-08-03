@@ -171,6 +171,29 @@ class InputProcessor:
         the require_preload frontend check)."""
         self._steer_preloaded_paths.update(paths)
 
+    def _validate_capture_select(self, capture_select: dict | None) -> None:
+        """Reject malformed per-request capture selections at admission.
+
+        Shape: {stream_name: SelectSpec wire dict}. Validating here
+        gives the client a clean error instead of a worker-side failure
+        mid-forward.
+        """
+        if capture_select is None:
+            return
+        from vllm.steer_vectors.api import SelectSpec
+
+        if not isinstance(capture_select, dict):
+            raise ValueError(
+                "capture_select must be {stream_name: SelectSpec wire dict}"
+            )
+        for stream, wire in capture_select.items():
+            if not isinstance(wire, dict):
+                raise ValueError(
+                    f"capture_select[{stream!r}] must be a SelectSpec "
+                    "wire dict (SelectSpec.to_wire())"
+                )
+            SelectSpec.from_wire(wire)
+
     def _validate_steer_vector(self, steer_vector_request: SteerVectorRequest | None) -> None:
         if steer_vector_request is None:
             return
@@ -304,6 +327,7 @@ class InputProcessor:
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
         steer_vector_request: SteerVectorRequest | None = None,
+        capture_select: dict | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
@@ -313,6 +337,7 @@ class InputProcessor:
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
         self._validate_steer_vector(steer_vector_request)
+        self._validate_capture_select(capture_select)
 
         parallel_config = self.vllm_config.parallel_config
         dp_size = parallel_config.data_parallel_size
@@ -436,6 +461,7 @@ class InputProcessor:
             arrival_time=arrival_time,
             lora_request=lora_request,
             steer_vector_request=steer_vector_request,
+            capture_select=capture_select,
             cache_salt=decoder_inputs.get("cache_salt"),
             priority=priority,
             data_parallel_rank=data_parallel_rank,

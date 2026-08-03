@@ -1273,8 +1273,11 @@ class Worker(WorkerBase):
         stream: str,
         clear: bool = True,
         layers: list[int] | None = None,
+        req_ids: list[str] | None = None,
     ) -> dict:
-        return self.model_runner.fetch_captured(stream, clear=clear, layers=layers)
+        return self.model_runner.fetch_captured(
+            stream, clear=clear, layers=layers, req_ids=req_ids
+        )
 
     def capture_status(self, stream: str) -> dict:
         return self.model_runner.capture_status(stream)
