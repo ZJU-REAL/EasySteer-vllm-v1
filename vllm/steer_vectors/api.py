@@ -280,6 +280,24 @@ class VectorSpec(BaseModel):
                 f"algorithm '{self.algorithm}' requires either a source "
                 "file or an in-memory data payload"
             )
+        # Reject wrong source formats at admission: a load failure inside
+        # the worker would take down the EngineCore.
+        if self.source is not None:
+            if self.algorithm in ("linear", "lm_steer", "loreft"):
+                raise ValueError(
+                    f"algorithm {self.algorithm!r} loads no source files; "
+                    "load the checkpoint yourself (see easysteer.vectors "
+                    "adapters) and pass data=..."
+                )
+            gguf_only = ("direct", "erase", "replace")
+            if self.algorithm in gguf_only and not self.source.lower().endswith(
+                ".gguf"
+            ):
+                raise ValueError(
+                    f"algorithm {self.algorithm!r} accepts only .gguf "
+                    f"sources (EasySteer's export format), got "
+                    f"{self.source!r}; for other formats pass data=..."
+                )
         return self
 
 
