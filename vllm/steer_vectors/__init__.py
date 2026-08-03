@@ -13,6 +13,13 @@ from vllm.steer_vectors.api import (
     VectorSpec,
     to_engine_request,
 )
+from vllm.steer_vectors.payloads import (
+    ConceptPair,
+    DirectionVector,
+    LinearMap,
+    LowRankProjector,
+    ReftIntervention,
+)
 from vllm.steer_vectors.layers import DecoderLayerWithSteerVector
 from vllm.steer_vectors.models import (
     LoadedSteerVector,
@@ -29,6 +36,12 @@ __all__ = [
     "SteeringSpec",
     "VectorSpec",
     "to_engine_request",
+    # In-memory payloads (VectorSpec.data)
+    "ConceptPair",
+    "DirectionVector",
+    "LinearMap",
+    "LowRankProjector",
+    "ReftIntervention",
     # Layers
     "DecoderLayerWithSteerVector",
     # Models

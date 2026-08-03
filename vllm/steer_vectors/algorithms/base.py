@@ -24,7 +24,6 @@ class BaseSteerVectorAlgorithm(ABC):
         self.layer_id = layer_id
 
     @classmethod
-    @abstractmethod
     def load_from_path(
         cls,
         path: str,
@@ -34,7 +33,13 @@ class BaseSteerVectorAlgorithm(ABC):
         target_layers: list[int] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Load steer vector data from a file path.
+        """Load steer vector data from a source file.
+
+        Only formats whose schema EasySteer itself defines are loaded
+        engine-side (its GGUF export; the moe_router JSON config).
+        Third-party checkpoint formats are interpreted client-side —
+        load the file yourself (or use an ``easysteer.vectors``
+        adapter) and pass ``VectorSpec(data=...)``.
 
         Args:
             path: Vector file or directory path.
@@ -48,7 +53,11 @@ class BaseSteerVectorAlgorithm(ABC):
             payload is whatever this algorithm's ``_transform`` consumes
             (tensor, dict, ...).
         """
-        pass
+        raise ValueError(
+            f"algorithm {cls.__name__} loads no source files; pass its "
+            "payload via VectorSpec(data=...) — see "
+            "vllm.steer_vectors.payloads and easysteer.vectors"
+        )
 
     @abstractmethod
     def set_payload(self, payload: Any, scale_factor: float = 1.0) -> None:

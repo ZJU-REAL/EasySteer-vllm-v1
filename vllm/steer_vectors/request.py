@@ -85,68 +85,23 @@ def is_prompt_length_sensitive(request) -> bool:
     return any(_sensitive(vc) for vc in request.vector_configs or [])
 
 
-_APPLY_SPEC_KEYS = (
-    "phases",
-    "tokens",
-    "positions",
-    "exclude_tokens",
-    "exclude_positions",
-    "window",
-)
-
-
 def validate_apply_spec(spec: dict) -> None:
     """Structurally validate a wire-format `apply_spec` dict.
 
-    The pydantic ApplySpec model is the authoring-side validator; this
-    guards the engine struct against hand-built or corrupted dicts.
+    Delegates to `SelectSpec.from_wire` — the single implementation of
+    the clause rules — so authoring-side and engine-side validation
+    cannot drift.
     """
     if not isinstance(spec, dict):
         raise ValueError(f"apply_spec must be a dict, got {type(spec).__name__}")
-    unknown = set(spec) - set(_APPLY_SPEC_KEYS)
-    if unknown:
-        raise ValueError(f"apply_spec has unknown keys: {sorted(unknown)}")
-    phases = spec.get("phases")
-    if (
-        not isinstance(phases, list)
-        or not phases
-        or len(set(phases)) != len(phases)
-        or any(p not in ("prompt", "generation") for p in phases)
-    ):
-        raise ValueError(
-            "apply_spec['phases'] must be a non-empty duplicate-free "
-            f"subset of ['prompt', 'generation'], got {phases!r}"
-        )
-    for key in ("tokens", "positions", "exclude_tokens", "exclude_positions"):
-        value = spec.get(key)
-        if value is None:
-            continue
-        if not isinstance(value, list) or not value:
-            raise ValueError(
-                f"apply_spec[{key!r}] must be None or a non-empty list, "
-                f"got {value!r}"
-            )
-        if key in ("tokens", "exclude_tokens") and any(t < 0 for t in value):
-            raise ValueError(
-                f"apply_spec[{key!r}] must contain real token ids (>= 0), "
-                f"got {value!r}"
-            )
-    window = spec.get("window")
-    if window is not None:
-        if (
-            not isinstance(window, (list, tuple))
-            or len(window) != 2
-            or window[0] < 0
-            or (window[1] is not None and window[1] <= window[0])
-        ):
-            raise ValueError(
-                "apply_spec['window'] must be a half-open [start, stop] "
-                f"with start >= 0 and stop > start or None, got {window!r}"
-            )
-        if "generation" not in phases:
-            raise ValueError(
-                "apply_spec['window'] requires 'generation' in phases"
-            )
+    from vllm.steer_vectors.api import SelectSpec
+
+    try:
+        SelectSpec.from_wire(spec)
+    except ValueError:
+        raise
+    except Exception as exc:  # pydantic ValidationError -> ValueError
+        raise ValueError(f"invalid apply_spec: {exc}") from exc
 
 
 def _validate_where_clause(obj, context: str) -> None:
@@ -156,6 +111,28 @@ def _validate_where_clause(obj, context: str) -> None:
             "build requests through the v2 API (SteeringSpec/ApplySpec)"
         )
     validate_apply_spec(obj.apply_spec)
+
+
+def _validate_inline_payload(obj, path: str, context: str) -> None:
+    """Check the path/payload alternative on an engine struct."""
+    if obj.inline_payload is None:
+        if obj.payload_sha256 is not None:
+            raise ValueError(
+                f"{context} has payload_sha256 without inline_payload"
+            )
+        return
+    if path:
+        raise ValueError(
+            f"{context} has both a file path and an inline payload; "
+            "they are mutually exclusive"
+        )
+    from vllm.steer_vectors.payloads import validate_wire
+
+    validate_wire(obj.inline_payload)
+    if obj.payload_sha256 != obj.inline_payload.get("sha256"):
+        raise ValueError(
+            f"{context}: payload_sha256 does not match the inline payload"
+        )
 
 
 def _assert_schema_complete(cls, field_names, required) -> None:
@@ -203,6 +180,10 @@ class VectorConfig(
     apply_spec: dict | None = None
     algorithm: str = "direct"
     normalize: bool = False
+    # In-memory payload (vllm.steer_vectors.payloads wire dict) as the
+    # alternative to `path`; sha256 is its identity for slot dedup.
+    inline_payload: dict | None = None
+    payload_sha256: str | None = None
 
 
 class SteerVectorRequest(
@@ -230,6 +211,10 @@ class SteerVectorRequest(
     apply_spec: dict | None = None
     algorithm: str = "direct"
     normalize: bool = False
+    # In-memory payload (vllm.steer_vectors.payloads wire dict) as the
+    # alternative to a file path; sha256 is its identity for slot dedup.
+    inline_payload: dict | None = None
+    payload_sha256: str | None = None
 
     # === Multi-vector mode ===
     vector_configs: list[VectorConfig] | None = None
@@ -269,29 +254,35 @@ class SteerVectorRequest(
             if not self.vector_configs:
                 raise ValueError("vector_configs cannot be empty in multi-vector mode")
             for i, vc in enumerate(self.vector_configs):
-                _validate_where_clause(vc, f"vector_configs[{i}]")
+                context = f"vector_configs[{i}]"
+                _validate_where_clause(vc, context)
+                _validate_inline_payload(vc, vc.path, context)
+                if not vc.path and vc.inline_payload is None:
+                    raise ValueError(
+                        f"{context} has neither a path nor an inline "
+                        "payload"
+                    )
         else:
+            _validate_inline_payload(
+                self, self.steer_vector_local_path, "Steering request"
+            )
             # moe_router can work without a file path: it takes
             # expert_ids/mode from the request fields directly.
-            if self.algorithm != "moe_router" and not self.steer_vector_local_path:
+            if (
+                self.algorithm != "moe_router"
+                and not self.steer_vector_local_path
+                and self.inline_payload is None
+            ):
                 raise ValueError(
-                    "Must specify steer_vector_local_path in single-vector mode "
-                    "(except for moe_router algorithm)"
+                    "Single-vector mode requires steer_vector_local_path "
+                    "or an inline payload (except for moe_router)"
                 )
             if self.algorithm == "moe_router" and self.moe_mode is not None:
                 from vllm.steer_vectors.algorithms.moe_router import (
                     MoERouterAlgorithm,
                 )
 
-                known = (
-                    set(MoERouterAlgorithm.CANONICAL_MODES)
-                    | set(MoERouterAlgorithm.MODE_ALIASES)
-                )
-                if self.moe_mode not in known:
-                    raise ValueError(
-                        f"unknown moe_mode {self.moe_mode!r}; expected "
-                        f"one of {sorted(known)}"
-                    )
+                MoERouterAlgorithm.validate_mode(self.moe_mode)
             if self.algorithm == "moe_router" and not self.steer_vector_local_path:
                 if not self.moe_expert_ids:
                     raise ValueError(

@@ -62,7 +62,6 @@ class ConceptReplaceAlgorithm(AlgorithmTemplate):
         *,
         config,
         target_layers: list[int] | None = None,
-        **kwargs,
     ) -> dict:
         if not os.path.isdir(path):
             raise ValueError(

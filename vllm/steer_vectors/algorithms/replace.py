@@ -5,7 +5,7 @@ import os
 import torch
 
 from .factory import register_algorithm
-from .loading import read_gguf_directions
+from .loading import read_gguf_directions, require_extension
 from .template import AlgorithmTemplate
 
 
@@ -36,13 +36,8 @@ class ReplaceAlgorithm(AlgorithmTemplate):
         *,
         config,
         target_layers: list[int] | None = None,
-        **kwargs,
     ) -> dict:
-        file_ext = os.path.splitext(path)[1].lower()
-        if file_ext != ".gguf":
-            raise ValueError(
-                f"ReplaceAlgorithm only supports .gguf files, got: {file_ext}"
-            )
+        require_extension(path, ".gguf", cls.__name__)
         return {
             "layer_payloads": read_gguf_directions(path, device, config.adapter_dtype)
         }

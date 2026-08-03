@@ -115,13 +115,59 @@ class VectorStore:
             logger.info("Evicted steer vector from store: %s", evicted_key[0])
         return entry
 
+    def get_inline(
+        self,
+        wire: dict,
+        algorithm: str,
+        *,
+        target_layers: list[int] | None = None,
+    ) -> "LoadedSteerVector":
+        """Return the entry for an in-memory payload, materializing once.
+
+        Keyed by the payload's content sha256 (plus algorithm and layer
+        set) — the same identity the config fingerprint uses — so any
+        number of requests carrying byte-identical payloads share one
+        resident entry.
+        """
+        layers_key = tuple(sorted(target_layers)) if target_layers else None
+        key = ("<inline>", algorithm, layers_key, wire["sha256"])
+        entry = self._entries.get(key)
+        if entry is not None:
+            self._entries.move_to_end(key)
+            return entry
+
+        from vllm.steer_vectors.models import LoadedSteerVector
+        from vllm.steer_vectors.payloads import materialize
+
+        layer_payloads = materialize(
+            wire,
+            self.device,
+            self.steer_vector_config.adapter_dtype,
+            target_layers,
+        )
+        if not layer_payloads:
+            raise ValueError(
+                f"inline {wire.get('kind')!r} payload produced no layer "
+                "payloads; the vector would steer nothing"
+            )
+        entry = LoadedSteerVector(
+            steer_vector_id=0,
+            layer_payloads=layer_payloads,
+            algorithm=algorithm,
+        )
+        self._entries[key] = entry
+        logger.info(
+            "Materialized inline steer payload into store: %s (%s)",
+            wire["sha256"][:12],
+            algorithm,
+        )
+        while len(self._entries) > self.capacity:
+            evicted_key, _ = self._entries.popitem(last=False)
+            logger.info("Evicted steer vector from store: %s", evicted_key[0])
+        return entry
+
     def preload(self, path: str, algorithm: str = "direct") -> None:
         self.get(path, algorithm, lazy=False)
-
-    def reload(self, path: str, algorithm: str = "direct") -> None:
-        """Force-refresh a vector from disk regardless of stat changes."""
-        self.unload(path)
-        self.preload(path, algorithm)
 
     def unload(self, path: str) -> bool:
         removed = False
@@ -129,6 +175,3 @@ class VectorStore:
             del self._entries[key]
             removed = True
         return removed
-
-    def resident_paths(self) -> list[str]:
-        return [k[0] for k in self._entries]

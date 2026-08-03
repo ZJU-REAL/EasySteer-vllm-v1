@@ -70,6 +70,21 @@ class MoERouterAlgorithm(AlgorithmTemplate):
         "steermoe": "activate",
     }
 
+    @classmethod
+    def validate_mode(cls, mode: str) -> str:
+        """Reject unknown modes; returns the canonical spelling.
+
+        The single mode validator — admission paths (api.py, request.py)
+        and the file loader all call this.
+        """
+        canonical = cls.MODE_ALIASES.get(mode, mode)
+        if canonical not in cls.CANONICAL_MODES:
+            known = sorted(set(cls.CANONICAL_MODES) | set(cls.MODE_ALIASES))
+            raise ValueError(
+                f"unknown moe_router mode {mode!r}; expected one of {known}"
+            )
+        return canonical
+
     def __init__(self, layer_id: int | None = None, **kwargs):
         # MoE router doesn't use normalize parameter - remove it from kwargs if present
         kwargs.pop("normalize", None)
@@ -366,19 +381,10 @@ class MoERouterAlgorithm(AlgorithmTemplate):
                 if default_mode is not None
                 else params.get("mode", "activate")
             )
-            canonical = cls.MODE_ALIASES.get(mode, mode)
-            if canonical not in (
-                "activate",
-                "deactivate",
-                "soft",
-                "soft_topk",
-                "soft_random",
-            ):
-                raise ValueError(
-                    f"Layer {layer_id}: unknown MoE mode {mode!r} (must be "
-                    "'activate', 'deactivate', 'soft', 'soft_topk' or "
-                    "'soft_random', or a deprecated alias)"
-                )
+            try:
+                canonical = cls.validate_mode(mode)
+            except ValueError as e:
+                raise ValueError(f"Layer {layer_id}: {e}") from None
 
             if canonical in ("activate", "deactivate"):
                 if not (

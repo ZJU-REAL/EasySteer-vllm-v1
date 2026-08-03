@@ -36,6 +36,17 @@ Phase = Literal["prompt", "generation"]
 
 PHASES = ("prompt", "generation")
 
+# The canonical wire keys of an apply/select clause (`to_wire()` dict).
+# Single source of truth — engine-side validators import this.
+APPLY_SPEC_KEYS: tuple[str, ...] = (
+    "phases",
+    "tokens",
+    "positions",
+    "exclude_tokens",
+    "exclude_positions",
+    "window",
+)
+
 # Allowed `VectorSpec.params` keys per algorithm; algorithms not listed
 # accept no params. (moe defaults match the v1 request defaults.)
 ALGORITHM_PARAMS: dict[str, tuple[str, ...]] = {
@@ -137,15 +148,7 @@ class SelectSpec(BaseModel):
         Used engine-side to reject malformed selection clauses at
         enable time instead of failing mid-forward.
         """
-        known = {
-            "phases",
-            "tokens",
-            "positions",
-            "exclude_tokens",
-            "exclude_positions",
-            "window",
-        }
-        unknown = set(wire) - known
+        unknown = set(wire) - set(APPLY_SPEC_KEYS)
         if unknown:
             raise ValueError(f"unknown selection fields: {sorted(unknown)}")
         window = wire.get("window")
@@ -171,12 +174,17 @@ class VectorSpec(BaseModel):
     """One steering vector and how it applies.
 
     Args:
-        source: Path to the vector file (local or HF-hub form). None is
-            allowed only for algorithms that need no file (moe_router
-            with explicit expert_ids).
+        source: Path to a vector file in a format EasySteer itself
+            defines (its GGUF export; moe_router JSON). For third-party
+            checkpoint formats, load the file yourself (or use an
+            `easysteer.vectors` adapter) and pass `data` instead.
+        data: An in-memory payload (`vllm.steer_vectors.payloads`, or
+            its wire dict) — the canonical way to steer with tensors
+            you constructed or loaded yourself. Mutually exclusive with
+            source.
         algorithm: Steering algorithm name (registry key).
         scale: Scale factor.
-        layers: Layer indices to apply to; None lets the file decide.
+        layers: Layer indices to apply to; None lets the source decide.
         normalize: Normalize the vector before applying.
         apply: Where/when the vector applies (required).
         params: Algorithm-specific parameters; validated per algorithm,
@@ -187,6 +195,7 @@ class VectorSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     source: str | None = None
+    data: Any = None
     algorithm: str = "direct"
     scale: float = 1.0
     layers: list[int] | None = None
@@ -215,15 +224,41 @@ class VectorSpec(BaseModel):
                 MoERouterAlgorithm,
             )
 
-            mode = self.params["mode"]
-            known = (
-                set(MoERouterAlgorithm.CANONICAL_MODES)
-                | set(MoERouterAlgorithm.MODE_ALIASES)
+            MoERouterAlgorithm.validate_mode(self.params["mode"])
+        if self.data is not None:
+            from vllm.steer_vectors.payloads import (
+                ALGORITHM_PAYLOADS,
+                Payload,
+                is_broadcast_kind,
+                validate_wire,
             )
-            if mode not in known:
+
+            if self.source is not None:
+                raise ValueError("source and data are mutually exclusive")
+            expected = ALGORITHM_PAYLOADS.get(self.algorithm)
+            if expected is None:
                 raise ValueError(
-                    f"unknown moe_router mode {mode!r}; expected one of "
-                    f"{sorted(known)}"
+                    f"algorithm {self.algorithm!r} does not accept "
+                    "in-memory payloads"
+                )
+            if isinstance(self.data, Payload):
+                kind = self.data.kind
+            elif isinstance(self.data, dict):
+                kind = validate_wire(self.data)
+            else:
+                raise ValueError(
+                    "data must be a vllm.steer_vectors.payloads object "
+                    f"or its wire dict, got {type(self.data).__name__}"
+                )
+            if kind != expected:
+                raise ValueError(
+                    f"algorithm {self.algorithm!r} requires a "
+                    f"{expected!r} payload, got {kind!r}"
+                )
+            if is_broadcast_kind(kind) and not self.layers:
+                raise ValueError(
+                    f"a {kind!r} payload holds one map applied to each "
+                    "target layer; layers is required"
                 )
         if self.algorithm == "moe_router" and self.source is None:
             if not self.params.get("expert_ids"):
@@ -236,8 +271,15 @@ class VectorSpec(BaseModel):
                     "moe_router without a source file requires layers "
                     "(the layers whose experts to steer)"
                 )
-        if self.algorithm != "moe_router" and self.source is None:
-            raise ValueError(f"algorithm '{self.algorithm}' requires a source file")
+        if (
+            self.algorithm != "moe_router"
+            and self.source is None
+            and self.data is None
+        ):
+            raise ValueError(
+                f"algorithm '{self.algorithm}' requires either a source "
+                "file or an in-memory data payload"
+            )
         return self
 
 
@@ -296,6 +338,11 @@ def to_engine_request(
     if int_id is None:
         int_id = _next_steer_vector_id()
 
+    def _payload_wire(v: VectorSpec) -> dict[str, Any] | None:
+        if v.data is None:
+            return None
+        return v.data if isinstance(v.data, dict) else v.data.to_wire()
+
     if len(spec.vectors) == 1:
         v = spec.vectors[0]
         moe: dict[str, Any] = {}
@@ -306,10 +353,13 @@ def to_engine_request(
                 "moe_lambda": v.params.get("lambda", 0.5),
                 "moe_topk": v.params.get("topk", 8),
             }
+        wire = _payload_wire(v)
         return SteerVectorRequest(
             steer_vector_name=name,
             steer_vector_int_id=int_id,
             steer_vector_local_path=v.source or "",
+            inline_payload=wire,
+            payload_sha256=wire["sha256"] if wire else None,
             debug=spec.debug,
             scale=v.scale,
             target_layers=v.layers,
@@ -319,20 +369,23 @@ def to_engine_request(
             **moe,
         )
 
+    def _vector_config(v: VectorSpec) -> "VectorConfig":
+        wire = _payload_wire(v)
+        return VectorConfig(
+            path=v.source or "",
+            inline_payload=wire,
+            payload_sha256=wire["sha256"] if wire else None,
+            scale=v.scale,
+            target_layers=v.layers,
+            algorithm=v.algorithm,
+            normalize=v.normalize,
+            apply_spec=v.apply.to_wire(),
+        )
+
     return SteerVectorRequest(
         steer_vector_name=name,
         steer_vector_int_id=int_id,
         debug=spec.debug,
         conflict_resolution=spec.conflict,
-        vector_configs=[
-            VectorConfig(
-                path=v.source or "",
-                scale=v.scale,
-                target_layers=v.layers,
-                algorithm=v.algorithm,
-                normalize=v.normalize,
-                apply_spec=v.apply.to_wire(),
-            )
-            for v in spec.vectors
-        ],
+        vector_configs=[_vector_config(v) for v in spec.vectors],
     )

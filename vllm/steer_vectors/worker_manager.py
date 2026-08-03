@@ -47,7 +47,7 @@ def config_fingerprint(request: SteerVectorRequest) -> str:
     # The file version participates so a vector regenerated at the same
     # path gets a fresh slot (and thus a fresh load) even while requests
     # with the old version are still running.
-    values = [request.local_path, request.debug]
+    values = [request.local_path, request.payload_sha256, request.debug]
     if request.local_path:
         values.append(file_version(request.local_path))
     values.extend(_canon(request, STEER_APPLY_FIELDS))
@@ -55,7 +55,9 @@ def config_fingerprint(request: SteerVectorRequest) -> str:
         values.append(request.conflict_resolution)
         for vc in request.vector_configs:
             values.append(vc.path)
-            values.append(file_version(vc.path))
+            values.append(vc.payload_sha256)
+            if vc.path:
+                values.append(file_version(vc.path))
             values.extend(_canon(vc, STEER_APPLY_FIELDS))
     if request.algorithm == "moe_router":
         values.extend(_canon(request, STEER_MOE_FIELDS))
@@ -240,22 +242,17 @@ class WorkerSteerVectorManager:
             self._distribute_multi_config(slot, request)
         elif request.algorithm == "moe_router":
             self._distribute_moe_slot(slot, request)
-        elif self._graph_full:
-            model = self.vector_store.get(
-                request.local_path,
-                request.algorithm,
-                target_layers=request.target_layers,
-                lazy=True,
-            )
-            self._distribute_graph_config(slot, model, request)
         else:
-            model = self.vector_store.get(
+            model = self._load_entry(
                 request.local_path,
                 request.algorithm,
-                target_layers=request.target_layers,
-                lazy=True,
+                request.target_layers,
+                request.inline_payload,
             )
-            self._distribute_config(slot, model, request)
+            if self._graph_full:
+                self._distribute_graph_config(slot, model, request)
+            else:
+                self._distribute_config(slot, model, request)
         self._config_slots[fp] = [slot, 1, request]
         self._req_fingerprints[req_id] = fp
         logger.debug("Configured steering slot %d for %s", slot, fp)
@@ -304,13 +301,28 @@ class WorkerSteerVectorManager:
         """
         specs = []
         for vc in request.vector_configs:
-            model = self.vector_store.get(
-                vc.path, vc.algorithm,
-                target_layers=vc.target_layers, lazy=True,
+            model = self._load_entry(
+                vc.path, vc.algorithm, vc.target_layers, vc.inline_payload
             )
             fields = {**steer_params_dict(vc), "debug": request.debug}
             specs.append((fields, model.layer_payloads or {}))
         self._configure_layer_slots(slot, specs, request.conflict_resolution)
+
+    def _load_entry(
+        self,
+        path: str,
+        algorithm: str,
+        target_layers: list[int] | None,
+        inline_payload: dict | None,
+    ) -> LoadedSteerVector:
+        """Resolve a vector source (file path or inline payload)."""
+        if inline_payload is not None:
+            return self.vector_store.get_inline(
+                inline_payload, algorithm, target_layers=target_layers
+            )
+        return self.vector_store.get(
+            path, algorithm, target_layers=target_layers, lazy=True
+        )
 
     def _configure_layer_slots(
         self,
