@@ -6394,7 +6394,7 @@ class GPUModelRunner(
 
                 if (encoder_budget := mm_budget.get_encoder_budget()) > 0:
                     if not mm_budget.mm_max_toks_per_item:
-                        # All modality limits are 0 閳ワ拷 embedding-only mode.
+                        # All modality limits are 0 — embedding-only mode.
                         # Budget is non-zero for embedding storage, but
                         # there's no encoder to profile.
                         logger.info(
