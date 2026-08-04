@@ -21,6 +21,52 @@ import torch
 
 from vllm.steer_vectors.discovery import resolve_batch_positions
 
+_CLAUSE_KEYS = (
+    "phases",
+    "tokens",
+    "positions",
+    "exclude_tokens",
+    "exclude_positions",
+    "window",
+)
+
+
+def _canon(value):
+    if isinstance(value, (list, tuple)):
+        return tuple(_canon(v) for v in value)
+    return value
+
+
+def clause_cache_key(apply_spec: dict | None) -> tuple | None:
+    """Hashable identity of a where-clause.
+
+    Position resolution is layer-invariant (clauses match tokens,
+    positions and phases — never hidden states), so one resolution per
+    step serves every layer. The worker-side resolver and the layer
+    hooks must derive keys from this one function or lookups drift.
+    """
+    if apply_spec is None:
+        return None
+    return tuple((key, _canon(apply_spec.get(key))) for key in _CLAUSE_KEYS)
+
+
+def is_global_only_spec(apply_spec: dict) -> bool:
+    """Whether the clause selects every token of both phases.
+
+    Enables the fast path that skips position collection and steers
+    all of the slot's token rows directly.
+    """
+    return len(apply_spec["phases"]) == 2 and all(
+        apply_spec.get(key) is None
+        for key in (
+            "tokens",
+            "positions",
+            "exclude_tokens",
+            "exclude_positions",
+            "window",
+        )
+    )
+
 
 class TriggerController:
     """Holds one intervention's where-clause and debug flag."""
@@ -28,6 +74,7 @@ class TriggerController:
     def __init__(self):
         self.apply_spec: dict | None = None
         self.debug: bool = False
+        self.cache_key: tuple | None = None
 
     def set_debug(self, debug: bool) -> None:
         """Set debug mode."""
@@ -45,56 +92,15 @@ class TriggerController:
         for name in STEER_TRIGGER_FIELDS + ("debug",):
             if name in config:
                 setattr(self, name, config[name])
+        self.cache_key = clause_cache_key(self.apply_spec)
 
     def has_any_triggers(self) -> bool:
         """Whether a where-clause is configured."""
         return self.apply_spec is not None
 
     def is_global_only_config(self) -> bool:
-        """Whether the clause selects every token of both phases.
-
-        Enables the fast path that skips position collection and steers
-        all of the slot's token rows directly.
-        """
-        if self.apply_spec is None:
-            return False
-        spec = self.apply_spec
-        return len(spec["phases"]) == 2 and all(
-            spec.get(key) is None
-            for key in (
-                "tokens",
-                "positions",
-                "exclude_tokens",
-                "exclude_positions",
-                "window",
-            )
-        )
-
-    def collect_intervention_positions(
-        self,
-        hidden_states: torch.Tensor,
-        current_tokens: torch.Tensor,
-        samples_info: dict[str, torch.Tensor],
-    ) -> torch.Tensor | None:
-        """Positions to steer for the current step.
-
-        Args:
-            hidden_states: [total_tokens, hidden_dim] (device source only)
-            current_tokens: [total_tokens] token IDs
-            samples_info: batch geometry (query_start_loc, num_computed,
-                is_decode_mask, num_output_tokens, num_prompt_tokens)
-
-        Returns:
-            [num_positions] tensor of flat token indices, or None when
-            nothing matches.
-        """
-        if self.apply_spec is None:
-            return None
-        return collect_positions_apply_spec(
-            current_tokens=current_tokens,
-            samples_info=samples_info,
-            spec=self.apply_spec,
-        )
+        """Whether the clause selects every token of both phases."""
+        return self.apply_spec is not None and is_global_only_spec(self.apply_spec)
 
 
 def _isin_token_set(tokens: torch.Tensor, ids) -> torch.Tensor:

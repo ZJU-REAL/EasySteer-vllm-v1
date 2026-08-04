@@ -6,13 +6,6 @@ import torch
 
 from .base import BaseSteerVectorAlgorithm
 from .triggers import TriggerController
-from vllm.steer_vectors.discovery import extract_samples_info
-
-# Import forward context to get current token information
-try:
-    from vllm.forward_context import get_forward_context
-except ImportError:
-    get_forward_context = None
 
 
 class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
@@ -98,62 +91,24 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
         scaled = transformed.float() * norm_pre / (norm_post + 1e-8)
         return scaled.to(original.dtype)
 
-    def _get_forward_context_and_samples(self, hidden_states: torch.Tensor):
-        """
-        Get forward context and sample information.
-
-        This is a shared helper that extracts forward context, current tokens,
-        and sample boundaries - common operations for both single-vector and
-        multi-vector interventions.
-
-        Args:
-            hidden_states: [total_tokens, hidden_dim]
-
-        Returns:
-            tuple: (forward_ctx, samples_info, current_tokens) or None if unavailable
-        """
-        # Get forward context
-        if get_forward_context is None:
-            return None
-
-        forward_ctx = get_forward_context()
-        if forward_ctx is None:
-            return None
-
-        geo = forward_ctx.batch_geometry
-        current_tokens = geo.token_ids if geo is not None else None
-        attn_metadata = forward_ctx.attn_metadata
-
-        if current_tokens is None or attn_metadata is None:
-            return None
-
-        # Flatten tokens if needed
-        if current_tokens.dim() == 2:
-            current_tokens = current_tokens.flatten()
-
-        # Extract sample boundaries using GPU batch operations
-        samples_info = extract_samples_info(attn_metadata)
-
-        if samples_info is None:
-            # In vLLM V1, query_start_loc should always be available
-            raise RuntimeError(
-                "Cannot extract sample information from attention metadata. "
-                "This should not happen in vLLM V1 with standard attention backends. "
-                "Please report this issue with your configuration details."
-            )
-
-        return (forward_ctx, samples_info, current_tokens)
-
-    def _batch_transform_tensor(self, hidden_states, positions_tensor, params):
+    def _batch_transform_tensor(
+        self, hidden_states, positions_tensor, params, residual=None
+    ):
         """
         Apply transformation using position tensor.
 
         Performs direct tensor operations without GPU-CPU synchronization.
 
+        When `residual` is given, the transform sees the complete hidden
+        state (hidden + residual) of the selected rows, but only `hidden`
+        is written back — in delta form, so identity transforms leave
+        `hidden` bit-exact and the residual stream flows on untouched.
+
         Args:
             hidden_states: [total_tokens, hidden_dim]
             positions_tensor: [num_positions] GPU tensor of indices
             params: Algorithm parameters
+            residual: optional [total_tokens, hidden_dim] residual stream
 
         Returns:
             hidden_states: Transformed hidden states
@@ -162,9 +117,15 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
 
         # Select positions to transform
         selected = hidden_states.index_select(0, positions_tensor)
+        if residual is not None:
+            complete = selected + residual.index_select(0, positions_tensor)
+        else:
+            complete = selected
 
         # Apply transformation
-        transformed = self._transform(selected, params).to(original_dtype)
+        transformed = self._transform(complete, params).to(original_dtype)
+        if residual is not None:
+            transformed = selected + (transformed - complete)
 
         # Write back transformed values
         hidden_states.index_copy_(0, positions_tensor, transformed)

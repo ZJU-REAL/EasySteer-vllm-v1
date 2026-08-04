@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from vllm.steer_vectors import trace
-from vllm.steer_vectors.request import SteerVectorRequest, steer_params_dict
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
@@ -86,16 +86,88 @@ def build_batch_geometry(input_batch: InputBatch) -> "BatchGeometry":
     )
 
 
+def _batch_token_slots(
+    input_batch: InputBatch, state: SteerVectorState, default_slot: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-request and per-token config-slot routing for this step."""
+    num_reqs = input_batch.num_reqs
+    slots_np = np.fromiter(
+        (
+            slot if (slot := state.slot_of(req_id)) >= 0 else default_slot
+            for req_id in input_batch.req_ids
+        ),
+        dtype=np.int32,
+        count=num_reqs,
+    )
+    token_slots_np = np.repeat(slots_np, input_batch.num_scheduled_tokens[:num_reqs])
+    return slots_np, token_slots_np
+
+
+def resolve_slot_positions(
+    slot_clauses: dict[int, list[dict | None]],
+    active_slots: list[int],
+    token_slots_np: np.ndarray,
+    token_slots: torch.Tensor,
+    geo,
+) -> dict[tuple, torch.Tensor | None]:
+    """Resolve every active clause's steered positions, once per step.
+
+    Where-clauses are layer-invariant, so this single resolution serves
+    every decoder/MoE-gate hook (and the Tier-1 mask filler). Keys are
+    (slot, clause_cache_key); a None value means the clause matched no
+    token this step. Global-only clauses resolve on the CPU (no device
+    sync); others run the trigger collector once on the GPU.
+    """
+    from vllm.steer_vectors.algorithms.triggers import (
+        clause_cache_key,
+        collect_positions_apply_spec,
+        is_global_only_spec,
+    )
+
+    resolved: dict[tuple, torch.Tensor | None] = {}
+    device = token_slots.device
+    samples_info = None
+    for slot in active_slots:
+        for clause in slot_clauses.get(slot, []):
+            key = clause_cache_key(clause)
+            if key is None or (slot, key) in resolved:
+                continue
+            if is_global_only_spec(clause):
+                pos_np = np.nonzero(token_slots_np == slot)[0]
+                positions = (
+                    torch.from_numpy(pos_np).to(device, non_blocking=True)
+                    if pos_np.size
+                    else None
+                )
+            else:
+                if samples_info is None:
+                    samples_info = geo.samples_info()
+                positions = collect_positions_apply_spec(
+                    current_tokens=geo.token_ids,
+                    samples_info=samples_info,
+                    spec=clause,
+                )
+                if positions is not None:
+                    positions = positions[token_slots[positions] == slot]
+                    if positions.numel() == 0:
+                        positions = None
+            resolved[(slot, key)] = positions
+    return resolved
+
+
 def make_steer_vector_forward_kwargs(
     input_batch: InputBatch,
     state: SteerVectorState | None = None,
     default_slot: int = -1,
+    manager=None,
 ) -> dict:
     """Build the ForwardContext fields consumed by steering and capture.
 
     - batch_geometry: the per-step BatchGeometry (see build_batch_geometry)
     - steer_token_slots / steer_active_slots: per-request config routing
       (only when routed configs are live)
+    - steer_slot_positions: per-clause steered positions, resolved once
+      here and consumed by every layer hook (see resolve_slot_positions)
 
     `default_slot` is the server-level config's slot (-1 when absent);
     requests without their own steering config are routed to it.
@@ -105,20 +177,21 @@ def make_steer_vector_forward_kwargs(
     kwargs = {"batch_geometry": geo}
 
     if state is not None and (state.has_routed() or default_slot >= 0):
-        slots_np = np.fromiter(
-            (
-                slot if (slot := state.slot_of(req_id)) >= 0 else default_slot
-                for req_id in input_batch.req_ids
-            ),
-            dtype=np.int32,
-            count=num_reqs,
-        )
-        num_scheduled = input_batch.num_scheduled_tokens[:num_reqs]
-        token_slots_np = np.repeat(slots_np, num_scheduled)
-        kwargs["steer_token_slots"] = torch.from_numpy(token_slots_np).to(
+        slots_np, token_slots_np = _batch_token_slots(input_batch, state, default_slot)
+        token_slots = torch.from_numpy(token_slots_np).to(
             input_batch.input_ids.device, non_blocking=True
         )
-        kwargs["steer_active_slots"] = sorted({int(s) for s in slots_np if s >= 0})
+        active_slots = sorted({int(s) for s in slots_np if s >= 0})
+        kwargs["steer_token_slots"] = token_slots
+        kwargs["steer_active_slots"] = active_slots
+        if manager is None:
+            raise RuntimeError(
+                "steering slots are routed but no worker manager was passed "
+                "to make_steer_vector_forward_kwargs"
+            )
+        kwargs["steer_slot_positions"] = resolve_slot_positions(
+            manager.slot_clauses(), active_slots, token_slots_np, token_slots, geo
+        )
 
         if trace.enabled():
             trace.begin_step(
@@ -143,11 +216,10 @@ def fill_graph_steer_buffers(
     sets the per-layer trigger masks to 1 at steered positions. The
     captured kernel `hidden += mask * vectors[row_tok]` then applies the
     right configs without any per-step graph work; row 0 / mask 0 keep
-    unsteered and padding tokens untouched.
+    unsteered and padding tokens untouched. Positions come from the same
+    resolver the layer hooks use (resolve_slot_positions).
     """
-    from vllm.steer_vectors.algorithms.triggers import (
-        TriggerController,
-    )
+    from vllm.steer_vectors.algorithms.triggers import clause_cache_key
 
     manager.zero_graph_masks()
     row_buf = manager.row_tok_buf
@@ -156,58 +228,35 @@ def fill_graph_steer_buffers(
     if not entries or state is None:
         return
 
-    num_reqs = input_batch.num_reqs
-    default_slot = manager.server_slot
-    slots_np = np.fromiter(
-        (
-            slot if (slot := state.slot_of(req_id)) >= 0 else default_slot
-            for req_id in input_batch.req_ids
-        ),
-        dtype=np.int64,
-        count=num_reqs,
+    slots_np, token_slots_np = _batch_token_slots(
+        input_batch, state, manager.server_slot
     )
     rows_np = np.fromiter(
         (entries[s][0] if s in entries else 0 for s in slots_np),
         dtype=np.int64,
-        count=num_reqs,
+        count=slots_np.shape[0],
     )
-    num_scheduled = input_batch.num_scheduled_tokens[:num_reqs]
+    num_scheduled = input_batch.num_scheduled_tokens[: slots_np.shape[0]]
     token_rows_np = np.repeat(rows_np, num_scheduled)
     n = token_rows_np.shape[0]
     if n == 0:
         return
     device = row_buf.device
     row_buf[:n].copy_(torch.from_numpy(token_rows_np).to(device, non_blocking=True))
-    token_slots = torch.from_numpy(np.repeat(slots_np, num_scheduled)).to(
-        device, non_blocking=True
-    )
+    token_slots = torch.from_numpy(token_slots_np).to(device, non_blocking=True)
 
     # Batch geometry for the trigger collector: the same object the
     # forward context carries, from the single producer.
     geo = build_batch_geometry(input_batch)
-    current_tokens = geo.token_ids
-    samples_info = geo.samples_info()
-
     batch_slots = set(slots_np.tolist())
-    for slot, (row, request, controllers) in entries.items():
-        if slot not in batch_slots:
-            continue
-        ctrl = TriggerController()
-        ctrl.configure_from_dict(steer_params_dict(request))
-        if ctrl.is_global_only_config():
-            positions = (token_slots == slot).nonzero(as_tuple=False).squeeze(-1)
-        else:
-            # current_tokens doubles as the hidden_states arg: the
-            # collector only takes the device from it.
-            positions = ctrl.collect_intervention_positions(
-                hidden_states=current_tokens,
-                current_tokens=current_tokens,
-                samples_info=samples_info,
-            )
-            if positions is None or positions.numel() == 0:
-                continue
-            positions = positions[token_slots[positions] == slot]
-        if positions.numel() == 0:
+    active_slots = sorted(s for s in entries if s in batch_slots)
+    resolved = resolve_slot_positions(
+        manager.slot_clauses(), active_slots, token_slots_np, token_slots, geo
+    )
+    for slot in active_slots:
+        _, request, controllers = entries[slot]
+        positions = resolved[(slot, clause_cache_key(request.apply_spec))]
+        if positions is None:
             continue
         for module in controllers:
             module.graph_mask[positions] = 1.0

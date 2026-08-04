@@ -210,6 +210,13 @@ class ForwardContext:
     steer_active_slots: list[int] | None = None
     """Config slots present in the current batch, for layer-side iteration."""
 
+    steer_slot_positions: dict[tuple, torch.Tensor | None] | None = None
+    """(slot, clause_cache_key) -> steered token positions for this step,
+    resolved once by the runner and shared by every layer hook (clauses
+    are layer-invariant). None value = clause matched nothing this step;
+    missing key = resolver/hook drift (layer hooks raise).
+    """
+
     # Boolean mask over the token axis: True for padding rows that are not real
     # tokens. Consumers can use it to skip work for padded tokens. None when
     # the producer does not set it.
@@ -283,6 +290,7 @@ def create_forward_context(
     batch_geometry: "BatchGeometry | None" = None,
     steer_token_slots: torch.Tensor | None = None,
     steer_active_slots: list[int] | None = None,
+    steer_slot_positions: dict[tuple, torch.Tensor | None] | None = None,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -304,6 +312,7 @@ def create_forward_context(
         batch_geometry=batch_geometry,
         steer_token_slots=steer_token_slots,
         steer_active_slots=steer_active_slots,
+        steer_slot_positions=steer_slot_positions,
     )
 
 
@@ -337,6 +346,7 @@ def set_forward_context(
     batch_geometry: "BatchGeometry | None" = None,
     steer_token_slots: torch.Tensor | None = None,
     steer_active_slots: list[int] | None = None,
+    steer_slot_positions: dict[tuple, torch.Tensor | None] | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -409,6 +419,7 @@ def set_forward_context(
         batch_geometry=batch_geometry,
         steer_token_slots=steer_token_slots,
         steer_active_slots=steer_active_slots,
+        steer_slot_positions=steer_slot_positions,
     )
 
     try:

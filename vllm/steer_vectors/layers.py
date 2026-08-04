@@ -17,10 +17,6 @@ try:
 except ImportError:
     get_forward_context = None
 
-# Sentinel for lazily-fetched forward-context info (None is a valid
-# "unavailable" fetch result).
-_CTX_UNSET = object()
-
 
 def _resolve_conflicts(collected, mode: str):
     """Resolve position conflicts between a slot's interventions.
@@ -125,21 +121,25 @@ class SlotRoutedSteerController(nn.Module):
         self.slot_interventions.pop(index, None)
         self.slot_conflict.pop(index, None)
 
-    def apply_steering(self, token_tensor):
+    def apply_steering(self, token_tensor, residual=None):
         """Dispatch slot-routed steering on a per-token row tensor.
 
         Applies each batch-active slot's interventions to its own
-        requests' token rows via the forward context's token->slot map;
-        no map means no steering this step.
+        requests' token rows; positions are pre-resolved once per step
+        by the runner (forward context's steer_slot_positions, keyed by
+        clause) — no per-layer trigger work or device syncs. With
+        `residual`, transforms see the complete hidden state of the
+        selected rows but write back only `token_tensor` (delta form) —
+        the residual stream is never collapsed or zeroed.
         """
         ctx = get_forward_context() if get_forward_context is not None else None
         token_slots = getattr(ctx, "steer_token_slots", None)
         active_slots = getattr(ctx, "steer_active_slots", None)
         if token_slots is None or not active_slots:
             return token_tensor
+        slot_positions = ctx.steer_slot_positions
 
         tensor = token_tensor
-        ctx_info = _CTX_UNSET
         for slot in active_slots:
             entries = self.slot_interventions.get(slot)
             if not entries:
@@ -150,28 +150,17 @@ class SlotRoutedSteerController(nn.Module):
                 params = algo._get_params()
                 if not algo._is_valid(params):
                     continue
-                if not algo.triggers.has_any_triggers():
+                key = algo.triggers.cache_key
+                if key is None:
                     continue
-                if algo.triggers.is_global_only_config():
-                    # All tokens of this slot's requests.
-                    positions = (
-                        (token_slots == slot).nonzero(as_tuple=False).squeeze(-1)
+                if slot_positions is None or (slot, key) not in slot_positions:
+                    raise RuntimeError(
+                        f"steering positions for slot {slot} were not "
+                        "resolved this step — the runner's clause registry "
+                        "is out of sync with the layer controllers"
                     )
-                else:
-                    if ctx_info is _CTX_UNSET:
-                        ctx_info = algo._get_forward_context_and_samples(tensor)
-                    if ctx_info is None:
-                        continue
-                    _, samples_info, current_tokens = ctx_info
-                    positions = algo.triggers.collect_intervention_positions(
-                        hidden_states=tensor,
-                        current_tokens=current_tokens,
-                        samples_info=samples_info,
-                    )
-                    if positions is None or positions.numel() == 0:
-                        continue
-                    positions = positions[token_slots[positions] == slot]
-                if positions.numel() == 0:
+                positions = slot_positions[(slot, key)]
+                if positions is None:
                     continue
                 collected.append((idx, algo, positions))
 
@@ -180,7 +169,7 @@ class SlotRoutedSteerController(nn.Module):
             )
             for idx, algo, positions in collected:
                 tensor = algo._batch_transform_tensor(
-                    tensor, positions, algo._get_params()
+                    tensor, positions, algo._get_params(), residual=residual
                 )
                 if trace.enabled():
                     label = (
@@ -246,6 +235,12 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
         all steering logic executes inside the opaque vllm::steer_apply
         custom op, which is a piecewise splitting op under compiled
         execution (it runs eagerly between CUDA-graph segments).
+
+        Steering is row-local on `hidden_states`: adding a delta to
+        `hidden` is equivalent to adding it to `hidden + residual`, so
+        the residual stream flows on untouched and the next layer's
+        fused add-RMSNorm is preserved. Unsteered steps cost only the
+        op dispatch.
         """
         if self._op_key is None:
             return output
@@ -253,36 +248,23 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
         hidden_states, residual, other_outputs, original_format = split_decoder_output(
             output
         )
-        if residual is not None:
-            complete_hidden_states = hidden_states + residual
-        else:
-            complete_hidden_states = hidden_states
 
         if self._graph_mode:
             # Tier-1 full-graph kernel: pure tensor math over persistent
             # buffers, safe to capture into CUDA graphs / compile. Rows
             # and masks are filled host-side before each step; row 0 is
             # the zero vector, so unsteered/padding tokens are no-ops.
-            n = complete_hidden_states.shape[0]
-            complete_hidden_states = complete_hidden_states + (
+            n = hidden_states.shape[0]
+            steered = hidden_states + (
                 self.graph_mask[:n].unsqueeze(1)
                 * self.graph_vectors[self.graph_row_tok[:n]]
             )
-        else:
-            torch.ops.vllm.steer_apply(complete_hidden_states, self._op_key)
-
-        if residual is not None:
-            zero_residual = torch.zeros_like(residual)
             return reconstruct_decoder_output(
-                complete_hidden_states,
-                zero_residual,
-                other_outputs,
-                original_format,
-                output,
+                steered, residual, other_outputs, original_format, output
             )
-        return reconstruct_decoder_output(
-            complete_hidden_states, None, other_outputs, original_format, output
-        )
+
+        torch.ops.vllm.steer_apply(hidden_states, residual, self._op_key)
+        return output
 
 
 class MoEGateSteerController(SlotRoutedSteerController):

@@ -284,6 +284,20 @@ class WorkerSteerVectorManager:
         entry = self._config_slots.get(fp)
         return None if entry is None else entry[0]
 
+    def slot_clauses(self) -> dict[int, list[dict | None]]:
+        """slot -> ordered where-clauses of its live interventions.
+
+        Input of the per-step position resolver; derived from the live
+        request registry so it can never drift from slot routing.
+        """
+        clauses: dict[int, list[dict | None]] = {}
+        for slot, _, request in self._config_slots.values():
+            if request.is_multi_vector:
+                clauses[slot] = [vc.apply_spec for vc in request.vector_configs]
+            else:
+                clauses[slot] = [request.apply_spec]
+        return clauses
+
     def _distribute_config(
         self, slot: int, model: LoadedSteerVector, request: SteerVectorRequest
     ) -> None:

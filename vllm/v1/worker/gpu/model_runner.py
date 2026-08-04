@@ -1412,6 +1412,7 @@ class GPUModelRunner(
                     input_batch,
                     self.steer_vector_state,
                     default_slot=(-1 if manager is None else manager.server_slot),
+                    manager=manager,
                 )
             if not steer_vector_kwargs and not dummy_run:
                 # Capture-only runs still need batch geometry in the
