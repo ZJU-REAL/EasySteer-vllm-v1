@@ -3,6 +3,18 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 
+def wire_tensor_rank(wire, field: str) -> int | None:
+    """Rank (second dim) of a named 2-D tensor in an inline wire payload."""
+    if not isinstance(wire, dict):
+        return None
+    tensor = wire.get("tensors", {}).get(field)
+    if isinstance(tensor, dict):
+        shape = tensor.get("shape")
+        if isinstance(shape, list) and len(shape) == 2:
+            return int(shape[1])
+    return None
+
+
 class BaseSteerVectorAlgorithm(ABC):
     """
     Base interface for steer vector algorithms.
@@ -12,7 +24,30 @@ class BaseSteerVectorAlgorithm(ABC):
     Trigger management (where a vector applies) is handled by TriggerController in
     triggers.py, allowing algorithm developers to focus purely on transformation
     logic.
+
+    Full-graph (Tier-1) support is declared per algorithm: `graph_family`
+    names a kernel family in vllm.steer_vectors.layers.GRAPH_FAMILIES
+    (None = piecewise only, rejected at admission under graph_mode=full),
+    and `graph_lower` maps this algorithm's (payload, scale) onto that
+    family's slot tensors — colocated with the eager `_transform` whose
+    math it must reproduce.
     """
+
+    graph_family: str | None = None
+
+    @staticmethod
+    def graph_lower(payload: Any, scale: float) -> dict[str, Any]:
+        """Lower one layer's (payload, scale) to family slot tensors.
+
+        Returns {table_key: tensor-or-None}; None entries keep the
+        table's zero default (e.g. an absent bias).
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def wire_rank(wire) -> int | None:
+        """Rank of an inline wire payload (low-rank families only)."""
+        return None
 
     def __init__(self, layer_id: int | None = None):
         """

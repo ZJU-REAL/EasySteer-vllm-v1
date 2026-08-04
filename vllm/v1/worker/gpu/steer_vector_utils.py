@@ -258,5 +258,13 @@ def fill_graph_steer_buffers(
         positions = resolved[(slot, clause_cache_key(request.apply_spec))]
         if positions is None:
             continue
+        # Families whose delta a zero table row cannot neutralize (e.g.
+        # replace) carry their own mask; see GRAPH_FAMILY_MASKS.
+        from vllm.steer_vectors.algorithms import get_algorithm
+        from vllm.steer_vectors.layers import graph_family_mask_attr
+
+        mask_attr = graph_family_mask_attr(
+            get_algorithm(request.algorithm).graph_family
+        )
         for module in controllers:
-            module.graph_mask[positions] = 1.0
+            getattr(module, mask_attr)[positions] = 1.0

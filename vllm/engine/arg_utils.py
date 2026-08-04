@@ -608,6 +608,7 @@ class EngineArgs:
     max_steer_vectors: int = 8
     steer_vector_dtype: str = "auto"
     steer_graph_mode: str = "auto"
+    steer_graph_max_rank: int = 32
     steer_require_preload: bool = False
     steering_config: str | None = None
 
@@ -1391,6 +1392,16 @@ class EngineArgs:
                 "configs only), 'piecewise' (all algorithms; steering runs "
                 "between graph segments), or 'auto' (default: full under "
                 "compiled execution, piecewise under eager)."
+            ),
+        )
+        steer_vector_group.add_argument(
+            "--steer-graph-max-rank",
+            type=int,
+            default=EngineArgs.steer_graph_max_rank,
+            help=(
+                "Rank capacity of the full-graph low-rank steering buffers "
+                "(loreft/lm_steer); higher-rank payloads are rejected under "
+                "steer-graph-mode=full."
             ),
         )
         steer_vector_group.add_argument(
@@ -2309,6 +2320,7 @@ class EngineArgs:
                 max_steer_vectors=self.max_steer_vectors,
                 steer_vector_dtype=self.steer_vector_dtype,
                 graph_mode=self.steer_graph_mode,
+                graph_max_rank=self.steer_graph_max_rank,
                 require_preload=bool(self.steer_require_preload),
                 steering_config=self.steering_config,
             )

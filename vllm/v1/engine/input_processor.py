@@ -226,21 +226,17 @@ class InputProcessor:
         # Reject non-graph-safe configs at the frontend so a bad request
         # errors instead of reaching (and killing) the engine core.
         if self.vllm_config.steer_vector_config.graph_mode == "full":
-            problem = None
-            if steer_vector_request.is_multi_vector:
-                problem = "multi-vector configs"
-            elif steer_vector_request.algorithm != "direct":
-                problem = f"algorithm '{steer_vector_request.algorithm}'"
-            elif steer_vector_request.normalize:
-                problem = "normalize=True"
+            from vllm.steer_vectors.worker_manager import (
+                graph_reject_message,
+                graph_request_problem,
+            )
+
+            problem = graph_request_problem(
+                steer_vector_request,
+                self.vllm_config.steer_vector_config.graph_max_rank,
+            )
             if problem is not None:
-                raise ValueError(
-                    f"steer graph_mode=full (the default under compiled "
-                    f"execution) supports only graph-safe configs (direct "
-                    f"algorithm, no normalize, single vector); got "
-                    f"{problem}. Launch with steer_graph_mode='piecewise' "
-                    f"to run this config under CUDA graphs."
-                )
+                raise ValueError(graph_reject_message(problem))
 
     def _get_mm_identifier(
         self,

@@ -2,6 +2,7 @@
 
 import torch
 
+from .base import wire_tensor_rank
 from .factory import register_algorithm
 from .template import AlgorithmTemplate
 
@@ -13,6 +14,23 @@ class LMSteerAlgorithm(AlgorithmTemplate):
     Payload: dict with 'projector1' and 'projector2' low-rank projection
     matrices per layer, loaded from a .pt file.
     """
+
+    graph_family = "lowrank"
+
+    @staticmethod
+    def graph_lower(payload, scale):
+        # The lowrank family's Rin/b terms vanish: delta = (xP1)(αP2)^T.
+        p1 = payload["projector1"]
+        p2 = payload["projector2"]
+        if p1.dim() > 2:
+            p1 = p1[0]
+        if p2.dim() > 2:
+            p2 = p2[0]
+        return {"A": p1, "Rout": p2 * scale}
+
+    @staticmethod
+    def wire_rank(wire):
+        return wire_tensor_rank(wire, "projector1")
 
     def _transform(self, hidden_state: torch.Tensor, params: dict) -> torch.Tensor:
         P1 = params["projector1"]

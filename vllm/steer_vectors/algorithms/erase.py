@@ -18,6 +18,15 @@ class EraseAlgorithm(AlgorithmTemplate):
     tensor per layer (GGUF only).
     """
 
+    graph_family = "projection"
+
+    @staticmethod
+    def graph_lower(payload, scale):
+        # Mirrors _transform with the prescaled direction: the
+        # projection is scale-invariant up to the epsilon.
+        h1 = (payload * scale).to(torch.float32).reshape(-1)
+        return {"B": h1 / (h1.pow(2).sum() + 1e-8), "C": -h1}
+
     def _transform(
         self, hidden_state: torch.Tensor, params: torch.Tensor
     ) -> torch.Tensor:

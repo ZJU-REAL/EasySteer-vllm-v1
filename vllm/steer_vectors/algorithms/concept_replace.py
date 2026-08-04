@@ -35,6 +35,15 @@ class ConceptReplaceAlgorithm(AlgorithmTemplate):
     or the first two alphabetically).
     """
 
+    graph_family = "projection"
+
+    @staticmethod
+    def graph_lower(payload, scale):
+        # Like _transform, the substitution ignores the scale.
+        h1 = payload["h1"].to(torch.float32).reshape(-1)
+        h2 = payload["h2"].to(torch.float32).reshape(-1)
+        return {"B": h1 / (h1.pow(2).sum() + 1e-8), "C": h2 - h1}
+
     def _transform(
         self, hidden_state: torch.Tensor, params: dict[str, torch.Tensor]
     ) -> torch.Tensor:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import torch
 
+from .base import wire_tensor_rank
 from .factory import register_algorithm
 from .template import AlgorithmTemplate
 
@@ -13,6 +14,23 @@ class LoReFTAlgorithm(AlgorithmTemplate):
     and optional 'learned_source_bias' (b) per layer, loaded from a
     pyreft checkpoint directory.
     """
+
+    graph_family = "lowrank"
+
+    @staticmethod
+    def graph_lower(payload, scale):
+        # delta = (xW^T + b - xR) @ (sR)^T = (x(W^T - R) + b) @ (sR)^T
+        rotate = payload["rotate_layer"]
+        weight = payload["learned_source_weight"]
+        return {
+            "A": weight.T - rotate,
+            "Rout": rotate * scale,
+            "b": payload.get("learned_source_bias"),
+        }
+
+    @staticmethod
+    def wire_rank(wire):
+        return wire_tensor_rank(wire, "rotate_layer")
 
     def _transform(self, hidden_state: torch.Tensor, params: dict) -> torch.Tensor:
         rotate_layer = params["rotate_layer"]

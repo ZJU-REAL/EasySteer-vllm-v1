@@ -10,7 +10,32 @@ from vllm.steer_vectors.discovery import (
     split_decoder_output,
 )
 
-from .algorithms import create_algorithm
+from .algorithms import create_algorithm, get_algorithm
+
+# Tier-1 kernel-family buffer schemas: family -> {table: dims}, dims
+# over "h" (hidden size) and "r" (steer_graph_max_rank). The traced
+# kernel in DecoderLayerWithSteerVector.process_output_hook is written
+# against exactly these families — adding a family means extending both
+# this schema and that kernel. Algorithms opt in by declaring
+# graph_family + graph_lower on their class (see algorithms/base.py).
+GRAPH_FAMILIES: dict[str, dict[str, tuple[str, ...]]] = {
+    # delta = V[row]
+    "additive": {"V": ("h",)},
+    # delta = (x . B[row]) * C[row]
+    "projection": {"B": ("h",), "C": ("h",)},
+    # delta = (x @ A[row] + b[row]) @ Rout[row]^T
+    "lowrank": {"A": ("h", "r"), "Rout": ("h", "r"), "b": ("r",)},
+    # complete state becomes V[row]: delta = mask * (V[row] - x)
+    "replace": {"V": ("h",)},
+}
+
+# Families whose delta is not neutralized by a zero table row carry
+# their own per-token mask; all others share "graph_mask".
+GRAPH_FAMILY_MASKS: dict[str, str] = {"replace": "repl_mask"}
+
+
+def graph_family_mask_attr(family: str | None) -> str:
+    return GRAPH_FAMILY_MASKS.get(family, "graph_mask")
 
 try:
     from vllm.forward_context import get_forward_context
@@ -193,11 +218,16 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
     def __init__(self) -> None:
         super().__init__()
         # Tier-1 full-graph mode: persistent buffers read by the captured
-        # kernel `hidden += mask * vectors[row_tok]` (see init_graph_table).
+        # kernel families (see GRAPH_FAMILIES, init_graph_table and
+        # process_output_hook).
         self._graph_mode: bool = False
-        self.graph_vectors: torch.Tensor | None = None
+        self.graph_tables: dict[str, dict[str, torch.Tensor]] | None = None
         self.graph_mask: torch.Tensor | None = None
+        self.repl_mask: torch.Tensor | None = None
         self.graph_row_tok: torch.Tensor | None = None
+        # Per-row normalize flag: steered rows of flagged configs are
+        # rescaled back to the original complete-state norm.
+        self.norm_flag: torch.Tensor | None = None
 
     def init_graph_table(
         self,
@@ -207,26 +237,83 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
         device: torch.device,
         max_num_tokens: int,
         row_tok: torch.Tensor,
+        max_rank: int,
     ) -> None:
         """Allocate Tier-1 persistent buffers (full-graph steering mode).
 
         Must run before compilation/graph capture so the captured kernel
-        sees the final buffer addresses. Row 0 of the vector table stays
-        zero (the no-steer row).
+        sees the final buffer addresses. Row 0 of every table stays zero
+        (the no-steer row): unused families contribute an exact zero
+        delta, so they cost only cached zero-row reads when idle.
         """
-        self.graph_vectors = torch.zeros(
-            num_rows + 1, hidden_size, dtype=dtype, device=device
-        )
+        dim_of = {"h": hidden_size, "r": max_rank}
+        rows = num_rows + 1
+        self.graph_tables = {
+            family: {
+                key: torch.zeros(
+                    rows, *(dim_of[d] for d in dims), dtype=dtype, device=device
+                )
+                for key, dims in schema.items()
+            }
+            for family, schema in GRAPH_FAMILIES.items()
+        }
         self.graph_mask = torch.zeros(max_num_tokens, dtype=dtype, device=device)
+        self.repl_mask = torch.zeros(max_num_tokens, dtype=dtype, device=device)
+        self.norm_flag = torch.zeros(rows, dtype=dtype, device=device)
         self.graph_row_tok = row_tok
         self._graph_mode = True
 
-    def set_graph_row(self, row: int, payload: torch.Tensor) -> None:
-        self.graph_vectors[row].copy_(payload.to(self.graph_vectors.dtype))
+    def set_graph_row(
+        self,
+        row: int,
+        algorithm: str,
+        payload,
+        scale: float,
+        normalize: bool = False,
+    ) -> None:
+        """Write one config's lowered payload into its family's tables.
+
+        The algorithm class owns the lowering (graph_lower, colocated
+        with its eager math); this writer is generic: smaller tensors are
+        zero-padded into the table slot (exact no-op padding), larger
+        ones rejected.
+        """
+        algo_cls = get_algorithm(algorithm)
+        self.norm_flag[row] = 1.0 if normalize else 0.0
+        family = algo_cls.graph_family
+        if family is None:
+            raise ValueError(
+                f"algorithm {algorithm!r} has no full-graph kernel family"
+            )
+        tables = self.graph_tables[family]
+        for key, value in algo_cls.graph_lower(payload, scale).items():
+            if value is None:
+                continue
+            dest = tables[key][row]
+            if value.dim() != dest.dim() or any(
+                v > d for v, d in zip(value.shape, dest.shape)
+            ):
+                raise ValueError(
+                    f"{algorithm} payload {key} shape {tuple(value.shape)} "
+                    f"exceeds the full-graph buffer {tuple(dest.shape)}; "
+                    f"raise steer_graph_max_rank or launch with "
+                    f"steer_graph_mode='piecewise'"
+                )
+            dest[tuple(slice(0, s) for s in value.shape)].copy_(
+                value.to(dest.dtype)
+            )
 
     def clear_graph_row(self, row: int) -> None:
-        if self.graph_vectors is not None:
-            self.graph_vectors[row].zero_()
+        if self.graph_tables is None:
+            return
+        self.norm_flag[row] = 0.0
+        for tables in self.graph_tables.values():
+            for table in tables.values():
+                table[row].zero_()
+
+    def zero_step_masks(self) -> None:
+        self.graph_mask.zero_()
+        self.repl_mask.zero_()
 
     def process_output_hook(self, module, args, output):
         """torch forward-hook entry point: intervene on the layer output.
@@ -250,15 +337,48 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
         )
 
         if self._graph_mode:
-            # Tier-1 full-graph kernel: pure tensor math over persistent
+            # Tier-1 full-graph kernels: pure tensor math over persistent
             # buffers, safe to capture into CUDA graphs / compile. Rows
-            # and masks are filled host-side before each step; row 0 is
-            # the zero vector, so unsteered/padding tokens are no-ops.
+            # and masks are filled host-side before each step; row 0 of
+            # every table is zero, so unsteered/padding tokens and idle
+            # families contribute exact zero deltas. Low-rank/projection
+            # coefficients are computed for all slots at once (slot count
+            # is small) and then selected per token — this avoids
+            # materializing per-token [n, hidden, rank] weight gathers.
             n = hidden_states.shape[0]
-            steered = hidden_states + (
-                self.graph_mask[:n].unsqueeze(1)
-                * self.graph_vectors[self.graph_row_tok[:n]]
+            rt = self.graph_row_tok[:n]
+            mask = self.graph_mask[:n].unsqueeze(1)
+            if residual is not None:
+                x = hidden_states + residual
+            else:
+                x = hidden_states
+
+            delta = self.graph_tables["additive"]["V"][rt]
+            # Projection family: delta += (x . B[row]) * C[row]
+            proj = self.graph_tables["projection"]
+            coef = (x @ proj["B"].T).gather(1, rt.unsqueeze(1))
+            delta = delta + coef * proj["C"][rt]
+            # Low-rank family: delta += (x @ A[row] + b[row]) @ Rout[row]^T
+            lowrank = self.graph_tables["lowrank"]
+            low = torch.einsum("nh,shr->snr", x, lowrank["A"])
+            low = low + lowrank["b"].unsqueeze(1)
+            out = torch.einsum("snr,shr->snh", low, lowrank["Rout"])
+            delta = delta + out[rt, torch.arange(n, device=rt.device)]
+
+            repl = self.repl_mask[:n].unsqueeze(1)
+            total = mask * delta + repl * (
+                self.graph_tables["replace"]["V"][rt] - x
             )
+            # normalize: rescale flagged steered rows to the original
+            # complete-state norm (float32, mirroring _renormalize).
+            # Gated by the token masks too — an eps-renorm on an
+            # unsteered row would break bit-exactness.
+            y = x + total
+            norm_x = torch.linalg.vector_norm(x.float(), dim=-1, keepdim=True)
+            norm_y = torch.linalg.vector_norm(y.float(), dim=-1, keepdim=True)
+            renormed = (y.float() * norm_x / (norm_y + 1e-8)).to(y.dtype)
+            nf = self.norm_flag[rt].unsqueeze(1) * (mask + repl)
+            steered = hidden_states + total + nf * (renormed - y)
             return reconstruct_decoder_output(
                 steered, residual, other_outputs, original_format, output
             )
@@ -282,6 +402,97 @@ class MoEGateSteerController(SlotRoutedSteerController):
     configs batch together.
     """
 
+    def __init__(self) -> None:
+        super().__init__()
+        # Tier-1 full-graph mode: expert toggle tables read by the
+        # captured gate kernel (see init_graph_table / the hook below).
+        self._graph_mode: bool = False
+        self.hook_target = None  # set at attach (models.py)
+        self.moe_act: torch.Tensor | None = None
+        self.moe_deact: torch.Tensor | None = None
+        self.moe_eps: torch.Tensor | None = None
+        self.graph_mask: torch.Tensor | None = None
+        self.graph_row_tok: torch.Tensor | None = None
+
+    def init_graph_table(
+        self,
+        num_rows: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        max_num_tokens: int,
+        row_tok: torch.Tensor,
+    ) -> None:
+        """Allocate the gate kernel's expert toggle tables.
+
+        The expert count comes from the hooked gate module's weight;
+        row 0 stays zero so unrouted tokens are exact no-ops.
+        """
+        weight = getattr(self.hook_target, "weight", None)
+        if weight is None:
+            raise RuntimeError(
+                "moe gate module exposes no weight; cannot size the "
+                "full-graph expert toggle tables"
+            )
+        num_experts = weight.shape[0]
+        rows = num_rows + 1
+        self.moe_act = torch.zeros(
+            rows, num_experts, dtype=dtype, device=device
+        )
+        self.moe_deact = torch.zeros(
+            rows, num_experts, dtype=dtype, device=device
+        )
+        self.moe_eps = torch.zeros(rows, dtype=dtype, device=device)
+        self.graph_mask = torch.zeros(max_num_tokens, dtype=dtype, device=device)
+        self.graph_row_tok = row_tok
+        self._graph_mode = True
+
+    def set_graph_row(self, row: int, payload: dict) -> None:
+        """Write one config's expert toggles (per-layer moe payload).
+
+        Mirrors _transform_toggle: mode routes expert_ids, explicit
+        activate_ids/deactivate_ids are honored, out-of-range ids warn
+        and drop, deactivation wins overlaps (applied last in-kernel).
+        """
+        from vllm.logger import init_logger
+
+        num_experts = self.moe_act.shape[1]
+        expert_ids = payload.get("expert_ids") or []
+        activate = list(payload.get("activate_ids") or [])
+        deactivate = list(payload.get("deactivate_ids") or [])
+        if payload.get("mode", "activate") == "activate":
+            activate += expert_ids
+        else:
+            deactivate += expert_ids
+        invalid = [
+            e for e in activate + deactivate if not 0 <= e < num_experts
+        ]
+        if invalid:
+            init_logger(__name__).warning_once(
+                "moe_router: expert ids %s are outside [0, %d) for this "
+                "model and are ignored.",
+                sorted(set(invalid)),
+                num_experts,
+            )
+        self.moe_act[row].zero_()
+        self.moe_deact[row].zero_()
+        for e in activate:
+            if 0 <= e < num_experts:
+                self.moe_act[row, e] = 1.0
+        for e in deactivate:
+            if 0 <= e < num_experts:
+                self.moe_deact[row, e] = 1.0
+        self.moe_eps[row] = payload.get("epsilon", 0.01)
+
+    def clear_graph_row(self, row: int) -> None:
+        if self.moe_act is None:
+            return
+        self.moe_act[row].zero_()
+        self.moe_deact[row].zero_()
+        self.moe_eps[row] = 0.0
+
+    def zero_step_masks(self) -> None:
+        self.graph_mask.zero_()
+
     def process_gate_output_hook(self, module, args, output):
         """Forward-hook entry point on the gate module.
 
@@ -292,6 +503,24 @@ class MoEGateSteerController(SlotRoutedSteerController):
             return None
         logits = extract_gate_logits(output)
         if logits is None:
+            return None
+        if self._graph_mode:
+            # Captured gate kernel, mirroring _transform_toggle: steered
+            # rows become log-softmax scores with activated experts at
+            # max+eps and deactivated at min-eps (deactivation last);
+            # unsteered rows keep the raw logits bit-exactly.
+            n = logits.shape[0]
+            rt = self.graph_row_tok[:n]
+            m = self.graph_mask[:n].unsqueeze(1)
+            scores = torch.nn.functional.log_softmax(logits, dim=-1)
+            mx = scores.max(dim=-1, keepdim=True).values
+            mn = scores.min(dim=-1, keepdim=True).values
+            act = self.moe_act[rt]
+            deact = self.moe_deact[rt]
+            eps = self.moe_eps[rt].unsqueeze(1)
+            out = scores * (1 - act) + act * (mx + eps)
+            out = out * (1 - deact) + deact * (mn - eps)
+            logits.copy_(m * out + (1 - m) * logits)
             return None
         torch.ops.vllm.steer_moe_gate(logits, self._op_key)
         return None

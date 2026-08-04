@@ -246,6 +246,10 @@ class SteerControllerManager:
                     module_name,
                 )
             controller._op_key = op_key
+            # Keep a reference to the hooked module without registering
+            # it as a submodule (that would cycle the module tree); the
+            # MoE gate graph tables read their expert count from it.
+            object.__setattr__(controller, "hook_target", target)
             steer_ops.register_controller(op_key, controller)
             hook = getattr(controller, spec.hook_method)
             self._hook_handles.append(target.register_forward_hook(hook))

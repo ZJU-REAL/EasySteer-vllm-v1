@@ -85,6 +85,11 @@ class MoERouterAlgorithm(AlgorithmTemplate):
             )
         return canonical
 
+    # Gate-hook kernel family (expert toggle tables on the gate
+    # controller); activate/deactivate only — soft modes and file-based
+    # configs stay piecewise (see graph_request_problem).
+    graph_family = "moe_gate"
+
     def __init__(self, layer_id: int | None = None, **kwargs):
         # MoE router doesn't use normalize parameter - remove it from kwargs if present
         kwargs.pop("normalize", None)

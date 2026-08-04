@@ -17,6 +17,12 @@ class ReplaceAlgorithm(AlgorithmTemplate):
     single tensor per layer (GGUF only).
     """
 
+    graph_family = "replace"
+
+    @staticmethod
+    def graph_lower(payload, scale):
+        return {"V": payload * scale}
+
     def _transform(
         self, hidden_state: torch.Tensor, params: torch.Tensor
     ) -> torch.Tensor:

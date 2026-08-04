@@ -53,15 +53,22 @@ class SteerVectorConfig:
 
     graph_mode: str = "auto"
     """CUDA-graph execution mode for steering. "full" keeps full CUDA
-    graphs by capturing a data-driven per-layer kernel
-    (hidden += mask * vector_table[token_row]) that reads persistent
-    buffers filled host-side each step — only graph-safe configs are
-    admitted (direct algorithm, no normalize, single-vector).
-    "piecewise" splits compiled graphs at every steered layer and runs
-    steering eagerly between the segments — all algorithms supported,
-    at roughly half the throughput of full graphs. "auto" (default)
-    resolves to "full" under compiled execution and "piecewise" under
-    eager execution (resolved during VllmConfig post-init)."""
+    graphs by capturing data-driven per-layer kernel families (additive,
+    projection, low-rank, replace) that read persistent buffers filled
+    host-side each step — single-vector configs of the graph-safe
+    algorithms (direct, erase, replace, concept_replace, loreft,
+    lm_steer) without normalize are admitted. "piecewise" splits
+    compiled graphs at every steered layer and runs steering eagerly
+    between the segments — all algorithms supported, at roughly half
+    the throughput of full graphs. "auto" (default) resolves to "full"
+    under compiled execution and "piecewise" under eager execution
+    (resolved during VllmConfig post-init)."""
+
+    graph_max_rank: int = Field(default=32, ge=1)
+    """Rank capacity of the full-graph low-rank steering buffers
+    (loreft rotations, lm_steer projectors). Payloads above this rank
+    are rejected under graph_mode=full; raise it (more buffer memory,
+    ~3 * layers * slots * hidden * rank values) or use piecewise."""
 
     steering_config: str | None = None
     """Engine-default steering: a SteeringSpec as inline JSON or a path
@@ -85,6 +92,7 @@ class SteerVectorConfig:
         factors.append(self.max_steer_vectors)
         factors.append(self.steer_vector_dtype)
         factors.append(self.graph_mode)
+        factors.append(self.graph_max_rank)
         factors.append(self.steering_config)
 
         hash_str = hashlib.md5(str(factors).encode(), usedforsecurity=False).hexdigest()

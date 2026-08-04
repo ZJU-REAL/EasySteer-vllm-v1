@@ -1526,9 +1526,31 @@ class VllmConfig:
                     and not self.model_config.enforce_eager
                     and self.compilation_config.mode == CompilationMode.VLLM_COMPILE
                 )
-                self.steer_vector_config.graph_mode = (
-                    "full" if compiled else "piecewise"
-                )
+                resolved = "full" if compiled else "piecewise"
+                if (
+                    resolved == "full"
+                    and self.steer_vector_config.steering_config is not None
+                ):
+                    # The engine-default config must be admissible under
+                    # the resolved mode; a full-mode engine that rejects
+                    # its own startup steering would be useless.
+                    from vllm.steer_vectors.request import build_server_request
+                    from vllm.steer_vectors.worker_manager import (
+                        graph_request_problem,
+                    )
+
+                    problem = graph_request_problem(
+                        build_server_request(self.steer_vector_config),
+                        self.steer_vector_config.graph_max_rank,
+                    )
+                    if problem is not None:
+                        logger.info(
+                            "steer_graph_mode=auto resolves to piecewise: "
+                            "the engine-default steering config carries %s.",
+                            problem,
+                        )
+                        resolved = "piecewise"
+                self.steer_vector_config.graph_mode = resolved
         if (
             self.steer_vector_config is not None
             and self.model_config is not None
