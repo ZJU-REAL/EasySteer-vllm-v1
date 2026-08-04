@@ -606,6 +606,7 @@ class EngineArgs:
     # Steer Vector fields
     enable_steer_vector: bool = False
     max_steer_vectors: int = 8
+    steer_vector_dtype: str = "auto"
     steer_graph_mode: str = "piecewise"
     steer_require_preload: bool = False
     steering_config: str | None = None
@@ -2305,6 +2306,7 @@ class EngineArgs:
         steer_vector_config = (
             SteerVectorConfig(
                 max_steer_vectors=self.max_steer_vectors,
+                steer_vector_dtype=self.steer_vector_dtype,
                 graph_mode=self.steer_graph_mode,
                 require_preload=bool(self.steer_require_preload),
                 steering_config=self.steering_config,
