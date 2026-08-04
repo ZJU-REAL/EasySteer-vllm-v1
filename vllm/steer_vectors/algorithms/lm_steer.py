@@ -2,13 +2,12 @@
 
 import torch
 
-from .base import wire_tensor_rank
+from .base import BaseSteerVectorAlgorithm, wire_tensor_rank
 from .factory import register_algorithm
-from .template import AlgorithmTemplate
 
 
 @register_algorithm("lm_steer")
-class LMSteerAlgorithm(AlgorithmTemplate):
+class LMSteerAlgorithm(BaseSteerVectorAlgorithm):
     """LM-Steer: h' = h + α * ((h @ P1) @ P2^T).
 
     Payload: dict with 'projector1' and 'projector2' low-rank projection

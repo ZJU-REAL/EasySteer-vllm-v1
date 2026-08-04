@@ -4,38 +4,18 @@ import torch
 from torch import nn
 
 from vllm.steer_vectors import trace
-from vllm.steer_vectors.discovery import (
+from vllm.steer_vectors.geometry import (
     extract_gate_logits,
     reconstruct_decoder_output,
     split_decoder_output,
 )
 
 from .algorithms import create_algorithm, get_algorithm
-
-# Tier-1 kernel-family buffer schemas: family -> {table: dims}, dims
-# over "h" (hidden size) and "r" (steer_graph_max_rank). The traced
-# kernel in DecoderLayerWithSteerVector.process_output_hook is written
-# against exactly these families — adding a family means extending both
-# this schema and that kernel. Algorithms opt in by declaring
-# graph_family + graph_lower on their class (see algorithms/base.py).
-GRAPH_FAMILIES: dict[str, dict[str, tuple[str, ...]]] = {
-    # delta = V[row]
-    "additive": {"V": ("h",)},
-    # delta = (x . B[row]) * C[row]
-    "projection": {"B": ("h",), "C": ("h",)},
-    # delta = (x @ A[row] + b[row]) @ Rout[row]^T
-    "lowrank": {"A": ("h", "r"), "Rout": ("h", "r"), "b": ("r",)},
-    # complete state becomes V[row]: delta = mask * (V[row] - x)
-    "replace": {"V": ("h",)},
-}
-
-# Families whose delta is not neutralized by a zero table row carry
-# their own per-token mask; all others share "graph_mask".
-GRAPH_FAMILY_MASKS: dict[str, str] = {"replace": "repl_mask"}
-
-
-def graph_family_mask_attr(family: str | None) -> str:
-    return GRAPH_FAMILY_MASKS.get(family, "graph_mask")
+from .graph_kernels import (
+    GRAPH_FAMILIES,
+    apply_decoder_families,
+    apply_gate_toggles,
+)
 
 try:
     from vllm.forward_context import get_forward_context
@@ -136,7 +116,7 @@ class SlotRoutedSteerController(nn.Module):
             )
             scale = spec.get("scale")
             algo.set_payload(spec["payload"], 1.0 if scale is None else scale)
-            algo.triggers.configure_from_dict(spec)
+            algo.clause.configure_from_dict(spec)
             entries.append(algo)
         self.slot_interventions[slot] = entries
         self.slot_conflict[slot] = conflict_resolution
@@ -175,7 +155,7 @@ class SlotRoutedSteerController(nn.Module):
                 params = algo._get_params()
                 if not algo._is_valid(params):
                     continue
-                key = algo.triggers.cache_key
+                key = algo.clause.cache_key
                 if key is None:
                     continue
                 if slot_positions is None or (slot, key) not in slot_positions:
@@ -206,7 +186,7 @@ class SlotRoutedSteerController(nn.Module):
         return tensor
 
 
-class DecoderLayerWithSteerVector(SlotRoutedSteerController):
+class DecoderSteerController(SlotRoutedSteerController):
     """DecoderLayer intervention controller for full hidden states.
 
     Hook-based: the controller stays outside the model tree and
@@ -223,11 +203,11 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
         self._graph_mode: bool = False
         self.graph_tables: dict[str, dict[str, torch.Tensor]] | None = None
         self.graph_mask: torch.Tensor | None = None
-        self.repl_mask: torch.Tensor | None = None
-        self.graph_row_tok: torch.Tensor | None = None
+        self.replace_mask: torch.Tensor | None = None
+        self.graph_token_rows: torch.Tensor | None = None
         # Per-row normalize flag: steered rows of flagged configs are
         # rescaled back to the original complete-state norm.
-        self.norm_flag: torch.Tensor | None = None
+        self.normalize_flag: torch.Tensor | None = None
 
     def init_graph_table(
         self,
@@ -258,9 +238,9 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
             for family, schema in GRAPH_FAMILIES.items()
         }
         self.graph_mask = torch.zeros(max_num_tokens, dtype=dtype, device=device)
-        self.repl_mask = torch.zeros(max_num_tokens, dtype=dtype, device=device)
-        self.norm_flag = torch.zeros(rows, dtype=dtype, device=device)
-        self.graph_row_tok = row_tok
+        self.replace_mask = torch.zeros(max_num_tokens, dtype=dtype, device=device)
+        self.normalize_flag = torch.zeros(rows, dtype=dtype, device=device)
+        self.graph_token_rows = row_tok
         self._graph_mode = True
 
     def set_graph_row(
@@ -279,7 +259,7 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
         ones rejected.
         """
         algo_cls = get_algorithm(algorithm)
-        self.norm_flag[row] = 1.0 if normalize else 0.0
+        self.normalize_flag[row] = 1.0 if normalize else 0.0
         family = algo_cls.graph_family
         if family is None:
             raise ValueError(
@@ -306,14 +286,14 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
     def clear_graph_row(self, row: int) -> None:
         if self.graph_tables is None:
             return
-        self.norm_flag[row] = 0.0
+        self.normalize_flag[row] = 0.0
         for tables in self.graph_tables.values():
             for table in tables.values():
                 table[row].zero_()
 
     def zero_step_masks(self) -> None:
         self.graph_mask.zero_()
-        self.repl_mask.zero_()
+        self.replace_mask.zero_()
 
     def process_output_hook(self, module, args, output):
         """torch forward-hook entry point: intervene on the layer output.
@@ -337,48 +317,15 @@ class DecoderLayerWithSteerVector(SlotRoutedSteerController):
         )
 
         if self._graph_mode:
-            # Tier-1 full-graph kernels: pure tensor math over persistent
-            # buffers, safe to capture into CUDA graphs / compile. Rows
-            # and masks are filled host-side before each step; row 0 of
-            # every table is zero, so unsteered/padding tokens and idle
-            # families contribute exact zero deltas. Low-rank/projection
-            # coefficients are computed for all slots at once (slot count
-            # is small) and then selected per token — this avoids
-            # materializing per-token [n, hidden, rank] weight gathers.
-            n = hidden_states.shape[0]
-            rt = self.graph_row_tok[:n]
-            mask = self.graph_mask[:n].unsqueeze(1)
-            if residual is not None:
-                x = hidden_states + residual
-            else:
-                x = hidden_states
-
-            delta = self.graph_tables["additive"]["V"][rt]
-            # Projection family: delta += (x . B[row]) * C[row]
-            proj = self.graph_tables["projection"]
-            coef = (x @ proj["B"].T).gather(1, rt.unsqueeze(1))
-            delta = delta + coef * proj["C"][rt]
-            # Low-rank family: delta += (x @ A[row] + b[row]) @ Rout[row]^T
-            lowrank = self.graph_tables["lowrank"]
-            low = torch.einsum("nh,shr->snr", x, lowrank["A"])
-            low = low + lowrank["b"].unsqueeze(1)
-            out = torch.einsum("snr,shr->snh", low, lowrank["Rout"])
-            delta = delta + out[rt, torch.arange(n, device=rt.device)]
-
-            repl = self.repl_mask[:n].unsqueeze(1)
-            total = mask * delta + repl * (
-                self.graph_tables["replace"]["V"][rt] - x
+            steered = apply_decoder_families(
+                self.graph_tables,
+                self.graph_mask,
+                self.replace_mask,
+                self.normalize_flag,
+                self.graph_token_rows,
+                hidden_states,
+                residual,
             )
-            # normalize: rescale flagged steered rows to the original
-            # complete-state norm (float32, mirroring _renormalize).
-            # Gated by the token masks too — an eps-renorm on an
-            # unsteered row would break bit-exactness.
-            y = x + total
-            norm_x = torch.linalg.vector_norm(x.float(), dim=-1, keepdim=True)
-            norm_y = torch.linalg.vector_norm(y.float(), dim=-1, keepdim=True)
-            renormed = (y.float() * norm_x / (norm_y + 1e-8)).to(y.dtype)
-            nf = self.norm_flag[rt].unsqueeze(1) * (mask + repl)
-            steered = hidden_states + total + nf * (renormed - y)
             return reconstruct_decoder_output(
                 steered, residual, other_outputs, original_format, output
             )
@@ -412,7 +359,7 @@ class MoEGateSteerController(SlotRoutedSteerController):
         self.moe_deact: torch.Tensor | None = None
         self.moe_eps: torch.Tensor | None = None
         self.graph_mask: torch.Tensor | None = None
-        self.graph_row_tok: torch.Tensor | None = None
+        self.graph_token_rows: torch.Tensor | None = None
 
     def init_graph_table(
         self,
@@ -443,26 +390,21 @@ class MoEGateSteerController(SlotRoutedSteerController):
         )
         self.moe_eps = torch.zeros(rows, dtype=dtype, device=device)
         self.graph_mask = torch.zeros(max_num_tokens, dtype=dtype, device=device)
-        self.graph_row_tok = row_tok
+        self.graph_token_rows = row_tok
         self._graph_mode = True
 
-    def set_graph_row(self, row: int, payload: dict) -> None:
-        """Write one config's expert toggles (per-layer moe payload).
+    def set_graph_toggles(self, row: int, toggles: dict) -> None:
+        """Write one config's lowered expert toggles into the tables.
 
-        Mirrors _transform_toggle: mode routes expert_ids, explicit
-        activate_ids/deactivate_ids are honored, out-of-range ids warn
-        and drop, deactivation wins overlaps (applied last in-kernel).
+        `toggles` comes from MoERouterAlgorithm.graph_lower (the
+        algorithm owns mode routing and overlap semantics); this writer
+        owns the width-aware part: out-of-range ids warn and drop.
         """
         from vllm.logger import init_logger
 
         num_experts = self.moe_act.shape[1]
-        expert_ids = payload.get("expert_ids") or []
-        activate = list(payload.get("activate_ids") or [])
-        deactivate = list(payload.get("deactivate_ids") or [])
-        if payload.get("mode", "activate") == "activate":
-            activate += expert_ids
-        else:
-            deactivate += expert_ids
+        activate = toggles["activate"]
+        deactivate = toggles["deactivate"]
         invalid = [
             e for e in activate + deactivate if not 0 <= e < num_experts
         ]
@@ -481,7 +423,7 @@ class MoEGateSteerController(SlotRoutedSteerController):
         for e in deactivate:
             if 0 <= e < num_experts:
                 self.moe_deact[row, e] = 1.0
-        self.moe_eps[row] = payload.get("epsilon", 0.01)
+        self.moe_eps[row] = toggles["epsilon"]
 
     def clear_graph_row(self, row: int) -> None:
         if self.moe_act is None:
@@ -505,22 +447,14 @@ class MoEGateSteerController(SlotRoutedSteerController):
         if logits is None:
             return None
         if self._graph_mode:
-            # Captured gate kernel, mirroring _transform_toggle: steered
-            # rows become log-softmax scores with activated experts at
-            # max+eps and deactivated at min-eps (deactivation last);
-            # unsteered rows keep the raw logits bit-exactly.
-            n = logits.shape[0]
-            rt = self.graph_row_tok[:n]
-            m = self.graph_mask[:n].unsqueeze(1)
-            scores = torch.nn.functional.log_softmax(logits, dim=-1)
-            mx = scores.max(dim=-1, keepdim=True).values
-            mn = scores.min(dim=-1, keepdim=True).values
-            act = self.moe_act[rt]
-            deact = self.moe_deact[rt]
-            eps = self.moe_eps[rt].unsqueeze(1)
-            out = scores * (1 - act) + act * (mx + eps)
-            out = out * (1 - deact) + deact * (mn - eps)
-            logits.copy_(m * out + (1 - m) * logits)
+            apply_gate_toggles(
+                self.moe_act,
+                self.moe_deact,
+                self.moe_eps,
+                self.graph_mask,
+                self.graph_token_rows,
+                logits,
+            )
             return None
         torch.ops.vllm.steer_moe_gate(logits, self._op_key)
         return None

@@ -4,11 +4,11 @@ import torch
 
 from .factory import register_algorithm
 from .loading import read_gguf_directions, require_extension
-from .template import AlgorithmTemplate
+from .base import BaseSteerVectorAlgorithm
 
 
 @register_algorithm("direct")
-class DirectAlgorithm(AlgorithmTemplate):
+class DirectAlgorithm(BaseSteerVectorAlgorithm):
     """Direct addition: h' = h + vector.
 
     Payload: a single direction tensor per layer. Loads EasySteer's

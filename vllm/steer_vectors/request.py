@@ -18,12 +18,12 @@ import msgspec
 # _assert_schema_complete at import time), and every conversion/copy
 # site iterates these tuples instead of spelling the fields out.
 
-STEER_TRIGGER_FIELDS: tuple[str, ...] = ("apply_spec",)
+STEER_CLAUSE_FIELDS: tuple[str, ...] = ("apply_spec",)
 
 STEER_APPLY_FIELDS: tuple[str, ...] = (
     "scale",
     "target_layers",
-    *STEER_TRIGGER_FIELDS,
+    *STEER_CLAUSE_FIELDS,
     "algorithm",
     "normalize",
 )

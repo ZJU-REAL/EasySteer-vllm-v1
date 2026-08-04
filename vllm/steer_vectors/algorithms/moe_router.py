@@ -14,13 +14,13 @@ import torch
 from vllm.logger import init_logger
 
 from .factory import register_algorithm
-from .template import AlgorithmTemplate
+from .base import BaseSteerVectorAlgorithm
 
 logger = init_logger(__name__)
 
 
 @register_algorithm("moe_router")
-class MoERouterAlgorithm(AlgorithmTemplate):
+class MoERouterAlgorithm(BaseSteerVectorAlgorithm):
     """
     MoE Router Logits intervention algorithm.
 
@@ -89,6 +89,30 @@ class MoERouterAlgorithm(AlgorithmTemplate):
     # controller); activate/deactivate only — soft modes and file-based
     # configs stay piecewise (see graph_request_problem).
     graph_family = "moe_gate"
+
+    @classmethod
+    def graph_lower(cls, payload, scale):
+        """Resolve one layer's toggle lists for the gate kernel tables.
+
+        Mirrors _transform_toggle's routing: the canonical mode decides
+        which direction expert_ids maps to, explicit activate_ids /
+        deactivate_ids are honored in either mode, and deactivation
+        wins overlaps (applied last in-kernel). Range validation is
+        width-aware and lives in the table writer.
+        """
+        expert_ids = payload.get("expert_ids") or []
+        activate = list(payload.get("activate_ids") or [])
+        deactivate = list(payload.get("deactivate_ids") or [])
+        mode = cls.validate_mode(payload.get("mode", "activate"))
+        if mode == "activate":
+            activate += expert_ids
+        else:
+            deactivate += expert_ids
+        return {
+            "activate": activate,
+            "deactivate": deactivate,
+            "epsilon": payload.get("epsilon", 0.01),
+        }
 
     def __init__(self, layer_id: int | None = None, **kwargs):
         # MoE router doesn't use normalize parameter - remove it from kwargs if present

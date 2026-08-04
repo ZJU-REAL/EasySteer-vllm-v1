@@ -20,8 +20,8 @@ from vllm.steer_vectors.payloads import (
     LowRankProjector,
     ReftIntervention,
 )
-from vllm.steer_vectors.layers import DecoderLayerWithSteerVector
-from vllm.steer_vectors.models import (
+from vllm.steer_vectors.controllers import DecoderSteerController
+from vllm.steer_vectors.controller_manager import (
     LoadedSteerVector,
     SteerControllerManager,
     create_steer_controller_manager,
@@ -43,7 +43,7 @@ __all__ = [
     "LowRankProjector",
     "ReftIntervention",
     # Layers
-    "DecoderLayerWithSteerVector",
+    "DecoderSteerController",
     # Models
     "LoadedSteerVector",
     "SteerControllerManager",

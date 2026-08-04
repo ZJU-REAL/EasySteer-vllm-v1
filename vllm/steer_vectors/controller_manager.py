@@ -28,8 +28,8 @@ from vllm.steer_vectors.discovery import (
     find_moe_gate,
     moe_gate_is_fused,
 )
-from vllm.steer_vectors.layers import (
-    DecoderLayerWithSteerVector,
+from vllm.steer_vectors.controllers import (
+    DecoderSteerController,
     MoEGateSteerController,
 )
 
@@ -82,7 +82,7 @@ def _moe_gate_hook_target(module_name: str, module: nn.Module) -> nn.Module | No
 
 _CONTROLLER_REGISTRY: dict[str, _ControllerSpec] = {
     "decoder_layer": _ControllerSpec(
-        controller_class=DecoderLayerWithSteerVector,
+        controller_class=DecoderSteerController,
         structural_finder=find_decoder_layers,
         fallback_class_names=SUPPORTED_DECODER_LAYERS,
         hook_target=_decoder_hook_target,

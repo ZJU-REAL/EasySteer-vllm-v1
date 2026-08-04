@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 import torch
 
-from .base import wire_tensor_rank
+from .base import BaseSteerVectorAlgorithm, wire_tensor_rank
 from .factory import register_algorithm
-from .template import AlgorithmTemplate
 
 
 @register_algorithm("loreft")
-class LoReFTAlgorithm(AlgorithmTemplate):
+class LoReFTAlgorithm(BaseSteerVectorAlgorithm):
     """LoReFT: h' = h + R^T(Wh + b - Rh).
 
     Payload: dict with 'rotate_layer' (R), 'learned_source_weight' (W)

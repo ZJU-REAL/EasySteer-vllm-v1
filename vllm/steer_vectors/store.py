@@ -15,7 +15,7 @@ from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import SteerVectorConfig
-    from vllm.steer_vectors.models import LoadedSteerVector
+    from vllm.steer_vectors.controller_manager import LoadedSteerVector
 
 logger = init_logger(__name__)
 
@@ -97,7 +97,7 @@ class VectorStore:
                 path,
             )
 
-        from vllm.steer_vectors.models import LoadedSteerVector
+        from vllm.steer_vectors.controller_manager import LoadedSteerVector
 
         entry = LoadedSteerVector.from_local_checkpoint(
             steer_vector_model_path=path,
@@ -136,7 +136,7 @@ class VectorStore:
             self._entries.move_to_end(key)
             return entry
 
-        from vllm.steer_vectors.models import LoadedSteerVector
+        from vllm.steer_vectors.controller_manager import LoadedSteerVector
         from vllm.steer_vectors.payloads import materialize
 
         layer_payloads = materialize(

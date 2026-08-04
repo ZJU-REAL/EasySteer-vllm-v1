@@ -36,10 +36,10 @@ def prepare_rows(
       when chunked prompts need exact means.
     """
     from vllm.forward_context import get_forward_context
-    from vllm.steer_vectors.algorithms.triggers import (
+    from vllm.steer_vectors.algorithms.clause import (
         collect_positions_apply_spec,
     )
-    from vllm.steer_vectors.discovery import (
+    from vllm.steer_vectors.geometry import (
         extract_samples_info,
         resolve_batch_positions,
     )

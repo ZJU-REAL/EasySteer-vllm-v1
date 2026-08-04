@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Worker-level manager for steer vectors in vLLM V1."""
+"""Worker-level manager for steer vectors in vLLM V1.
+
+Maps live requests to refcounted config slots; full-graph buffer state
+and admissibility live in graph_support.SteerGraphState."""
 
 from typing import Any
 
@@ -8,10 +11,15 @@ import torch
 
 from vllm.config import SteerVectorConfig
 from vllm.logger import init_logger
-from vllm.steer_vectors.models import (
+from vllm.steer_vectors.controller_manager import (
     LoadedSteerVector,
     SteerControllerManager,
     create_steer_controller_manager,
+)
+from vllm.steer_vectors.graph_support import (
+    SteerGraphState,
+    graph_reject_message,
+    graph_request_problem,
 )
 from vllm.steer_vectors.request import (
     STEER_APPLY_FIELDS,
@@ -21,69 +29,6 @@ from vllm.steer_vectors.request import (
 )
 
 logger = init_logger(__name__)
-
-
-def graph_request_problem(
-    request: SteerVectorRequest, max_rank: int
-) -> str | None:
-    """Why this request cannot run under full-graph steering, or None.
-
-    The single admissibility check behind graph_mode=full — used by the
-    frontend (reject before the engine core), the worker (defense in
-    depth) and the auto graph-mode resolution for engine-default
-    configs. Capability comes from each algorithm's declared
-    graph_family; rank limits from the family schema.
-    """
-    from vllm.steer_vectors.algorithms import (
-        get_algorithm,
-        graph_safe_algorithms,
-    )
-    from vllm.steer_vectors.layers import GRAPH_FAMILIES
-
-    if request.is_multi_vector:
-        return "multi-vector configs"
-    if request.algorithm not in graph_safe_algorithms():
-        return f"algorithm '{request.algorithm}'"
-    if request.algorithm == "moe_router":
-        from vllm.steer_vectors.algorithms.moe_router import MoERouterAlgorithm
-
-        if request.local_path:
-            return (
-                "a file-based moe_router config (only inline "
-                "expert_ids/mode configs run under full graphs)"
-            )
-        mode = MoERouterAlgorithm.validate_mode(request.moe_mode or "activate")
-        if mode not in ("activate", "deactivate"):
-            return f"moe_router mode '{mode}'"
-        return None
-    algo_cls = get_algorithm(request.algorithm)
-    rank_limited = any(
-        "r" in dims
-        for dims in GRAPH_FAMILIES.get(algo_cls.graph_family, {}).values()
-    )
-    if rank_limited:
-        rank = algo_cls.wire_rank(request.inline_payload)
-        if rank is None:
-            return (
-                f"a {request.algorithm} payload whose rank could not be "
-                f"determined"
-            )
-        if rank > max_rank:
-            return f"payload rank {rank} above steer_graph_max_rank {max_rank}"
-    return None
-
-
-def graph_reject_message(problem: str) -> str:
-    """The user-facing rejection for a graph_request_problem result."""
-    from vllm.steer_vectors.algorithms import graph_safe_algorithms
-
-    return (
-        f"steer graph_mode=full (the default under compiled execution) "
-        f"supports single-vector configs of "
-        f"{sorted(graph_safe_algorithms())}; got {problem}. Launch with "
-        f"steer_graph_mode='piecewise' to run this config under CUDA "
-        f"graphs."
-    )
 
 
 def config_fingerprint(request: SteerVectorRequest) -> str:
@@ -157,97 +102,41 @@ class WorkerSteerVectorManager:
         self._req_fingerprints: dict[str, str] = {}
         self._free_slots: list[int] = []
         self._next_slot = 0
-        # Tier-1 full-graph mode state (enable_graph_mode + wrap).
+        # Tier-1 full-graph mode state (see graph_support).
         self._graph_full = steer_vector_config.graph_mode == "full"
-        self._graph_params: tuple | None = None
-        self._graph_controllers: list = []
-        self.row_tok_buf: torch.Tensor | None = None
-        self._slot_rows: dict[int, int] = {}
-        self._slot_graph_algos: dict[int, str] = {}
-        self._slot_graph_modules: dict[int, list] = {}
-        self._free_rows: list[int] = list(
-            range(steer_vector_config.max_steer_vectors, 0, -1)
-        )
+        self.graph_state = SteerGraphState(steer_vector_config, device)
 
     def enable_graph_mode(
         self, hidden_size: int, dtype: torch.dtype, max_num_tokens: int
     ) -> None:
         """Record buffer geometry for full-graph steering (before wrap)."""
-        self._graph_params = (hidden_size, dtype, max_num_tokens)
+        self.graph_state.enable(hidden_size, dtype, max_num_tokens)
 
     def _init_graph_tables(self) -> None:
-        """Allocate Tier-1 buffers on every decoder and gate controller."""
         assert self._controller_manager is not None
-        assert self._graph_params is not None, (
-            "steer graph_mode=full requires enable_graph_mode() before model wrap"
-        )
-        from vllm.steer_vectors.layers import (
-            DecoderLayerWithSteerVector,
-            MoEGateSteerController,
-        )
+        self.graph_state.init_tables(self._controller_manager)
 
-        hidden_size, dtype, max_num_tokens = self._graph_params
-        self.row_tok_buf = torch.zeros(
-            max_num_tokens, dtype=torch.long, device=self.device
-        )
-        capacity = self.steer_vector_config.max_steer_vectors
-        max_rank = self.steer_vector_config.graph_max_rank
-        gates = 0
-        for module in self._controller_manager.modules.values():
-            if isinstance(module, DecoderLayerWithSteerVector):
-                module.init_graph_table(
-                    capacity,
-                    hidden_size,
-                    dtype,
-                    self.device,
-                    max_num_tokens,
-                    self.row_tok_buf,
-                    max_rank,
-                )
-                self._graph_controllers.append(module)
-            elif isinstance(module, MoEGateSteerController):
-                if getattr(module.hook_target, "weight", None) is None:
-                    # Fused/weightless gates cannot be hooked anyway
-                    # (see moe_gate_is_fused); booting must not fail.
-                    logger.warning(
-                        "moe gate %s exposes no weight; full-graph moe "
-                        "steering is unavailable on it.",
-                        module.layer_id,
-                    )
-                    continue
-                module.init_graph_table(
-                    capacity, dtype, self.device, max_num_tokens, self.row_tok_buf
-                )
-                self._graph_controllers.append(module)
-                gates += 1
-        logger.info(
-            "Full-graph steering buffers allocated on %d controllers "
-            "(%d gates; %d rows, hidden %d, rank %d, %d max tokens)",
-            len(self._graph_controllers),
-            gates,
-            capacity,
-            hidden_size,
-            max_rank,
-            max_num_tokens,
-        )
+    @property
+    def token_rows_buf(self):
+        return self.graph_state.token_rows_buf
 
     def zero_graph_masks(self) -> None:
-        for module in self._graph_controllers:
-            module.zero_step_masks()
+        self.graph_state.zero_step_masks()
 
     def graph_row_of(self, slot: int) -> int:
-        return self._slot_rows.get(slot, 0)
+        return self.graph_state.row_of(slot)
 
     def graph_batch_entries(self) -> dict[int, tuple]:
         """slot -> (row, request, controllers) for all live graph configs."""
+        rows = self.graph_state.slot_rows
         return {
             entry[0]: (
-                self._slot_rows[entry[0]],
+                rows[entry[0]],
                 entry[2],
-                self._slot_graph_modules[entry[0]],
+                self.graph_state.slot_modules[entry[0]],
             )
             for entry in self._config_slots.values()
-            if entry[0] in self._slot_rows
+            if entry[0] in rows
         }
 
     def _assert_graph_safe(self, request: SteerVectorRequest) -> None:
@@ -260,69 +149,20 @@ class WorkerSteerVectorManager:
     def _distribute_graph_config(
         self, slot: int, model: LoadedSteerVector, request: SteerVectorRequest
     ) -> None:
-        """Write a config's scaled payload into per-layer vector tables."""
         assert self._controller_manager is not None
-        if not self._free_rows:
-            raise RuntimeError(
-                f"No free steering rows (capacity "
-                f"{self.steer_vector_config.max_steer_vectors})."
-            )
-        row = self._free_rows.pop()
-        target_layers = request.target_layers
-        modules: list = []
-        for layer_idx, payload in (model.layer_payloads or {}).items():
-            if target_layers and layer_idx not in target_layers:
-                continue
-            for module in self._controller_manager._get_modules_for_layer(
-                layer_idx, "decoder_layer"
-            ):
-                module.set_graph_row(
-                    row,
-                    request.algorithm,
-                    payload,
-                    request.scale,
-                    normalize=bool(request.normalize),
-                )
-                modules.append(module)
-        self._slot_rows[slot] = row
-        self._slot_graph_algos[slot] = request.algorithm
-        self._slot_graph_modules[slot] = modules
+        self.graph_state.distribute(
+            slot, request, model.layer_payloads, self._controller_manager
+        )
 
     def _distribute_graph_moe(self, slot: int, request: SteerVectorRequest) -> None:
-        """Write a moe_router config into the gate expert toggle tables."""
+        """MoE payloads are built here (file/params paths), then lowered
+        per layer by MoERouterAlgorithm.graph_lower inside distribute."""
         assert self._controller_manager is not None
-        if not self._free_rows:
-            raise RuntimeError(
-                f"No free steering rows (capacity "
-                f"{self.steer_vector_config.max_steer_vectors})."
-            )
-        from vllm.steer_vectors.algorithms.moe_router import MoERouterAlgorithm
-
-        row = self._free_rows.pop()
         model = self._build_moe_model(request)
-        modules: list = []
-        for layer_idx, payload in (model.layer_payloads or {}).items():
-            payload = dict(payload)
-            payload["mode"] = MoERouterAlgorithm.validate_mode(
-                payload.get("mode", "activate")
-            )
-            for module in self._controller_manager._get_modules_for_layer(
-                layer_idx, "moe_layer"
-            ):
-                module.set_graph_row(row, payload)
-                modules.append(module)
-        self._slot_rows[slot] = row
-        self._slot_graph_algos[slot] = request.algorithm
-        self._slot_graph_modules[slot] = modules
+        self.graph_state.distribute(
+            slot, request, model.layer_payloads, self._controller_manager
+        )
 
-    def _release_graph_config(self, slot: int) -> None:
-        row = self._slot_rows.pop(slot, None)
-        if row is None:
-            return
-        self._slot_graph_algos.pop(slot, None)
-        for module in self._slot_graph_modules.pop(slot, []):
-            module.clear_graph_row(row)
-        self._free_rows.append(row)
 
     # ------------------------------------------------------------------
     # Per-request config routing (Phase C)
@@ -387,8 +227,8 @@ class WorkerSteerVectorManager:
             return
         slot, _, request = entry
         del self._config_slots[fp]
-        if slot in self._slot_rows:
-            self._release_graph_config(slot)
+        if slot in self.graph_state.slot_rows:
+            self.graph_state.release(slot)
         elif self._controller_manager is not None:
             for module in self._controller_manager.modules.values():
                 module.reset_steer_vector(slot)

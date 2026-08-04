@@ -21,7 +21,7 @@ import torch
 from vllm.utils.torch_utils import direct_register_custom_op
 
 if TYPE_CHECKING:
-    from vllm.steer_vectors.layers import DecoderLayerWithSteerVector
+    from vllm.steer_vectors.controllers import DecoderSteerController
 
 # Names used in CompilationConfig.splitting_ops.
 STEER_APPLY_OP = "vllm::steer_apply"
@@ -29,10 +29,10 @@ STEER_MOE_GATE_OP = "vllm::steer_moe_gate"
 
 # layer key (module name) -> controller for the currently loaded model.
 # One model per worker process; re-registration on model reload overwrites.
-_CONTROLLERS: dict[str, "DecoderLayerWithSteerVector"] = {}
+_CONTROLLERS: dict[str, "DecoderSteerController"] = {}
 
 
-def register_controller(key: str, controller: "DecoderLayerWithSteerVector") -> None:
+def register_controller(key: str, controller: "DecoderSteerController") -> None:
     _CONTROLLERS[key] = controller
 
 

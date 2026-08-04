@@ -16,10 +16,8 @@ from .lm_steer import LMSteerAlgorithm
 from .loreft import LoReFTAlgorithm
 from .moe_router import MoERouterAlgorithm
 from .replace import ReplaceAlgorithm
-from .template import AlgorithmTemplate
 
 __all__ = [
-    "AlgorithmTemplate",
     "BaseSteerVectorAlgorithm",
     "ConceptReplaceAlgorithm",
     "DirectAlgorithm",

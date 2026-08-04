@@ -176,8 +176,8 @@ class CaptureSession:
             SUPPORTED_DECODER_LAYERS,
             find_decoder_layers,
             find_layers_with_fallback,
-            split_decoder_output,
         )
+        from vllm.steer_vectors.geometry import split_decoder_output
 
         def extract_rows(output):
             hidden, residual, _, _ = split_decoder_output(output)
@@ -197,11 +197,11 @@ class CaptureSession:
 
     def _attach_gate_hooks(self, model: nn.Module) -> int:
         from vllm.steer_vectors.discovery import (
-            extract_gate_logits,
             find_moe_blocks,
             find_moe_gate,
             moe_gate_is_fused,
         )
+        from vllm.steer_vectors.geometry import extract_gate_logits
 
         def resolve_target(name, block):
             gate = find_moe_gate(block)

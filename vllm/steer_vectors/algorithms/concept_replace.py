@@ -21,13 +21,13 @@ from vllm.logger import init_logger
 
 from .factory import register_algorithm
 from .loading import read_gguf_directions
-from .template import AlgorithmTemplate
+from .base import BaseSteerVectorAlgorithm
 
 logger = init_logger(__name__)
 
 
 @register_algorithm("concept_replace")
-class ConceptReplaceAlgorithm(AlgorithmTemplate):
+class ConceptReplaceAlgorithm(BaseSteerVectorAlgorithm):
     """Concept Replace: h_new = h + λ(h2 - h1) with λ = (h·h1)/||h1||².
 
     Payload: dict with 'h1' and 'h2' tensors per layer, loaded from a

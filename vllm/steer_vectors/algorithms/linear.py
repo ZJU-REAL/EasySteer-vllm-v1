@@ -3,10 +3,10 @@
 import torch
 
 from .factory import register_algorithm
-from .template import AlgorithmTemplate
+from .base import BaseSteerVectorAlgorithm
 
 @register_algorithm("linear")
-class LinearTransformAlgorithm(AlgorithmTemplate):
+class LinearTransformAlgorithm(BaseSteerVectorAlgorithm):
     """Linear transformation: h' = W @ h + b.
 
     Payload: dict with 'weight' and optional 'bias' tensors per layer,

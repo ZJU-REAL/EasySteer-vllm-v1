@@ -226,7 +226,7 @@ class InputProcessor:
         # Reject non-graph-safe configs at the frontend so a bad request
         # errors instead of reaching (and killing) the engine core.
         if self.vllm_config.steer_vector_config.graph_mode == "full":
-            from vllm.steer_vectors.worker_manager import (
+            from vllm.steer_vectors.graph_support import (
                 graph_reject_message,
                 graph_request_problem,
             )

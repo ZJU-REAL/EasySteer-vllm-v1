@@ -6,11 +6,11 @@ import torch
 
 from .factory import register_algorithm
 from .loading import read_gguf_directions, require_extension
-from .template import AlgorithmTemplate
+from .base import BaseSteerVectorAlgorithm
 
 
 @register_algorithm("erase")
-class EraseAlgorithm(AlgorithmTemplate):
+class EraseAlgorithm(BaseSteerVectorAlgorithm):
     """Erase: h' = h - proj_{h1}(h) = h - (h · h1 / ||h1||²) * h1.
 
     Removes the component of the hidden state along direction h1,

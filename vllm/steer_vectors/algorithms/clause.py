@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Where-clause state and position matching for steering algorithms.
 
-`TriggerController` holds one intervention's `apply_spec` (the wire form
+`ApplyClause` holds one intervention's `apply_spec` (the wire form
 of the user-facing ApplySpec: phases, token/position filters, exclusions
 and the generation window); `collect_positions_apply_spec` turns it into
 flat token positions for the current step. Algorithms stay pure
@@ -19,7 +19,7 @@ There are no sentinel values and nothing bypasses exclusions.
 
 import torch
 
-from vllm.steer_vectors.discovery import resolve_batch_positions
+from vllm.steer_vectors.geometry import resolve_batch_positions
 
 _CLAUSE_KEYS = (
     "phases",
@@ -50,7 +50,7 @@ def clause_cache_key(apply_spec: dict | None) -> tuple | None:
     return tuple((key, _canon(apply_spec.get(key))) for key in _CLAUSE_KEYS)
 
 
-def is_global_only_spec(apply_spec: dict) -> bool:
+def selects_all_tokens(apply_spec: dict) -> bool:
     """Whether the clause selects every token of both phases.
 
     Enables the fast path that skips position collection and steers
@@ -68,7 +68,7 @@ def is_global_only_spec(apply_spec: dict) -> bool:
     )
 
 
-class TriggerController:
+class ApplyClause:
     """Holds one intervention's where-clause and debug flag."""
 
     def __init__(self):
@@ -87,20 +87,20 @@ class TriggerController:
         present in the dict are applied, everything else (payloads,
         algorithm parameters) is ignored.
         """
-        from vllm.steer_vectors.request import STEER_TRIGGER_FIELDS
+        from vllm.steer_vectors.request import STEER_CLAUSE_FIELDS
 
-        for name in STEER_TRIGGER_FIELDS + ("debug",):
+        for name in STEER_CLAUSE_FIELDS + ("debug",):
             if name in config:
                 setattr(self, name, config[name])
         self.cache_key = clause_cache_key(self.apply_spec)
 
-    def has_any_triggers(self) -> bool:
+    def has_clause(self) -> bool:
         """Whether a where-clause is configured."""
         return self.apply_spec is not None
 
-    def is_global_only_config(self) -> bool:
+    def selects_all_tokens(self) -> bool:
         """Whether the clause selects every token of both phases."""
-        return self.apply_spec is not None and is_global_only_spec(self.apply_spec)
+        return self.apply_spec is not None and selects_all_tokens(self.apply_spec)
 
 
 def _isin_token_set(tokens: torch.Tensor, ids) -> torch.Tensor:

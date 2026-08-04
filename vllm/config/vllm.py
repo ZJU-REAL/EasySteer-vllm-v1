@@ -1535,7 +1535,7 @@ class VllmConfig:
                     # the resolved mode; a full-mode engine that rejects
                     # its own startup steering would be useless.
                     from vllm.steer_vectors.request import build_server_request
-                    from vllm.steer_vectors.worker_manager import (
+                    from vllm.steer_vectors.graph_support import (
                         graph_request_problem,
                     )
 

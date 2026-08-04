@@ -6,11 +6,11 @@ import torch
 
 from .factory import register_algorithm
 from .loading import read_gguf_directions, require_extension
-from .template import AlgorithmTemplate
+from .base import BaseSteerVectorAlgorithm
 
 
 @register_algorithm("replace")
-class ReplaceAlgorithm(AlgorithmTemplate):
+class ReplaceAlgorithm(BaseSteerVectorAlgorithm):
     """Replace: h' = vector.
 
     Replaces the hidden state with the payload vector. Payload: a

@@ -118,10 +118,10 @@ def resolve_slot_positions(
     token this step. Global-only clauses resolve on the CPU (no device
     sync); others run the trigger collector once on the GPU.
     """
-    from vllm.steer_vectors.algorithms.triggers import (
+    from vllm.steer_vectors.algorithms.clause import (
         clause_cache_key,
         collect_positions_apply_spec,
-        is_global_only_spec,
+        selects_all_tokens,
     )
 
     resolved: dict[tuple, torch.Tensor | None] = {}
@@ -132,7 +132,7 @@ def resolve_slot_positions(
             key = clause_cache_key(clause)
             if key is None or (slot, key) in resolved:
                 continue
-            if is_global_only_spec(clause):
+            if selects_all_tokens(clause):
                 pos_np = np.nonzero(token_slots_np == slot)[0]
                 positions = (
                     torch.from_numpy(pos_np).to(device, non_blocking=True)
@@ -219,10 +219,10 @@ def fill_graph_steer_buffers(
     unsteered and padding tokens untouched. Positions come from the same
     resolver the layer hooks use (resolve_slot_positions).
     """
-    from vllm.steer_vectors.algorithms.triggers import clause_cache_key
+    from vllm.steer_vectors.algorithms.clause import clause_cache_key
 
     manager.zero_graph_masks()
-    row_buf = manager.row_tok_buf
+    row_buf = manager.token_rows_buf
     row_buf.zero_()
     entries = manager.graph_batch_entries()
     if not entries or state is None:
@@ -261,7 +261,7 @@ def fill_graph_steer_buffers(
         # Families whose delta a zero table row cannot neutralize (e.g.
         # replace) carry their own mask; see GRAPH_FAMILY_MASKS.
         from vllm.steer_vectors.algorithms import get_algorithm
-        from vllm.steer_vectors.layers import graph_family_mask_attr
+        from vllm.steer_vectors.graph_kernels import graph_family_mask_attr
 
         mask_attr = graph_family_mask_attr(
             get_algorithm(request.algorithm).graph_family
