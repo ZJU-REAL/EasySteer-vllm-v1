@@ -173,9 +173,11 @@ class WorkerSteerVectorManager:
             problem = "normalize=True"
         if problem is not None:
             raise ValueError(
-                f"steer graph_mode=full supports only graph-safe configs "
-                f"(direct algorithm, no normalize, single vector); got "
-                f"{problem}. Use --steer-graph-mode=piecewise."
+                f"steer graph_mode=full (the default under compiled "
+                f"execution) supports only graph-safe configs (direct "
+                f"algorithm, no normalize, single vector); got {problem}. "
+                f"Launch with steer_graph_mode='piecewise' to run this "
+                f"config under CUDA graphs."
             )
 
     def _distribute_graph_config(

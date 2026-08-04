@@ -607,7 +607,7 @@ class EngineArgs:
     enable_steer_vector: bool = False
     max_steer_vectors: int = 8
     steer_vector_dtype: str = "auto"
-    steer_graph_mode: str = "piecewise"
+    steer_graph_mode: str = "auto"
     steer_require_preload: bool = False
     steering_config: str | None = None
 
@@ -1383,13 +1383,14 @@ class EngineArgs:
         steer_vector_group.add_argument(
             "--steer-graph-mode",
             type=str,
-            choices=["piecewise", "full"],
+            choices=["auto", "piecewise", "full"],
             default=EngineArgs.steer_graph_mode,
             help=(
-                "CUDA-graph mode for steering: 'piecewise' (all algorithms; "
-                "steering runs between graph segments) or 'full' (keeps full "
-                "CUDA graphs via a data-driven in-graph kernel; graph-safe "
-                "configs only)."
+                "CUDA-graph mode for steering: 'full' (keeps full CUDA "
+                "graphs via a data-driven in-graph kernel; graph-safe "
+                "configs only), 'piecewise' (all algorithms; steering runs "
+                "between graph segments), or 'auto' (default: full under "
+                "compiled execution, piecewise under eager)."
             ),
         )
         steer_vector_group.add_argument(

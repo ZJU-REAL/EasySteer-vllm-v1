@@ -51,14 +51,17 @@ class SteerVectorConfig:
     latency-sensitive serving; leave False for dynamic-vector research
     workflows. (Not part of compute_hash: does not affect the graph.)"""
 
-    graph_mode: str = "piecewise"
-    """CUDA-graph execution mode for steering: "piecewise" (default)
-    splits compiled graphs at every steered layer and runs steering
-    eagerly between the segments — all algorithms supported. "full" keeps
-    full CUDA graphs by capturing a data-driven per-layer kernel
+    graph_mode: str = "auto"
+    """CUDA-graph execution mode for steering. "full" keeps full CUDA
+    graphs by capturing a data-driven per-layer kernel
     (hidden += mask * vector_table[token_row]) that reads persistent
     buffers filled host-side each step — only graph-safe configs are
-    admitted (direct algorithm, no normalize, single-vector)."""
+    admitted (direct algorithm, no normalize, single-vector).
+    "piecewise" splits compiled graphs at every steered layer and runs
+    steering eagerly between the segments — all algorithms supported,
+    at roughly half the throughput of full graphs. "auto" (default)
+    resolves to "full" under compiled execution and "piecewise" under
+    eager execution (resolved during VllmConfig post-init)."""
 
     steering_config: str | None = None
     """Engine-default steering: a SteeringSpec as inline JSON or a path

@@ -1507,10 +1507,28 @@ class VllmConfig:
             data_parallel_size=effective_dp_size,
         )
 
-        # Tier-2 piecewise steering: split the compiled graph at every
-        # steered decoder layer so vllm::steer_apply runs eagerly between
-        # CUDA-graph segments. Full cudagraphs are downgraded to piecewise
-        # until the data-driven (Tier-1) in-graph kernel exists.
+        # Steering graph tiers. "full" (Tier-1) captures a data-driven
+        # steering kernel into full CUDA graphs; "piecewise" (Tier-2)
+        # splits the compiled graph at every steered decoder layer so
+        # vllm::steer_apply runs eagerly between CUDA-graph segments.
+        # "auto" picks full under compiled execution (graph-safe configs
+        # only; enforced at admission) and piecewise otherwise.
+        if self.steer_vector_config is not None:
+            graph_mode = self.steer_vector_config.graph_mode
+            if graph_mode not in ("auto", "piecewise", "full"):
+                raise ValueError(
+                    f"steer_graph_mode must be 'auto', 'piecewise' or "
+                    f"'full'; got {graph_mode!r}"
+                )
+            if graph_mode == "auto":
+                compiled = (
+                    self.model_config is not None
+                    and not self.model_config.enforce_eager
+                    and self.compilation_config.mode == CompilationMode.VLLM_COMPILE
+                )
+                self.steer_vector_config.graph_mode = (
+                    "full" if compiled else "piecewise"
+                )
         if (
             self.steer_vector_config is not None
             and self.model_config is not None

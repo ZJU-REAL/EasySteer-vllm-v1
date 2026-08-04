@@ -235,10 +235,11 @@ class InputProcessor:
                 problem = "normalize=True"
             if problem is not None:
                 raise ValueError(
-                    f"steer graph_mode=full supports only graph-safe "
-                    f"configs (direct algorithm, no normalize, single "
-                    f"vector); got {problem}. Use "
-                    f"--steer-graph-mode=piecewise."
+                    f"steer graph_mode=full (the default under compiled "
+                    f"execution) supports only graph-safe configs (direct "
+                    f"algorithm, no normalize, single vector); got "
+                    f"{problem}. Launch with steer_graph_mode='piecewise' "
+                    f"to run this config under CUDA graphs."
                 )
 
     def _get_mm_identifier(
