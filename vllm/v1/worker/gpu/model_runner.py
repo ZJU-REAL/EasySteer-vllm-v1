@@ -820,6 +820,7 @@ class GPUModelRunner(
             assert new_req_data.prompt_token_ids is not None
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
+            known_req = req_id in self.req_states.req_id_to_index
 
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
@@ -854,6 +855,13 @@ class GPUModelRunner(
                 self._capture_session().add_request(
                     req_id, new_req_data.capture_select
                 )
+            if not known_req and new_req_data.num_computed_tokens > 0:
+                capture_session = getattr(self, "capture_session", None)
+                if capture_session is not None and capture_session.any_enabled():
+                    # Prefix-cache hit (or remote KV): the skipped prompt
+                    # head is never recomputed locally, so its rows cannot
+                    # be captured for this request.
+                    capture_session.mark_cache_elided(req_id)
 
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
                 assert self.sampler is not None
@@ -1224,6 +1232,14 @@ class GPUModelRunner(
             # when encoder inputs are scheduled, because this step updates
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
+        if not dummy_run and not skip_compiled:
+            capture_session = getattr(self, "capture_session", None)
+            if capture_session is not None and capture_session.any_enabled():
+                # Capture-active batches run the raw eager forward: the
+                # capture hooks are traced out of compiled artifacts, so
+                # compiled or graph-replayed execution would silently
+                # skip them. Idle batches keep the normal dispatch.
+                skip_compiled = True
 
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,

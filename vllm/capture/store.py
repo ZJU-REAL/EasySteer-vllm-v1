@@ -69,6 +69,24 @@ class StreamConfig:
         """Whether a source-side row selection (not a reduction) is set."""
         return self.select is not None
 
+    @property
+    def wants_prompt_rows(self) -> bool:
+        """Whether this stream can select prompt rows other than the
+        final prompt token.
+
+        Determines exposure to prefix-cache elision: a cache hit skips
+        recomputation of the prompt head but always leaves at least the
+        final prompt token to local compute, so the 'last' reduction and
+        generation-only selections are unaffected.
+        """
+        if self.reduce == "last":
+            return False
+        if self.select is not None:
+            phases = self.select.get("phases")
+            if phases and "prompt" not in phases:
+                return False
+        return True
+
 
 class StreamStore:
     """Bounded, chunk-appending CPU store for one capture stream.
@@ -89,6 +107,10 @@ class StreamStore:
         self.req_table: list[str] = []
         self._req_index: dict[str, int] = {}
         self.meta_complete = True
+        # Requests whose prompt head was skipped by a prefix-cache hit
+        # while this stream was enabled: their early rows were never
+        # computed, so the store is incomplete for them (fetch raises).
+        self.elided_reqs: set[str] = set()
         # Rows stored per layer; the budget caps each layer at
         # budget_rows rows (i.e. sequence tokens, per layer).
         self._layer_rows: dict[int, int] = {}
@@ -105,6 +127,17 @@ class StreamStore:
 
     def wants_layer(self, layer_id: int) -> bool:
         return self.config.layers is None or layer_id in self.config.layers
+
+    def mark_elided(self, req_id: str) -> None:
+        """Flag a request admitted with a prefix-cache hit as incomplete.
+
+        A request already present in the req_table captured rows before
+        (e.g. rescheduled after preemption onto its own earlier blocks);
+        nothing is missing for it, so it is not flagged.
+        """
+        with self.lock:
+            if req_id not in self._req_index:
+                self.elided_reqs.add(req_id)
 
     def req_index(self, req_id: str) -> int:
         """Stable index of a request id in this store's req_table."""
@@ -237,6 +270,25 @@ class StreamStore:
         from vllm.capture.serde import match_capture_request_id
 
         with self.lock:
+            elided = self.elided_reqs
+            if req_ids is not None and elided:
+                elided = {
+                    rid
+                    for rid in elided
+                    if any(
+                        match_capture_request_id(rid, ext) for ext in req_ids
+                    )
+                }
+            if elided:
+                raise RuntimeError(
+                    "prefix-cache hits skipped recomputation of the prompt "
+                    f"head for request(s) {sorted(elided)[:5]}; their early "
+                    "rows were never computed, so this capture is "
+                    "incomplete. Submit capture requests with a unique "
+                    "cache_salt (easysteer's capture() does this "
+                    "automatically), fetch with req_ids excluding them, or "
+                    "clear the stream."
+                )
             if not self.meta_complete:
                 if req_ids is not None:
                     raise RuntimeError(

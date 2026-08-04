@@ -13,7 +13,15 @@ One CaptureSession per worker owns named capture *streams*:
   active, the captured logits are the post-steering ones.
 
 Hooks never mutate the model tree (no wrappers, no module renames) and
-are inert until a stream is enabled. Each stream is configured at enable
+are inert until a stream is enabled. They work on any engine: hook
+bodies trace to nothing under torch.compile (compiled artifacts and
+CUDA graphs carry no capture code), and while a stream is enabled the
+runner dispatches batches to the raw eager forward (skip_compiled),
+where the hooks run natively; idle batches keep full performance.
+Prefix caching needs no engine-level restriction either — capture
+requests carry a unique cache_salt (full recompute, no cache hits), and
+unsalted requests that do hit the cache are flagged at admission and
+fail explicitly at fetch. Each stream is configured at enable
 time with a layer subset, storage dtype, a row-selection clause
 (`select`, the shared SelectSpec where-clause language also used by
 steering), a per-sample reduction (`reduce`: "all" | "last" | "mean")
@@ -102,6 +110,21 @@ class CaptureSession:
     def remove_request(self, req_id: str) -> None:
         self._request_selects.pop(req_id, None)
 
+    def mark_cache_elided(self, req_id: str) -> None:
+        """Record that a request's prompt head was skipped by a cache hit.
+
+        Called by the runner when a new request is admitted with
+        num_computed_tokens > 0 while capture is enabled: those tokens
+        are never recomputed, so their rows cannot be captured. Streams
+        whose selection cannot touch the elided prompt rows (generation
+        phase only, or the 'last' reduction — a cache hit always leaves
+        at least the final prompt token to local compute) are
+        unaffected; the rest fail explicitly at fetch.
+        """
+        for store in self._streams.values():
+            if store is not None and store.config.wants_prompt_rows:
+                store.mark_elided(req_id)
+
     # ------------------------------------------------------------------
     # Hook attachment (once, at model load; inert until a stream enables)
     # ------------------------------------------------------------------
@@ -153,6 +176,13 @@ class CaptureSession:
             fallback_id = layer_id + 1
 
             def hook(mod, args, output, _lid=layer_id, _name=name):
+                if torch.compiler.is_compiling():
+                    # Dynamo trace at engine build: the hook body folds
+                    # to nothing, so compiled artifacts and CUDA graphs
+                    # carry no capture code. Capture-active batches are
+                    # dispatched to the raw eager forward instead
+                    # (skip_compiled), where this hook runs natively.
+                    return
                 store = self._streams[stream]
                 if store is None or not store.wants_layer(_lid):
                     return
@@ -251,9 +281,8 @@ class CaptureSession:
             raise ValueError(f"Unknown capture stream: {stream}")
         if not self._attached:
             raise RuntimeError(
-                "Capture hooks are not attached. Capture requires "
-                "enforce_eager=True (hooks cannot run inside compiled "
-                "graphs)."
+                "Capture hooks are not attached to this model; "
+                "attachment happens once at model load."
             )
         if stream == ROUTER_LOGITS and self._gate_layers == 0:
             logger.warning(
@@ -309,4 +338,5 @@ class CaptureSession:
             "reduce": store.config.reduce,
             "select": store.config.select,
             "meta_complete": store.meta_complete,
+            "cache_elided_reqs": len(store.elided_reqs),
         }

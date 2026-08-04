@@ -3,9 +3,11 @@
 router logits) over collective_rpc.
 
 The capture mechanism lives in vllm.capture.session.CaptureSession;
-this mixin owns one session per worker, attaches its hooks at model load
-(eager engines only — hooks cannot run inside compiled graphs), and
-exposes stream lifecycle RPCs.
+this mixin owns one session per worker, attaches its hooks at model
+load, and exposes stream lifecycle RPCs. Capture works on any engine:
+while a stream is enabled the runner dispatches batches to the raw
+eager forward (skip_compiled), where the hooks run natively; compiled
+artifacts and CUDA graphs carry no capture code.
 """
 
 from typing import Any
@@ -29,20 +31,13 @@ class CaptureModelRunnerMixin:
     def _check_capture_compatible(self) -> None:
         """Reject capture on engines where it would be silently incomplete.
 
-        With prefix caching, cache-hit tokens are never recomputed, so
-        their hidden states / router logits cannot be captured (verified:
-        a warm-cache request captures only the uncached suffix).
+        Prefix caching needs no engine-level restriction: cache-hit
+        tokens are never recomputed, so capture requests carry a unique
+        cache_salt (full recompute, no hits), and unsalted requests that
+        do hit the cache while capture is enabled are flagged at
+        admission and fail explicitly at fetch.
         """
         vllm_config = self.vllm_config
-        if (
-            vllm_config.cache_config is not None
-            and vllm_config.cache_config.enable_prefix_caching
-        ):
-            raise RuntimeError(
-                "Capture requires enable_prefix_caching=False: prefix-cache "
-                "hits skip recomputation, so the cached tokens' states "
-                "would be silently missing from the capture."
-            )
         if not vllm_config.use_v2_model_runner:
             raise RuntimeError(
                 "Capture requires the V2 model runner (the V1 runner "
@@ -56,21 +51,16 @@ class CaptureModelRunnerMixin:
     def _attach_capture_hooks(self, model: nn.Module) -> nn.Module:
         """Attach capture hooks (once, at load). Model tree is untouched.
 
+        Attached on every engine: on compiled engines the hook bodies
+        trace to nothing (torch.compiler.is_compiling guard), so
+        compiled artifacts and CUDA graphs carry no capture code;
+        capture-active batches are dispatched to the raw eager forward
+        (skip_compiled), where the hooks run natively.
+
         Must run after the steering hooks are registered so gate-hook
         ordering makes captured router logits post-steering.
         """
-        session = self._capture_session()
-        enforce_eager = (
-            self.vllm_config.model_config is not None
-            and self.vllm_config.model_config.enforce_eager
-        )
-        if not enforce_eager:
-            logger.info(
-                "Capture hooks not attached (compiled execution); "
-                "launch with enforce_eager=True to use capture APIs."
-            )
-            return model
-        session.attach(model)
+        self._capture_session().attach(model)
         return model
 
     # ------------------------------------------------------------------
