@@ -464,6 +464,14 @@ class VllmConfig:
             vllm_factors.append(self.lora_config.compute_hash())
         else:
             vllm_factors.append("None")
+        if self.steer_vector_config:
+            # The in-graph steering tables are baked into compiled
+            # artifacts with their boot-time shapes (capacity, rank),
+            # so artifacts must not be shared across steering configs:
+            # a capacity-8 kernel gathers out of bounds at capacity 32.
+            vllm_factors.append(self.steer_vector_config.compute_hash())
+        else:
+            vllm_factors.append("None")
         if self.speculative_config:
             vllm_factors.append(self.speculative_config.compute_hash())
         else:
