@@ -96,7 +96,7 @@ Experts can override with `steer_graph_mode="in_graph"` or `"split"`. The declar
 | `enable_steer_vector` | `False` | Enable the steering subsystem |
 | `steer_algorithms` | — | **Required.** Declared workload: algorithm names or `"all"` |
 | `steer_multi_vector` | `False` | Declare multi-vector requests |
-| `max_steer_vectors` | `8` | Concurrent distinct configurations (slot capacity). A scheduling constraint like `max_loras`: additional differently-configured requests wait in the queue until a slot frees; identically-configured requests share a slot. An engine-default `steering_config` occupies one slot. |
+| `max_steer_vectors` | `min(256, max_num_seqs)` | Concurrent distinct configurations (slot capacity). A scheduling constraint like `max_loras`: additional differently-configured requests wait in the queue until a slot frees; identically-configured requests share a slot. An engine-default `steering_config` occupies one slot. The default never throttles below realistic concurrency; lower it to bound per-step config variety, raise it only past 256 concurrent distinct configs. |
 | `steer_graph_mode` | `"auto"` | Graph tier: `auto` / `in_graph` / `split` (expert) |
 | `steer_graph_max_rank` | `32` | Rank capacity of in-graph low-rank buffers |
 | `steer_vector_dtype` | `"auto"` | Vector dtype (defaults to model dtype) |

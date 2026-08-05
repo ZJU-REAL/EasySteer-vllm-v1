@@ -34,11 +34,15 @@ class SteerVectorConfig:
     control vectors to hidden states at specific layers.
     """
 
-    max_steer_vectors: int = Field(default=8, ge=1)
-    """Maximum number of steer vectors in a single batch."""
+    max_steer_vectors: int | None = Field(default=None, ge=1)
+    """Slot capacity: the maximum number of distinct steering
+    configurations live in the running batch at once. A scheduling
+    constraint like max_loras — differently-configured requests beyond
+    the capacity wait for a slot; identical configurations share one.
+    If None, resolves to min(256, max_num_seqs) at engine build."""
 
     max_cpu_steer_vectors: int | None = None
-    """Maximum number of steer vectors to store in CPU memory. 
+    """Maximum number of steer vectors to store in CPU memory.
     Must be >= max_steer_vectors. If None, defaults to max_steer_vectors."""
 
     steer_vector_dtype: SteerVectorDType = "auto"
@@ -149,9 +153,14 @@ class SteerVectorConfig:
 
     @model_validator(mode="after")
     def _validate_config(self) -> Self:
-        if self.max_cpu_steer_vectors is None:
-            self.max_cpu_steer_vectors = self.max_steer_vectors
-        if self.max_cpu_steer_vectors < self.max_steer_vectors:
+        # max_steer_vectors may still be None here (resolved from
+        # max_num_seqs at engine build); the cpu-capacity defaulting and
+        # cross-check happen there too.
+        if (
+            self.max_steer_vectors is not None
+            and self.max_cpu_steer_vectors is not None
+            and self.max_cpu_steer_vectors < self.max_steer_vectors
+        ):
             raise ValueError(
                 f"max_cpu_steer_vectors ({self.max_cpu_steer_vectors}) "
                 f"must be >= max_steer_vectors ({self.max_steer_vectors})"

@@ -607,7 +607,7 @@ class EngineArgs:
     enable_steer_vector: bool = False
     steer_algorithms: list[str] | str | None = None
     steer_multi_vector: bool = False
-    max_steer_vectors: int = 8
+    max_steer_vectors: int | None = None
     steer_vector_dtype: str = "auto"
     steer_graph_mode: str = "auto"
     steer_graph_max_rank: int = 32
@@ -1381,7 +1381,12 @@ class EngineArgs:
             "--max-steer-vectors",
             type=int,
             default=EngineArgs.max_steer_vectors,
-            help="Maximum number of steer vectors in a single batch.",
+            help=(
+                "Slot capacity: maximum distinct steering "
+                "configurations live at once (a scheduling constraint "
+                "like max_loras; identical configurations share a "
+                "slot). Default: min(256, max_num_seqs)."
+            ),
         )
         steer_vector_group.add_argument(
             "--steer-algorithms",

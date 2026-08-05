@@ -1523,6 +1523,22 @@ class VllmConfig:
         # declared workload (value validation lives on the config).
         if self.steer_vector_config is not None:
             cfg = self.steer_vector_config
+            # Slot capacity default: enough for realistic concurrent
+            # config variety without throttling (the constraint defers
+            # differently-configured requests past the capacity), never
+            # beyond what the scheduler can co-run anyway.
+            if cfg.max_steer_vectors is None:
+                cfg.max_steer_vectors = min(
+                    256, self.scheduler_config.max_num_seqs
+                )
+            if cfg.max_cpu_steer_vectors is None:
+                cfg.max_cpu_steer_vectors = cfg.max_steer_vectors
+            elif cfg.max_cpu_steer_vectors < cfg.max_steer_vectors:
+                raise ValueError(
+                    f"max_cpu_steer_vectors ({cfg.max_cpu_steer_vectors}) "
+                    f"must be >= max_steer_vectors "
+                    f"({cfg.max_steer_vectors})"
+                )
             compiled = (
                 self.model_config is not None
                 and not self.model_config.enforce_eager
