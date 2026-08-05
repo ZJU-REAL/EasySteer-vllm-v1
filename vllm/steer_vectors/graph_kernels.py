@@ -49,10 +49,13 @@ def apply_decoder_families(
 
     Applies every family's delta to the selected rows of
     `hidden_states` (delta form over the complete state x = hidden +
-    residual; the residual stream is never touched). Low-rank and
-    projection coefficients are computed for all slots at once (slot
-    count is small) and then selected per token — this avoids
-    materializing per-token [n, hidden, rank] weight gathers.
+    residual; the residual stream is never touched). The low-rank
+    family picks its formulation from the slot capacity (a static
+    buffer dimension, so the choice compiles in): dense all-slot
+    coefficients selected per token while capacity is small, per-token
+    weight gathers beyond that — the dense path's [slots, tokens,
+    hidden] product grows linearly with capacity and OOMs Inductor
+    autotuning at a few hundred slots.
     """
     n = hidden_states.shape[0]
     rt = token_rows[:n]
@@ -69,10 +72,16 @@ def apply_decoder_families(
     delta = delta + coef * proj["C"][rt]
     # Low-rank family: delta += (x @ A[row] + b[row]) @ Rout[row]^T
     lowrank = tables["lowrank"]
-    low = torch.einsum("nh,shr->snr", x, lowrank["A"])
-    low = low + lowrank["b"].unsqueeze(1)
-    out = torch.einsum("snr,shr->snh", low, lowrank["Rout"])
-    delta = delta + out[rt, torch.arange(n, device=rt.device)]
+    num_rows, _, rank = lowrank["A"].shape
+    if num_rows <= 2 * rank:
+        low = torch.einsum("nh,shr->snr", x, lowrank["A"])
+        low = low + lowrank["b"].unsqueeze(1)
+        out = torch.einsum("snr,shr->snh", low, lowrank["Rout"])
+        delta = delta + out[rt, torch.arange(n, device=rt.device)]
+    else:
+        a_t = lowrank["A"][rt]
+        low = torch.einsum("nh,nhr->nr", x, a_t) + lowrank["b"][rt]
+        delta = delta + torch.einsum("nr,nhr->nh", low, lowrank["Rout"][rt])
 
     repl = replace_mask[:n].unsqueeze(1)
     total = mask * delta + repl * (tables["replace"]["V"][rt] - x)
