@@ -5,9 +5,12 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
+
+if TYPE_CHECKING:
+    import numpy as np
 
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
@@ -153,6 +156,21 @@ class BatchGeometry:
     """Engine-internal request id per sample (capture row labels)."""
     token_ids: torch.Tensor
     """(total_tokens,) flat input token ids of the unpadded batch."""
+    query_start_loc_cpu: "np.ndarray | None" = None
+    """(num_samples + 1,) host copy of query_start_loc, for host-side
+    trigger resolution (see resolve_slot_positions)."""
+
+    def token_ids_cpu(self) -> "np.ndarray":
+        """Host copy of `token_ids`, fetched once per step on first use.
+
+        Only token-id filters need the ids host-side; the copy (a device
+        sync) is paid once per step, never per clause.
+        """
+        cached = getattr(self, "_token_ids_cpu", None)
+        if cached is None:
+            cached = self.token_ids.cpu().numpy()
+            self._token_ids_cpu = cached
+        return cached
 
     def samples_info(self) -> dict[str, torch.Tensor]:
         """The trigger collector's samples_info view of this geometry.
