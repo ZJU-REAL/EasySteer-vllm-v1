@@ -88,6 +88,15 @@ class Request:
         self.pooling_params = pooling_params
         self.lora_request = lora_request
         self.steer_vector_request = steer_vector_request
+        # Scheduler-side slot identity: requests with equal fingerprints
+        # share one steering slot (the same keying the worker uses), so
+        # the max_steer_vectors constraint counts fingerprints. Computed
+        # once here — it stats vector files.
+        self.steer_fingerprint: str | None = None
+        if steer_vector_request is not None:
+            from vllm.steer_vectors.worker_manager import config_fingerprint
+
+            self.steer_fingerprint = config_fingerprint(steer_vector_request)
         self.capture_select = capture_select
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
             sampling_params

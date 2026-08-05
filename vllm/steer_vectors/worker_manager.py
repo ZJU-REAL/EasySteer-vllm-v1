@@ -188,6 +188,19 @@ class WorkerSteerVectorManager:
             self._req_fingerprints[req_id] = fp
             return entry[0]
 
+        capacity = self.steer_vector_config.max_steer_vectors
+        if len(self._config_slots) >= capacity:
+            # The scheduler defers requests when all slots are taken
+            # (concurrent distinct configurations are a scheduling
+            # constraint, like max_loras); reaching here means that
+            # accounting drifted from the worker's slot keying.
+            raise RuntimeError(
+                f"steering slot capacity exceeded: {len(self._config_slots)} "
+                f"distinct configurations live, max_steer_vectors="
+                f"{capacity}. The scheduler should have deferred this "
+                f"request; please report this as a bug."
+            )
+
         slot = self._free_slots.pop() if self._free_slots else self._next_slot
         if slot == self._next_slot:
             self._next_slot += 1

@@ -84,6 +84,13 @@ class Scheduler(SchedulerInterface):
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.steer_vector_config = vllm_config.steer_vector_config
+        # Steering slots available to per-request configs: the
+        # engine-default config, if any, permanently occupies one.
+        self.num_steer_slots = 0
+        if self.steer_vector_config:
+            self.num_steer_slots = self.steer_vector_config.max_steer_vectors - (
+                1 if self.steer_vector_config.has_server_config else 0
+            )
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
@@ -663,18 +670,26 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Record the steer vector files used by scheduled_running_reqs.
-        # Capacity is bounded by resident vectors (files), not configs:
-        # any number of configs (scales/triggers) share one loaded vector.
+        # Record the distinct steering configurations of ALL running
+        # requests — not just those scheduled this step. Capacity is
+        # bounded by config slots (fingerprints — the same keying the
+        # worker allocates by): identically-configured requests share a
+        # slot, differently-configured ones each need their own even
+        # when they read the same vector file. Counting over
+        # self.running matters under async scheduling: a request
+        # scheduled through its final token stops being scheduled a
+        # step before its finish is confirmed, but it holds its worker
+        # slot until the finish lands (the runner releases slots before
+        # acquiring new ones within a step, so admitting a replacement
+        # in the same output as the finish is safe — earlier is not).
         scheduled_steer_vectors: set = set()
         if self.steer_vector_config:
             scheduled_steer_vectors = set(
-                req.steer_vector_request.local_path
-                or req.steer_vector_request.steer_vector_int_id
-                for req in scheduled_running_reqs
+                req.steer_fingerprint
+                for req in self.running
                 if req.steer_vector_request
             )
-            assert len(scheduled_steer_vectors) <= self.steer_vector_config.max_steer_vectors
+            assert len(scheduled_steer_vectors) <= self.num_steer_slots
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
@@ -721,19 +736,21 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.prepend_request(request)
                     continue
 
-                # Check that adding the request still respects the max_steer_vectors
-                # constraint.
+                # Check that adding the request still respects the
+                # max_steer_vectors constraint (concurrent distinct
+                # configurations; identical configs share a slot).
                 if (
                     self.steer_vector_config
                     and request.steer_vector_request
                     and (
-                        len(scheduled_steer_vectors) == self.steer_vector_config.max_steer_vectors
-                        and (request.steer_vector_request.local_path
-                             or request.steer_vector_request.steer_vector_int_id)
+                        len(scheduled_steer_vectors) >= self.num_steer_slots
+                        and request.steer_fingerprint
                         not in scheduled_steer_vectors
                     )
                 ):
-                    # Scheduling would exceed max_steer_vectors, skip.
+                    # Scheduling would exceed steering slot capacity:
+                    # the request waits until a running config releases
+                    # its slot.
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -1054,9 +1071,7 @@ class Scheduler(SchedulerInterface):
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
                 if self.steer_vector_config and request.steer_vector_request:
-                    scheduled_steer_vectors.add(
-                        request.steer_vector_request.local_path
-                        or request.steer_vector_request.steer_vector_int_id)
+                    scheduled_steer_vectors.add(request.steer_fingerprint)
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
                     request_id
                 )
