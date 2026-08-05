@@ -47,16 +47,23 @@ def apply_decoder_families(
 ) -> torch.Tensor:
     """The captured decoder-layer steering kernel.
 
-    Applies every family's delta to the selected rows of
+    Applies each family's delta to the selected rows of
     `hidden_states` (delta form over the complete state x = hidden +
-    residual; the residual stream is never touched). The low-rank
-    family picks its formulation from the slot capacity (a static
-    buffer dimension, so the choice compiles in): dense all-slot
-    coefficients selected per token while capacity is small, per-token
-    weight gathers beyond that — the dense path's [slots, tokens,
-    hidden] product grows linearly with capacity and OOMs Inductor
-    autotuning at a few hundred slots.
+    residual; the residual stream is never touched). `tables` holds
+    only the families compiled into this engine — the declared
+    workload's families (see declared_graph_families) — so families no
+    declared algorithm can use contribute no compute at all; within
+    one family, idle rows still cost only zero-row reads.
+
+    The low-rank family picks its formulation from the slot capacity
+    (a static buffer dimension, so the choice compiles in): dense
+    all-slot coefficients selected per token while capacity is small,
+    per-token weight gathers beyond that — the dense path's [slots,
+    tokens, hidden] product grows linearly with capacity and OOMs
+    Inductor autotuning at a few hundred slots.
     """
+    if not tables:
+        return hidden_states
     n = hidden_states.shape[0]
     rt = token_rows[:n]
     mask = graph_mask[:n].unsqueeze(1)
@@ -65,26 +72,38 @@ def apply_decoder_families(
     else:
         x = hidden_states
 
-    delta = tables["additive"]["V"][rt]
-    # Projection family: delta += (x . B[row]) * C[row]
-    proj = tables["projection"]
-    coef = (x @ proj["B"].T).gather(1, rt.unsqueeze(1))
-    delta = delta + coef * proj["C"][rt]
-    # Low-rank family: delta += (x @ A[row] + b[row]) @ Rout[row]^T
-    lowrank = tables["lowrank"]
-    num_rows, _, rank = lowrank["A"].shape
-    if num_rows <= 2 * rank:
-        low = torch.einsum("nh,shr->snr", x, lowrank["A"])
-        low = low + lowrank["b"].unsqueeze(1)
-        out = torch.einsum("snr,shr->snh", low, lowrank["Rout"])
-        delta = delta + out[rt, torch.arange(n, device=rt.device)]
-    else:
-        a_t = lowrank["A"][rt]
-        low = torch.einsum("nh,nhr->nr", x, a_t) + lowrank["b"][rt]
-        delta = delta + torch.einsum("nr,nhr->nh", low, lowrank["Rout"][rt])
+    delta = None
+    if "additive" in tables:
+        delta = tables["additive"]["V"][rt]
+    if "projection" in tables:
+        # delta += (x . B[row]) * C[row]
+        proj = tables["projection"]
+        coef = (x @ proj["B"].T).gather(1, rt.unsqueeze(1))
+        term = coef * proj["C"][rt]
+        delta = term if delta is None else delta + term
+    if "lowrank" in tables:
+        # delta += (x @ A[row] + b[row]) @ Rout[row]^T
+        lowrank = tables["lowrank"]
+        num_rows, _, rank = lowrank["A"].shape
+        if num_rows <= 2 * rank:
+            low = torch.einsum("nh,shr->snr", x, lowrank["A"])
+            low = low + lowrank["b"].unsqueeze(1)
+            out = torch.einsum("snr,shr->snh", low, lowrank["Rout"])
+            term = out[rt, torch.arange(n, device=rt.device)]
+        else:
+            a_t = lowrank["A"][rt]
+            low = torch.einsum("nh,nhr->nr", x, a_t) + lowrank["b"][rt]
+            term = torch.einsum("nr,nhr->nh", low, lowrank["Rout"][rt])
+        delta = term if delta is None else delta + term
 
-    repl = replace_mask[:n].unsqueeze(1)
-    total = mask * delta + repl * (tables["replace"]["V"][rt] - x)
+    total = None if delta is None else mask * delta
+    nf_mask = None if delta is None else mask
+    if "replace" in tables:
+        repl = replace_mask[:n].unsqueeze(1)
+        term = repl * (tables["replace"]["V"][rt] - x)
+        total = term if total is None else total + term
+        nf_mask = repl if nf_mask is None else nf_mask + repl
+
     # normalize: rescale flagged steered rows to the original
     # complete-state norm (float32, mirroring _renormalize). Gated by
     # the token masks too — an eps-renorm on an unsteered row would
@@ -93,7 +112,7 @@ def apply_decoder_families(
     norm_x = torch.linalg.vector_norm(x.float(), dim=-1, keepdim=True)
     norm_y = torch.linalg.vector_norm(y.float(), dim=-1, keepdim=True)
     renormed = (y.float() * norm_x / (norm_y + 1e-8)).to(y.dtype)
-    nf = normalize_flag[rt].unsqueeze(1) * (mask + repl)
+    nf = normalize_flag[rt].unsqueeze(1) * nf_mask
     return hidden_states + total + nf * (renormed - y)
 
 

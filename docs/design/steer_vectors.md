@@ -29,7 +29,7 @@ The steering kernel is captured *inside* vLLM's CUDA graphs. It is pure tensor m
 
 Before each step the host fills a per-token `token_rows` index buffer and the step masks; the captured kernel applies every family's delta to every token through its row. **Row 0 of every table is zero**, so unsteered and padding tokens receive an exact-zero delta — an unsteered request co-batched with steered ones is bit-identical to a vanilla engine's output. Buffer addresses are baked into the captured graphs, so tables are allocated before model wrap and sized at boot (`max_steer_vectors` slots, `steer_graph_max_rank` rank capacity).
 
-The closed schema is the point: idle families cost almost nothing, and admission can decide *exactly* what fits. A general `h' = W·h + b` (the `linear` algorithm) would need an `(h × h)` table per slot and a per-token batched matmul even when idle — that is not "one more family", it breaks the tier's premise, which is why `linear` is split-only. Bounded matrix interventions belong in `lowrank` (that is exactly what LoReFT is).
+The closed schema is the point: the kernel is compiled with exactly the families the declared workload can use (`steer_algorithms=["direct"]` compiles only `additive`; an undeclared family can never receive a payload, so it contributes no compute or table memory), and admission can decide *exactly* what fits. Within a compiled family, idle rows cost only zero-row reads. A general `h' = W·h + b` (the `linear` algorithm) would need an `(h × h)` table per slot and a per-token batched matmul even when idle — that is not "one more family", it breaks the tier's premise, which is why `linear` is split-only. Bounded matrix interventions belong in `lowrank` (that is exactly what LoReFT is).
 
 ### `split` (Tier 2)
 

@@ -65,6 +65,32 @@ def graph_request_problem(
     return None
 
 
+def declared_graph_families(
+    algorithms: list[str] | str | None,
+) -> frozenset[str]:
+    """Decoder kernel families the declared workload can ever use.
+
+    Takes the normalized `SteerVectorConfig.algorithms` value. The
+    in-graph kernel is compiled with exactly these families: admission
+    rejects undeclared algorithms on every engine, so a family no
+    declared algorithm maps to can never receive a payload — compiling
+    it in would only cost every unsteered token. A missing or 'all'
+    declaration (defensive; auto never resolves those to in_graph)
+    keeps every family.
+    """
+    from vllm.steer_vectors.algorithms import get_algorithm
+    from vllm.steer_vectors.graph_kernels import GRAPH_FAMILIES
+
+    if algorithms is None or algorithms == "all":
+        return frozenset(GRAPH_FAMILIES)
+    families = set()
+    for name in algorithms:
+        family = get_algorithm(name).graph_family
+        if family in GRAPH_FAMILIES:  # decoder families only (not moe_gate)
+            families.add(family)
+    return frozenset(families)
+
+
 def graph_reject_message(problem: str) -> str:
     """The user-facing rejection for a graph_request_problem result."""
     from vllm.steer_vectors.algorithms import graph_safe_algorithms
@@ -116,6 +142,9 @@ class SteerGraphState:
         )
         capacity = self.config.max_steer_vectors
         max_rank = self.config.graph_max_rank
+        algos = self.config.algorithms
+        families = declared_graph_families(algos)
+        moe_active = algos is None or algos == "all" or "moe_router" in algos
         gates = 0
         for module in controller_manager.modules.values():
             if isinstance(module, DecoderSteerController):
@@ -127,9 +156,16 @@ class SteerGraphState:
                     max_num_tokens,
                     self.token_rows_buf,
                     max_rank,
+                    families,
                 )
                 self.controllers.append(module)
             elif isinstance(module, MoEGateSteerController):
+                if not moe_active:
+                    # moe_router is undeclared, so no gate config can
+                    # ever be admitted: leave the hook a no-op instead
+                    # of compiling the gate kernel into every step.
+                    module.graph_noop = True
+                    continue
                 if getattr(module.hook_target, "weight", None) is None:
                     # Fused/weightless gates cannot be hooked anyway
                     # (see moe_gate_is_fused); booting must not fail.
@@ -147,9 +183,11 @@ class SteerGraphState:
                 gates += 1
         logger.info(
             "Full-graph steering buffers allocated on %d controllers "
-            "(%d gates; %d rows, hidden %d, rank %d, %d max tokens)",
+            "(%d gates; families %s; %d rows, hidden %d, rank %d, "
+            "%d max tokens)",
             len(self.controllers),
             gates,
+            sorted(families),
             capacity,
             hidden_size,
             max_rank,

@@ -218,13 +218,17 @@ class DecoderSteerController(SlotRoutedSteerController):
         max_num_tokens: int,
         row_tok: torch.Tensor,
         max_rank: int,
+        families: frozenset[str] | None = None,
     ) -> None:
         """Allocate Tier-1 persistent buffers (full-graph steering mode).
 
         Must run before compilation/graph capture so the captured kernel
-        sees the final buffer addresses. Row 0 of every table stays zero
-        (the no-steer row): unused families contribute an exact zero
-        delta, so they cost only cached zero-row reads when idle.
+        sees the final buffer addresses. Only `families` (the declared
+        workload's kernel families; None = all) are allocated and
+        compiled into the kernel — a family outside the declaration can
+        never receive a payload, so it contributes no compute. Row 0 of
+        every allocated table stays zero (the no-steer row): idle rows
+        contribute an exact zero delta.
         """
         dim_of = {"h": hidden_size, "r": max_rank}
         rows = num_rows + 1
@@ -236,6 +240,7 @@ class DecoderSteerController(SlotRoutedSteerController):
                 for key, dims in schema.items()
             }
             for family, schema in GRAPH_FAMILIES.items()
+            if families is None or family in families
         }
         self.graph_mask = torch.zeros(max_num_tokens, dtype=dtype, device=device)
         self.replace_mask = torch.zeros(max_num_tokens, dtype=dtype, device=device)
@@ -265,7 +270,17 @@ class DecoderSteerController(SlotRoutedSteerController):
             raise ValueError(
                 f"algorithm {algorithm!r} has no full-graph kernel family"
             )
-        tables = self.graph_tables[family]
+        tables = self.graph_tables.get(family)
+        if tables is None:
+            # Admission rejects undeclared algorithms; reaching here
+            # means the declaration and the compiled kernel families
+            # have drifted apart.
+            raise RuntimeError(
+                f"algorithm {algorithm!r} needs kernel family {family!r}, "
+                f"which was not compiled into this engine (families: "
+                f"{sorted(self.graph_tables)}); declare the algorithm via "
+                f"steer_algorithms at launch"
+            )
         for key, value in algo_cls.graph_lower(payload, scale).items():
             if value is None:
                 continue
@@ -311,6 +326,10 @@ class DecoderSteerController(SlotRoutedSteerController):
         """
         if self._op_key is None:
             return output
+        if self._graph_mode and not self.graph_tables:
+            # No decoder family is compiled into this engine (e.g. a
+            # moe_router-only declaration): the hook is a no-op.
+            return output
 
         hidden_states, residual, other_outputs, original_format = split_decoder_output(
             output
@@ -354,6 +373,9 @@ class MoEGateSteerController(SlotRoutedSteerController):
         # Tier-1 full-graph mode: expert toggle tables read by the
         # captured gate kernel (see init_graph_table / the hook below).
         self._graph_mode: bool = False
+        # Set at graph init when moe_router is undeclared: no gate
+        # config can ever be admitted, so the hook compiles to nothing.
+        self.graph_noop: bool = False
         self.hook_target = None  # set at attach (models.py)
         self.moe_act: torch.Tensor | None = None
         self.moe_deact: torch.Tensor | None = None
@@ -441,7 +463,7 @@ class MoEGateSteerController(SlotRoutedSteerController):
         The logits tensor is mutated in place, so the original output
         structure flows on unchanged (hook returns None).
         """
-        if self._op_key is None:
+        if self._op_key is None or self.graph_noop:
             return None
         logits = extract_gate_logits(output)
         if logits is None:

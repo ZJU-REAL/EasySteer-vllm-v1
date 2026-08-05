@@ -77,7 +77,7 @@ outputs = llm.generate(prompts, sampling_params, steering=spec)
 
 Steering integrates with compiled execution in one of two ways, fixed at engine construction:
 
-- **`in_graph`** — the steering math lives *inside* the captured CUDA graphs as a data-driven kernel; vLLM keeps its full cudagraphs and unsteered batches run at native speed. Only single-vector configs of graph-family algorithms are admissible, with per-payload conditions (e.g. the rank cap).
+- **`in_graph`** — the steering math lives *inside* the captured CUDA graphs as a data-driven kernel; vLLM keeps its full cudagraphs and unsteered batches run at near-native speed. The kernel is specialized to the declaration: only the declared algorithms' kernel families are compiled in, so a `steer_algorithms=["direct"]` engine carries none of the other families' compute. Only single-vector configs of graph-family algorithms are admissible, with per-payload conditions (e.g. the rank cap).
 - **`split`** — the steering ops become compilation splitting ops: the compiled graph is partitioned at every steered layer and steering runs eagerly between the segments. Every algorithm and multi-vector composition is supported, at roughly half the decode throughput of in-graph steering.
 
 You normally never choose: `steer_graph_mode="auto"` (the default) resolves from the declaration — in-graph when every declared algorithm is unconditionally graph-safe, split otherwise — and logs its reasoning at boot:
