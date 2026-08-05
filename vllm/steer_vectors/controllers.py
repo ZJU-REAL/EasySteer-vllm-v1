@@ -277,7 +277,7 @@ class DecoderSteerController(SlotRoutedSteerController):
                     f"{algorithm} payload {key} shape {tuple(value.shape)} "
                     f"exceeds the full-graph buffer {tuple(dest.shape)}; "
                     f"raise steer_graph_max_rank or launch with "
-                    f"steer_graph_mode='piecewise'"
+                    f"steer_graph_mode='split'"
                 )
             dest[tuple(slice(0, s) for s in value.shape)].copy_(
                 value.to(dest.dtype)

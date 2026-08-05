@@ -1375,7 +1375,7 @@ class GPUModelRunner(
 
         steer_config = self.vllm_config.steer_vector_config
         steer_full_graph = (
-            steer_config is not None and steer_config.graph_mode == "full"
+            steer_config is not None and steer_config.graph_mode == "in_graph"
         )
         if steer_full_graph and not dummy_run:
             # Tier-1: fill the persistent row/mask buffers the captured

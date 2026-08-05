@@ -605,6 +605,8 @@ class EngineArgs:
     enable_moe_shared_loras: bool = LoRAConfig.enable_moe_shared_loras
     # Steer Vector fields
     enable_steer_vector: bool = False
+    steer_algorithms: list[str] | str | None = None
+    steer_multi_vector: bool = False
     max_steer_vectors: int = 8
     steer_vector_dtype: str = "auto"
     steer_graph_mode: str = "auto"
@@ -1382,16 +1384,40 @@ class EngineArgs:
             help="Maximum number of steer vectors in a single batch.",
         )
         steer_vector_group.add_argument(
+            "--steer-algorithms",
+            type=str,
+            default=None,
+            help=(
+                "The steering workload declaration: comma-separated "
+                "algorithm names requests will use (e.g. "
+                "'direct,lm_steer'), or 'all' to allow every algorithm "
+                "(runs in split graph mode). Required when steering is "
+                "enabled without --steering-config. Requests using "
+                "undeclared algorithms are rejected."
+            ),
+        )
+        steer_vector_group.add_argument(
+            "--steer-multi-vector",
+            action="store_true",
+            default=EngineArgs.steer_multi_vector,
+            help=(
+                "Declare that requests may carry multi-vector steering "
+                "configs (resolves auto graph mode to 'split')."
+            ),
+        )
+        steer_vector_group.add_argument(
             "--steer-graph-mode",
             type=str,
-            choices=["auto", "piecewise", "full"],
+            choices=["auto", "split", "in_graph"],
             default=EngineArgs.steer_graph_mode,
             help=(
-                "CUDA-graph mode for steering: 'full' (keeps full CUDA "
-                "graphs via a data-driven in-graph kernel; graph-safe "
-                "configs only), 'piecewise' (all algorithms; steering runs "
-                "between graph segments), or 'auto' (default: full under "
-                "compiled execution, piecewise under eager)."
+                "Expert override for the steering graph tier: "
+                "'in_graph' (steering runs inside full CUDA graphs; "
+                "graph-safe workloads only, requires compiled "
+                "execution), 'split' (all algorithms; the compiled "
+                "graph is partitioned at steered layers), or 'auto' "
+                "(default: resolved conservatively from "
+                "--steer-algorithms)."
             ),
         )
         steer_vector_group.add_argument(
@@ -2317,6 +2343,8 @@ class EngineArgs:
         )
         steer_vector_config = (
             SteerVectorConfig(
+                algorithms=self.steer_algorithms,
+                multi_vector=bool(self.steer_multi_vector),
                 max_steer_vectors=self.max_steer_vectors,
                 steer_vector_dtype=self.steer_vector_dtype,
                 graph_mode=self.steer_graph_mode,

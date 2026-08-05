@@ -8,7 +8,7 @@ provides `_transform` (the core math) plus optional `load_from_path`
 
 Full-graph (Tier-1) support is declared on the class: `graph_family`
 names a kernel family in graph_kernels.GRAPH_FAMILIES (None =
-piecewise only, rejected at admission under graph_mode=full), and
+split-tier only, rejected at admission under graph_mode=in_graph), and
 `graph_lower` maps this algorithm's (payload, scale) onto that family's
 slot tensors — colocated with the eager `_transform` whose math it must
 reproduce.

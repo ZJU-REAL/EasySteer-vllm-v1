@@ -51,24 +51,49 @@ class SteerVectorConfig:
     latency-sensitive serving; leave False for dynamic-vector research
     workflows. (Not part of compute_hash: does not affect the graph.)"""
 
+    algorithms: list[str] | str | None = None
+    """The steering workload declaration: the algorithm names requests
+    will use (e.g. ["direct", "lm_steer"]), or "all" to allow every
+    algorithm. Required whenever steering is enabled without an
+    engine-default steering_config (which declares its own workload).
+    Requests using undeclared algorithms are rejected at admission on
+    every engine, so the declaration is the serving contract; the
+    engine also derives the graph execution tier from it (see
+    graph_mode)."""
+
+    multi_vector: bool = False
+    """Declare that requests may carry multi-vector steering configs
+    (SteeringSpec with more than one vector). Multi-vector composition
+    is outside the in-graph kernel families, so declaring it resolves
+    graph_mode=auto to "split". Implied by "all" and by a multi-vector
+    engine-default steering_config."""
+
     graph_mode: str = "auto"
-    """CUDA-graph execution mode for steering. "full" keeps full CUDA
-    graphs by capturing data-driven per-layer kernel families (additive,
-    projection, low-rank, replace) that read persistent buffers filled
-    host-side each step — single-vector configs of the graph-safe
-    algorithms (direct, erase, replace, concept_replace, loreft,
-    lm_steer) without normalize are admitted. "piecewise" splits
-    compiled graphs at every steered layer and runs steering eagerly
-    between the segments — all algorithms supported, at roughly half
-    the throughput of full graphs. "auto" (default) resolves to "full"
-    under compiled execution and "piecewise" under eager execution
-    (resolved during VllmConfig post-init)."""
+    """How steering integrates with compiled execution. "in_graph"
+    keeps full CUDA graphs by capturing data-driven per-layer kernel
+    families (additive, projection, low-rank, replace) that read
+    persistent buffers filled host-side each step — single-vector
+    configs of the graph-family algorithms are admitted, subject to
+    per-payload conditions (see graph_max_rank). "split" adds the
+    steering ops to the compilation splitting ops so the compiled
+    graph is partitioned at every steered layer and steering runs
+    eagerly between the segments — all algorithms supported, at
+    roughly half the throughput of in-graph steering. "auto" (default)
+    resolves from the declared workload during VllmConfig post-init:
+    "in_graph" when compiled execution is on and every declared
+    algorithm is unconditionally graph-safe (or the engine-default
+    steering_config is concretely admissible), else "split".
+    "in_graph" requires compiled execution: combining it with
+    enforce_eager is rejected at engine construction. Explicit values
+    are an expert override — the declaration still bounds what may
+    run."""
 
     graph_max_rank: int = Field(default=32, ge=1)
-    """Rank capacity of the full-graph low-rank steering buffers
+    """Rank capacity of the in-graph low-rank steering buffers
     (loreft rotations, lm_steer projectors). Payloads above this rank
-    are rejected under graph_mode=full; raise it (more buffer memory,
-    ~3 * layers * slots * hidden * rank values) or use piecewise."""
+    are rejected under graph_mode=in_graph; raise it (more buffer
+    memory, ~3 * layers * slots * hidden * rank values) or use
+    split mode."""
 
     steering_config: str | None = None
     """Engine-default steering: a SteeringSpec as inline JSON or a path
@@ -131,6 +156,55 @@ class SteerVectorConfig:
                 f"max_cpu_steer_vectors ({self.max_cpu_steer_vectors}) "
                 f"must be >= max_steer_vectors ({self.max_steer_vectors})"
             )
+        if self.graph_mode in ("full", "piecewise"):
+            renamed = {"full": "in_graph", "piecewise": "split"}
+            raise ValueError(
+                f"steer_graph_mode {self.graph_mode!r} was renamed to "
+                f"{renamed[self.graph_mode]!r} (the steering tiers are "
+                "distinct from vLLM's cudagraph modes)"
+            )
+        if self.graph_mode not in ("auto", "in_graph", "split"):
+            raise ValueError(
+                f"steer_graph_mode must be 'auto', 'in_graph' or "
+                f"'split'; got {self.graph_mode!r}"
+            )
+        if self.algorithms is not None:
+            from vllm.steer_vectors.algorithms.factory import (
+                ALGORITHM_REGISTRY,
+            )
+
+            if isinstance(self.algorithms, str):
+                names = (
+                    ["all"]
+                    if self.algorithms == "all"
+                    else [
+                        a.strip()
+                        for a in self.algorithms.split(",")
+                        if a.strip()
+                    ]
+                )
+            else:
+                names = list(self.algorithms)
+            if not names:
+                raise ValueError(
+                    "steer_algorithms must not be empty; declare the "
+                    "algorithm names requests will use, or 'all'"
+                )
+            if "all" in names:
+                if len(names) > 1:
+                    raise ValueError(
+                        "steer_algorithms 'all' cannot be combined with "
+                        "specific algorithm names"
+                    )
+                self.algorithms = "all"
+            else:
+                unknown = sorted(set(names) - set(ALGORITHM_REGISTRY))
+                if unknown:
+                    raise ValueError(
+                        f"unknown steering algorithm(s) {unknown}; "
+                        f"available: {sorted(ALGORITHM_REGISTRY)}"
+                    )
+                self.algorithms = sorted(set(names))
         if self.steering_config is not None:
             import os
 

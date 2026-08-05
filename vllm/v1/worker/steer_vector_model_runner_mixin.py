@@ -48,7 +48,7 @@ class SteerVectorModelRunnerMixin:
         if self.steer_vector_manager is not None:
             logger.info("Wrapping model with steer vector support")
             vllm_config = self.vllm_config  # type: ignore
-            if vllm_config.steer_vector_config.graph_mode == "full":
+            if vllm_config.steer_vector_config.graph_mode == "in_graph":
                 # Tier-1 buffers must exist before compile/graph capture.
                 self.steer_vector_manager.enable_graph_mode(
                     vllm_config.model_config.get_hidden_size(),

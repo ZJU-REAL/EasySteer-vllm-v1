@@ -223,9 +223,37 @@ class InputProcessor:
                     f"POST /v1/steering/vectors."
                 )
 
+        # The workload declaration is the serving contract on every
+        # engine: undeclared algorithms are rejected regardless of the
+        # graph mode, so behavior does not depend on the resolved tier.
+        cfg = self.vllm_config.steer_vector_config
+        if cfg.algorithms != "all":
+            if steer_vector_request.is_multi_vector:
+                used = sorted(
+                    {
+                        vc.algorithm
+                        for vc in steer_vector_request.vector_configs
+                    }
+                )
+            else:
+                used = [steer_vector_request.algorithm]
+            undeclared = sorted(set(used) - set(cfg.algorithms or []))
+            if undeclared:
+                raise ValueError(
+                    f"steering algorithm(s) {undeclared} were not "
+                    f"declared at launch (declared: {cfg.algorithms}). "
+                    f"Add them to steer_algorithms and restart the "
+                    f"engine."
+                )
+            if steer_vector_request.is_multi_vector and not cfg.multi_vector:
+                raise ValueError(
+                    "multi-vector steering was not declared at launch; "
+                    "start the engine with steer_multi_vector=True."
+                )
+
         # Reject non-graph-safe configs at the frontend so a bad request
         # errors instead of reaching (and killing) the engine core.
-        if self.vllm_config.steer_vector_config.graph_mode == "full":
+        if self.vllm_config.steer_vector_config.graph_mode == "in_graph":
             from vllm.steer_vectors.graph_support import (
                 graph_reject_message,
                 graph_request_problem,

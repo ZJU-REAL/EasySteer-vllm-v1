@@ -2,7 +2,7 @@
 """Full-graph steering support: admissibility and per-slot table state.
 
 `graph_request_problem` is the single admissibility check behind
-graph_mode=full — used by the frontend (reject before the engine core),
+graph_mode=in_graph — used by the frontend (reject before the engine core),
 the worker (defense in depth) and the auto graph-mode resolution for
 engine-default configs. `SteerGraphState` owns the Tier-1 buffer
 lifecycle: row allocation per slot, table initialization across
@@ -70,11 +70,11 @@ def graph_reject_message(problem: str) -> str:
     from vllm.steer_vectors.algorithms import graph_safe_algorithms
 
     return (
-        f"steer graph_mode=full (the default under compiled execution) "
-        f"supports single-vector configs of "
-        f"{sorted(graph_safe_algorithms())}; got {problem}. Launch with "
-        f"steer_graph_mode='piecewise' to run this config under CUDA "
-        f"graphs."
+        f"steer graph_mode=in_graph supports single-vector configs of "
+        f"{sorted(graph_safe_algorithms())}; got {problem}. Declare the "
+        f"workload via steer_algorithms so auto picks the right tier, "
+        f"or launch with steer_graph_mode='split' to run this config "
+        f"under CUDA graphs."
     )
 
 
@@ -103,7 +103,7 @@ class SteerGraphState:
         kernels see the final buffer addresses.
         """
         assert self.params is not None, (
-            "steer graph_mode=full requires enable() before model wrap"
+            "steer graph_mode=in_graph requires enable() before model wrap"
         )
         from vllm.steer_vectors.controllers import (
             DecoderSteerController,

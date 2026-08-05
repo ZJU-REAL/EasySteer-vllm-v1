@@ -103,7 +103,7 @@ class WorkerSteerVectorManager:
         self._free_slots: list[int] = []
         self._next_slot = 0
         # Tier-1 full-graph mode state (see graph_support).
-        self._graph_full = steer_vector_config.graph_mode == "full"
+        self._graph_full = steer_vector_config.graph_mode == "in_graph"
         self.graph_state = SteerGraphState(steer_vector_config, device)
 
     def enable_graph_mode(

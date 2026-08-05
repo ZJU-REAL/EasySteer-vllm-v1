@@ -272,6 +272,7 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+    VLLM_STEER_EAGER_IN_GRAPH: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -1921,6 +1922,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Flag to control the v2 model runner. If unset, use config defaults.
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
+    ),
+    # Test-only escape hatch: allow steer_graph_mode='in_graph' on a
+    # non-compiled engine so the in-graph steering kernel path can be
+    # byte-golden validated under eager execution (the only
+    # cross-boot-deterministic mode). Not for production use.
+    "VLLM_STEER_EAGER_IN_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_STEER_EAGER_IN_GRAPH", "0"))
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model

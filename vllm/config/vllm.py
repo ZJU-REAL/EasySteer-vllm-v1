@@ -1507,63 +1507,199 @@ class VllmConfig:
             data_parallel_size=effective_dp_size,
         )
 
-        # Steering graph tiers. "full" (Tier-1) captures a data-driven
-        # steering kernel into full CUDA graphs; "piecewise" (Tier-2)
-        # splits the compiled graph at every steered decoder layer so
-        # vllm::steer_apply runs eagerly between CUDA-graph segments.
-        # "auto" picks full under compiled execution (graph-safe configs
-        # only; enforced at admission) and piecewise otherwise.
+        # Steering graph tiers. "in_graph" (Tier-1) captures a
+        # data-driven steering kernel into full CUDA graphs; "split"
+        # (Tier-2) partitions the compiled graph at every steered
+        # decoder layer so vllm::steer_apply runs eagerly between
+        # CUDA-graph segments. "auto" resolves conservatively from the
+        # declared workload (value validation lives on the config).
         if self.steer_vector_config is not None:
-            graph_mode = self.steer_vector_config.graph_mode
-            if graph_mode not in ("auto", "piecewise", "full"):
-                raise ValueError(
-                    f"steer_graph_mode must be 'auto', 'piecewise' or "
-                    f"'full'; got {graph_mode!r}"
-                )
-            if graph_mode == "auto":
-                compiled = (
-                    self.model_config is not None
-                    and not self.model_config.enforce_eager
-                    and self.compilation_config.mode == CompilationMode.VLLM_COMPILE
-                )
-                resolved = "full" if compiled else "piecewise"
-                if (
-                    resolved == "full"
-                    and self.steer_vector_config.steering_config is not None
-                ):
-                    # The engine-default config must be admissible under
-                    # the resolved mode; a full-mode engine that rejects
-                    # its own startup steering would be useless.
-                    from vllm.steer_vectors.request import build_server_request
-                    from vllm.steer_vectors.graph_support import (
-                        graph_request_problem,
-                    )
+            cfg = self.steer_vector_config
+            compiled = (
+                self.model_config is not None
+                and not self.model_config.enforce_eager
+                and self.compilation_config.mode == CompilationMode.VLLM_COMPILE
+            )
 
+            # An engine-default steering config is concrete workload
+            # evidence: its algorithms join the declaration and its
+            # payloads are judged exactly (by the same admissibility
+            # check used at request time).
+            server_request = None
+            if cfg.steering_config is not None:
+                from vllm.steer_vectors.request import build_server_request
+
+                server_request = build_server_request(cfg)
+                if server_request.is_multi_vector:
+                    server_algos = sorted(
+                        {vc.algorithm for vc in server_request.vector_configs}
+                    )
+                    cfg.multi_vector = True
+                else:
+                    server_algos = [server_request.algorithm]
+                if cfg.algorithms is None:
+                    cfg.algorithms = server_algos
+                elif cfg.algorithms != "all":
+                    cfg.algorithms = sorted(
+                        set(cfg.algorithms) | set(server_algos)
+                    )
+            if cfg.algorithms is None:
+                raise ValueError(
+                    "steering is enabled but the workload is not "
+                    "declared: pass steer_algorithms=[...] (the "
+                    "algorithm names requests will use, e.g. "
+                    "['direct']), or steer_algorithms='all' to allow "
+                    "every algorithm (runs in split graph mode). "
+                    "Requests using undeclared algorithms are rejected."
+                )
+
+            from vllm.steer_vectors.algorithms import (
+                graph_condition,
+                graph_safe_algorithms,
+                unconditionally_graph_safe_algorithms,
+            )
+            from vllm.steer_vectors.graph_support import (
+                graph_request_problem,
+            )
+
+            if cfg.graph_mode == "auto":
+                if not compiled:
+                    resolved = "split"
+                    reason = "no compiled execution (no CUDA graphs to keep)"
+                elif server_request is not None:
+                    # Exact evidence: per-request steering is rejected
+                    # while an engine-default config is active, so the
+                    # config alone determines the workload.
                     problem = graph_request_problem(
-                        build_server_request(self.steer_vector_config),
-                        self.steer_vector_config.graph_max_rank,
+                        server_request, cfg.graph_max_rank
+                    )
+                    resolved = "in_graph" if problem is None else "split"
+                    reason = (
+                        "the engine-default steering config is "
+                        "graph-admissible"
+                        if problem is None
+                        else f"the engine-default steering config "
+                        f"carries {problem}"
+                    )
+                elif cfg.algorithms == "all":
+                    resolved = "split"
+                    reason = (
+                        "steer_algorithms='all' includes algorithms "
+                        "outside the in-graph kernel families"
+                    )
+                elif cfg.multi_vector:
+                    resolved = "split"
+                    reason = (
+                        "multi-vector steering was declared, which is "
+                        "outside the in-graph kernel families"
+                    )
+                else:
+                    conditional = [
+                        a
+                        for a in cfg.algorithms
+                        if a not in unconditionally_graph_safe_algorithms()
+                    ]
+                    if conditional:
+                        resolved = "split"
+                        conds = "; ".join(
+                            f"'{a}': "
+                            + (
+                                graph_condition(a)
+                                or "no in-graph kernel family"
+                            )
+                            for a in conditional
+                        )
+                        reason = (
+                            f"declared algorithm(s) {conditional} are not "
+                            f"unconditionally graph-safe ({conds}); "
+                            "without concrete payloads at boot the "
+                            "engine assumes the general case"
+                        )
+                    else:
+                        resolved = "in_graph"
+                        reason = (
+                            f"declared algorithms {cfg.algorithms} all "
+                            "run inside full CUDA graphs"
+                        )
+                cfg.graph_mode = resolved
+                logger.info(
+                    "Steering graph mode resolved to '%s': %s.",
+                    resolved,
+                    reason,
+                )
+            elif cfg.graph_mode == "in_graph":
+                # Expert override: the declaration still bounds what may
+                # run, so promises the mode can never keep are boot
+                # errors and risky ones are boot warnings.
+                if not compiled and not envs.VLLM_STEER_EAGER_IN_GRAPH:
+                    raise ValueError(
+                        "steer_graph_mode='in_graph' requires compiled "
+                        "execution; with enforce_eager or compilation "
+                        "disabled use 'split' (or leave the default "
+                        "'auto')."
+                    )
+                if cfg.algorithms == "all":
+                    raise ValueError(
+                        "steer_graph_mode='in_graph' cannot serve "
+                        "steer_algorithms='all': algorithms without an "
+                        "in-graph kernel family can never run in-graph. "
+                        "Declare the specific algorithms or use 'split'."
+                    )
+                if cfg.multi_vector:
+                    raise ValueError(
+                        "steer_graph_mode='in_graph' cannot serve "
+                        "multi-vector steering; use 'split' (or drop "
+                        "the steer_multi_vector declaration)."
+                    )
+                never = sorted(
+                    set(cfg.algorithms) - graph_safe_algorithms()
+                )
+                if never:
+                    raise ValueError(
+                        f"steer_graph_mode='in_graph' cannot serve "
+                        f"declared algorithm(s) {never}: they have no "
+                        f"in-graph kernel family. Remove them or use "
+                        f"'split'."
+                    )
+                if server_request is not None:
+                    problem = graph_request_problem(
+                        server_request, cfg.graph_max_rank
                     )
                     if problem is not None:
-                        logger.info(
-                            "steer_graph_mode=auto resolves to piecewise: "
-                            "the engine-default steering config carries %s.",
-                            problem,
+                        raise ValueError(
+                            f"steer_graph_mode='in_graph' cannot serve "
+                            f"the engine-default steering config: it "
+                            f"carries {problem}. Use 'split' or 'auto'."
                         )
-                        resolved = "piecewise"
-                self.steer_vector_config.graph_mode = resolved
+                conditional = sorted(
+                    set(cfg.algorithms)
+                    - unconditionally_graph_safe_algorithms()
+                )
+                if conditional:
+                    logger.warning(
+                        "steer_graph_mode='in_graph' with conditionally "
+                        "graph-safe algorithm(s) %s: requests whose "
+                        "payloads fall outside the in-graph conditions "
+                        "(%s) will be rejected at request time.",
+                        conditional,
+                        "; ".join(
+                            f"'{a}': {graph_condition(a)}"
+                            for a in conditional
+                        ),
+                    )
         if (
             self.steer_vector_config is not None
             and self.model_config is not None
             and not self.model_config.enforce_eager
         ):
-            if self.steer_vector_config.graph_mode == "full":
+            if self.steer_vector_config.graph_mode == "in_graph":
                 # Tier-1: the steering kernel is data-driven (persistent
                 # buffers) and captures into full CUDA graphs / compiled
                 # code directly; no graph splits needed. Graph-safe
                 # configs only (enforced at request admission).
                 logger.info(
-                    "Steer vectors in full-graph mode: data-driven "
-                    "in-graph kernel, cudagraph_mode %s kept.",
+                    "Steer vectors in in-graph mode: data-driven "
+                    "steering kernel, cudagraph_mode %s kept.",
                     self.compilation_config.cudagraph_mode.name,
                 )
             elif self.compilation_config.mode == CompilationMode.VLLM_COMPILE:

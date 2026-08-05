@@ -7,9 +7,11 @@ from .erase import EraseAlgorithm
 from .factory import (
     create_algorithm,
     get_algorithm,
+    graph_condition,
     graph_safe_algorithms,
     register_algorithm,
     steering_execution_modes,
+    unconditionally_graph_safe_algorithms,
 )
 from .linear import LinearTransformAlgorithm
 from .lm_steer import LMSteerAlgorithm
@@ -29,7 +31,9 @@ __all__ = [
     "ReplaceAlgorithm",
     "create_algorithm",
     "get_algorithm",
+    "graph_condition",
     "graph_safe_algorithms",
     "register_algorithm",
     "steering_execution_modes",
+    "unconditionally_graph_safe_algorithms",
 ]

@@ -45,7 +45,7 @@ def create_algorithm(name: str, *args, **kwargs) -> "BaseSteerVectorAlgorithm":
 
 
 def graph_safe_algorithms() -> frozenset[str]:
-    """Algorithms declaring a full-graph (Tier-1) kernel family."""
+    """Algorithms declaring an in-graph (Tier-1) kernel family."""
     return frozenset(
         name
         for name, cls in ALGORITHM_REGISTRY.items()
@@ -53,15 +53,47 @@ def graph_safe_algorithms() -> frozenset[str]:
     )
 
 
+def graph_condition(name: str) -> str | None:
+    """The per-payload condition an algorithm's in-graph support carries.
+
+    None for unconditionally graph-safe algorithms (any payload runs
+    in-graph) and for algorithms with no kernel family at all (never
+    in-graph — see graph_safe_algorithms). Conditional algorithms are
+    resolved pessimistically when only their name is declared: without
+    a concrete payload at boot, auto assumes the general case and picks
+    split mode.
+    """
+    from vllm.steer_vectors.graph_kernels import GRAPH_FAMILIES
+
+    cls = get_algorithm(name)
+    if cls.graph_family is None:
+        return None
+    if name == "moe_router":
+        return "only inline activate/deactivate expert configs run in-graph"
+    dims = GRAPH_FAMILIES.get(cls.graph_family, {})
+    if any("r" in d for d in dims.values()):
+        return "payload rank must be <= steer_graph_max_rank"
+    return None
+
+
+def unconditionally_graph_safe_algorithms() -> frozenset[str]:
+    """Algorithms whose every payload runs inside full CUDA graphs."""
+    return frozenset(
+        name
+        for name in graph_safe_algorithms()
+        if graph_condition(name) is None
+    )
+
+
 def steering_execution_modes() -> dict[str, tuple[str, ...]]:
-    """Central algorithm -> supported CUDA execution modes table.
+    """Central algorithm -> supported steering graph tiers table.
 
     Derived from each algorithm's declared graph_family (the single
     source of truth on the class), never hand-maintained: every
-    algorithm runs under piecewise mode; those with a kernel family
-    also run inside full CUDA graphs.
+    algorithm runs under split mode; those with a kernel family also
+    run in-graph (conditionally for some — see graph_condition).
     """
     return {
-        name: (("piecewise", "full") if cls.graph_family else ("piecewise",))
+        name: (("split", "in_graph") if cls.graph_family else ("split",))
         for name, cls in sorted(ALGORITHM_REGISTRY.items())
     }
