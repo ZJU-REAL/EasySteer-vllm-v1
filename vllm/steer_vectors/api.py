@@ -4,9 +4,9 @@
 
 Three concepts replace the v1 request surface:
 
-- `ApplySpec`: where and when a vector applies (phases, token/position
-  filters, generation window). Replaces the seven v1 trigger fields and
-  the `-1` sentinel.
+- `ApplySpec`: where and when a vector applies (per-phase "all" and
+  token/position/window selectors). Replaces the seven v1 trigger
+  fields and the `-1` sentinel.
 - `VectorSpec`: one vector — source, algorithm, scale, layers,
   normalize, algorithm-specific params, and its apply clause.
 - `SteeringSpec`: an ordered list of vectors plus a conflict policy.
@@ -21,9 +21,10 @@ internal engine struct; the apply clause travels as a canonical
 
 Semantics (differences from v1 are deliberate):
 
-- `phases` is the outer gate; include selectors union their matches
-  within it, and with no include selector the whole gated phases are
-  selected.
+- Each phase is selected independently: `prompt="all"` /
+  `generation="all"` select the whole phase, and each phase's include
+  selectors select the union of their matches. A phase with neither
+  "all" nor a selector is untouched — there is no separate phase gate.
 - Every include selector has an exclude twin; exclusions union and
   always subtract. When an include and an exclude overlap, the
   exclusion wins.
@@ -43,14 +44,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-Phase = Literal["prompt", "generation"]
-
-PHASES = ("prompt", "generation")
-
 # The canonical wire keys of an apply/select clause (`to_wire()` dict).
 # Single source of truth — engine-side validators import this.
 APPLY_SPEC_KEYS: tuple[str, ...] = (
-    "phases",
+    "prompt",
+    "generation",
     "prompt_tokens",
     "prompt_positions",
     "prompt_window",
@@ -66,7 +64,6 @@ APPLY_SPEC_KEYS: tuple[str, ...] = (
 )
 
 # Include selectors and their exclude twins, symmetric by construction.
-# A clause with no include selector set selects the whole gated phases.
 INCLUDE_SELECTOR_KEYS: tuple[str, ...] = (
     "prompt_tokens",
     "prompt_positions",
@@ -99,29 +96,32 @@ class SelectSpec(BaseModel):
     identically by the trigger collector, so a clause means the same
     thing in both systems.
 
+    Each phase is selected independently — `prompt="all"` selects every
+    prompt token, `prompt_positions=[-1]` selects one, and a phase with
+    neither "all" nor a selector is untouched. "Last prompt token plus
+    the whole generation" is therefore one clause:
+    `SelectSpec(prompt_positions=[-1], generation="all")`.
+
     Args:
-        phases: Which token kinds to select ("prompt", "generation").
-            Required and non-empty; the outer gate every selector
-            operates within. With no include selector the clause
-            selects every token of the listed phases.
+        prompt: "all" selects every prompt token — the widest prompt
+            include selector; unions with the others like any include.
+        generation: "all" selects every generated token — the widest
+            generation include selector.
         prompt_tokens: Token-id allowlist over prompt tokens (real
-            ids, >= 0). Requires "prompt" in phases.
+            ids, >= 0).
         prompt_positions: Prompt positions; negative values are
             Python-style from the end of the prompt (`-1` = last prompt
             token). Positive values past the prompt end clamp to the
-            last prompt token (warned at admission). Requires "prompt"
-            in phases.
+            last prompt token (warned at admission).
         prompt_window: Half-open (start, stop) over prompt positions;
             negative bounds resolve from the end of the prompt
-            (`(-5, None)` = the last five prompt tokens). Requires
-            "prompt" in phases.
+            (`(-5, None)` = the last five prompt tokens).
         generation_tokens: Token-id allowlist over generated tokens
-            (real ids, >= 0). Requires "generation" in phases.
+            (real ids, >= 0).
         generation_positions: 0-based decode step indices (`[0]` = the
-            first generated token). Requires "generation" in phases.
+            first generated token).
         generation_window: Half-open (start, stop) over 0-based decode
-            steps; stop=None means unbounded. Requires "generation" in
-            phases.
+            steps; stop=None means unbounded.
         exclude_prompt_tokens: Prompt token ids to never select.
         exclude_prompt_positions: Prompt positions to never select
             (same convention as `prompt_positions`).
@@ -131,14 +131,17 @@ class SelectSpec(BaseModel):
         exclude_generation_positions: Decode steps to never select.
         exclude_generation_window: Decode-step window to never select.
 
-    Within the gated phases, the include selectors select the union of
-    their matches; the exclude selectors union and always subtract —
-    where an include and an exclude overlap, the exclusion wins.
+    Selection = union of the include selectors' matches ("all" being
+    the widest selector of its phase); the exclude selectors union and
+    always subtract — where an include and an exclude overlap, the
+    exclusion wins. Exclusions require their phase to be covered, and a
+    clause that selects nothing is rejected.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    phases: list[Phase]
+    prompt: Literal["all"] | None = None
+    generation: Literal["all"] | None = None
     prompt_tokens: list[int] | None = None
     prompt_positions: list[int] | None = None
     prompt_window: tuple[int, int | None] | None = None
@@ -152,12 +155,36 @@ class SelectSpec(BaseModel):
     exclude_generation_positions: list[int] | None = None
     exclude_generation_window: tuple[int, int | None] | None = None
 
+    def _covers(self, phase: str) -> bool:
+        """Whether the clause selects anything in the given phase."""
+        if getattr(self, phase) == "all":
+            return True
+        return any(
+            getattr(self, key) is not None
+            for key in INCLUDE_SELECTOR_KEYS
+            if key.startswith(phase)
+        )
+
     @model_validator(mode="after")
     def _validate(self) -> "SelectSpec":
-        if not self.phases:
-            raise ValueError("phases must be non-empty")
-        if len(set(self.phases)) != len(self.phases):
-            raise ValueError(f"phases has duplicates: {self.phases}")
+        if not self._covers("prompt") and not self._covers("generation"):
+            raise ValueError(
+                "the clause selects nothing: set prompt='all' / "
+                "generation='all' or at least one include selector"
+            )
+        for phase in ("prompt", "generation"):
+            excludes = [
+                key
+                for key in EXCLUDE_SELECTOR_KEYS
+                if key.startswith(f"exclude_{phase}")
+                and getattr(self, key) is not None
+            ]
+            if excludes and not self._covers(phase):
+                raise ValueError(
+                    f"{sorted(excludes)} exclude {phase} tokens, but the "
+                    f"clause selects none: set {phase}='all' or a "
+                    f"{phase}_* selector"
+                )
         for name in (
             "prompt_tokens",
             "prompt_positions",
@@ -179,22 +206,9 @@ class SelectSpec(BaseModel):
             if ids is not None and any(t < 0 for t in ids):
                 raise ValueError(
                     f"{name} must contain real token ids (>= 0); the v1 "
-                    "-1 sentinel is replaced by the phases field"
+                    "-1 sentinel is replaced by prompt='all' / "
+                    "generation='all'"
                 )
-        for name in (
-            "prompt_tokens",
-            "prompt_positions",
-            "exclude_prompt_tokens",
-            "exclude_prompt_positions",
-        ):
-            if getattr(self, name) is not None and "prompt" not in self.phases:
-                raise ValueError(f"{name} requires 'prompt' in phases")
-        for name in ("generation_tokens", "exclude_generation_tokens"):
-            if (
-                getattr(self, name) is not None
-                and "generation" not in self.phases
-            ):
-                raise ValueError(f"{name} requires 'generation' in phases")
         for name in ("generation_positions", "exclude_generation_positions"):
             ids = getattr(self, name)
             if ids is not None and any(j < 0 for j in ids):
@@ -207,8 +221,6 @@ class SelectSpec(BaseModel):
             window = getattr(self, name)
             if window is None:
                 continue
-            if "prompt" not in self.phases:
-                raise ValueError(f"{name} requires 'prompt' in phases")
             start, stop = window
             if (
                 stop is not None
@@ -224,8 +236,6 @@ class SelectSpec(BaseModel):
             window = getattr(self, name)
             if window is None:
                 continue
-            if "generation" not in self.phases:
-                raise ValueError(f"{name} requires 'generation' in phases")
             start, stop = window
             if start < 0:
                 raise ValueError(f"{name} start must be >= 0, got {start}")
@@ -234,20 +244,6 @@ class SelectSpec(BaseModel):
                     f"{name} must be a half-open (start, stop) with "
                     f"stop > start or stop=None, got {window}"
                 )
-        if (
-            self.generation_positions is not None
-            and "generation" not in self.phases
-        ):
-            raise ValueError(
-                "generation_positions requires 'generation' in phases"
-            )
-        if (
-            self.exclude_generation_positions is not None
-            and "generation" not in self.phases
-        ):
-            raise ValueError(
-                "exclude_generation_positions requires 'generation' in phases"
-            )
         return self
 
     def to_wire(self) -> dict[str, Any]:
@@ -260,7 +256,8 @@ class SelectSpec(BaseModel):
             return None if value is None else [value[0], value[1]]
 
         return {
-            "phases": [p for p in PHASES if p in self.phases],
+            "prompt": self.prompt,
+            "generation": self.generation,
             "prompt_tokens": self.prompt_tokens,
             "prompt_positions": self.prompt_positions,
             "prompt_window": _window(self.prompt_window),
@@ -283,6 +280,12 @@ class SelectSpec(BaseModel):
         enable time instead of failing mid-forward.
         """
         unknown = set(wire) - set(APPLY_SPEC_KEYS)
+        if "phases" in unknown:
+            raise ValueError(
+                "'phases' was removed: write prompt='all' / "
+                "generation='all' (or per-phase selectors, which imply "
+                "their phase) instead"
+            )
         if unknown:
             raise ValueError(f"unknown selection fields: {sorted(unknown)}")
 
@@ -291,7 +294,8 @@ class SelectSpec(BaseModel):
             return None if value is None else tuple(value)
 
         return cls(
-            phases=wire.get("phases", []),
+            prompt=wire.get("prompt"),
+            generation=wire.get("generation"),
             prompt_tokens=wire.get("prompt_tokens"),
             prompt_positions=wire.get("prompt_positions"),
             prompt_window=_window("prompt_window"),

@@ -39,7 +39,7 @@ spec = SteeringSpec(vectors=[VectorSpec(
     algorithm="direct",
     scale=2.0,
     layers=list(range(10, 26)),
-    apply=ApplySpec(phases=["prompt", "generation"]),
+    apply=ApplySpec(prompt="all", generation="all"),
 )])
 
 outputs = llm.generate(prompts, sampling_params, steering=spec)
@@ -47,7 +47,7 @@ outputs = llm.generate(prompts, sampling_params, steering=spec)
 
 - **`SteeringSpec`** — the whole configuration: a list of vectors and a `conflict` policy (`"priority"`: first matching vector wins per position; `"sequential"`: all matching vectors apply in order).
 - **`VectorSpec`** — one intervention: the payload (`source` file or in-memory `data`), the `algorithm`, a `scale`, the `layers` it applies to, optional `normalize=True` (rescale the steered hidden state back to its original norm), and its `apply` clause.
-- **`ApplySpec`** — *where* the vector fires. `phases` (`"prompt"`: prefill tokens, correct across chunked prefill; `"generation"`: decode steps; or both) is the outer gate; six include selectors — three per phase, each named for it — and their six symmetric exclude twins operate within it:
+- **`ApplySpec`** — *where* the vector fires. Each phase is selected independently and only by what you name: `prompt="all"` selects every prefill token (correct across chunked prefill), `generation="all"` every decode step, and six narrower include selectors — three per phase, each named for it — plus their six symmetric exclude twins refine the selection. A phase you don't mention is untouched:
 
     | include | exclude twin | matches |
     |---|---|---|
@@ -58,7 +58,7 @@ outputs = llm.generate(prompts, sampling_params, steering=spec)
     | `generation_positions` | `exclude_generation_positions` | exact 0-based decode steps |
     | `generation_window` | `exclude_generation_window` | half-open `(start, stop)` over 0-based decode steps |
 
-    The include selectors select the **union** of their matches (with none set, the whole gated phases); the exclude selectors union and always subtract — where include and exclude overlap, the exclusion wins. One clause can therefore steer the prompt tail *and* the first decode steps: `ApplySpec(phases=["prompt", "generation"], prompt_window=(-4, None), generation_window=(0, 4))`.
+    The include selectors (with `prompt="all"` / `generation="all"` as the widest of each phase) select the **union** of their matches; the exclude selectors union and always subtract — where include and exclude overlap, the exclusion wins. Mixed granularities compose in one clause: `ApplySpec(prompt_positions=[-1], generation="all")` steers the last prompt token plus every generated token, and `ApplySpec(prompt_window=(-4, None), generation_window=(0, 4))` the prompt tail plus the first decode steps. A clause that selects nothing is rejected, as is the removed `phases` key.
 
 `steering=` accepts one spec for the whole batch or a list with one entry (or `None`) per prompt — different requests in one batch can carry entirely different configurations, and each is applied only to its own request.
 
@@ -131,7 +131,7 @@ resp = client.chat.completions.create(
             "algorithm": "direct",
             "scale": 2.0,
             "layers": list(range(10, 26)),
-            "apply": {"phases": ["prompt", "generation"]},
+            "apply": {"prompt": "all", "generation": "all"},
         }]
     }},
 )

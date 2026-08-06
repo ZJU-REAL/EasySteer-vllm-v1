@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Where-clause state and position matching for steering algorithms.
 
-`ApplyClause` holds one intervention's `apply_spec` (the wire form
-of the user-facing ApplySpec: phases, token/position filters, exclusions
-and the generation window); `collect_positions_apply_spec` turns it into
-flat token positions for the current step. Algorithms stay pure
-transformations over the positions computed here.
+`ApplyClause` holds one intervention's `apply_spec` (the wire form of
+the user-facing ApplySpec: per-phase "all" plus token/position/window
+selectors and their exclude twins); `collect_positions_apply_spec`
+turns it into flat token positions for the current step. Algorithms
+stay pure transformations over the positions computed here.
 
 Semantics (see steer_vectors/api.py):
-  candidates = tokens of the selected phases
-  if any include selector given (prompt_tokens, prompt_positions,
-    prompt_window, generation_tokens, generation_positions,
-    generation_window):
-      candidates &= union of the include selectors' matches
+  candidates = (prompt tokens if prompt == "all")
+             | (decode tokens if generation == "all")
+             | union of the include selectors' matches
   candidates &= ~(union of the exclude selectors' matches)
 
 Include and exclude selectors are symmetric twins evaluated by the
@@ -30,7 +28,8 @@ import torch
 from vllm.steer_vectors.geometry import resolve_batch_positions
 
 _CLAUSE_KEYS = (
-    "phases",
+    "prompt",
+    "generation",
     "prompt_tokens",
     "prompt_positions",
     "prompt_window",
@@ -82,8 +81,11 @@ def selects_all_tokens(apply_spec: dict) -> bool:
     Enables the fast path that skips position collection and steers
     all of the slot's token rows directly.
     """
-    return len(apply_spec["phases"]) == 2 and all(
-        apply_spec.get(key) is None for key in _CLAUSE_KEYS if key != "phases"
+    return (
+        apply_spec.get("prompt") == "all"
+        and apply_spec.get("generation") == "all"
+        and all(apply_spec.get(key) is None for key in _INCLUDE_KEYS)
+        and all(apply_spec.get(key) is None for key in _EXCLUDE_KEYS)
     )
 
 
@@ -258,16 +260,15 @@ def collect_positions_apply_spec(
             )
         return matched
 
-    phases = spec["phases"]
     mask = torch.zeros(total_tokens, dtype=torch.bool, device=device)
-    if "prompt" in phases:
+    if spec.get("prompt") == "all":
         mask |= ~is_decode_token
-    if "generation" in phases:
+    if spec.get("generation") == "all":
         mask |= is_decode_token
 
     includes = tuple(spec.get(key) for key in _INCLUDE_KEYS)
     if any(value is not None for value in includes):
-        mask &= _selector_mask(*includes)
+        mask |= _selector_mask(*includes)
 
     excludes = tuple(spec.get(key) for key in _EXCLUDE_KEYS)
     if any(value is not None for value in excludes):

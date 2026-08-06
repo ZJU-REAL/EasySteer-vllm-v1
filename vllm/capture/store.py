@@ -82,8 +82,11 @@ class StreamConfig:
         if self.reduce == "last":
             return False
         if self.select is not None:
-            phases = self.select.get("phases")
-            if phases and "prompt" not in phases:
+            covers_prompt = self.select.get("prompt") == "all" or any(
+                self.select.get(key) is not None
+                for key in ("prompt_tokens", "prompt_positions", "prompt_window")
+            )
+            if not covers_prompt:
                 return False
         return True
 

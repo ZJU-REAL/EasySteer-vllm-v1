@@ -195,17 +195,16 @@ def _clause_mask_np(
         return matched
 
     mask = np.zeros(n, dtype=bool)
-    phases = clause["phases"]
-    if "prompt" in phases:
+    if clause.get("prompt") == "all":
         mask |= ~is_dec
-    if "generation" in phases:
+    if clause.get("generation") == "all":
         mask |= is_dec
 
     from vllm.steer_vectors.algorithms.clause import _EXCLUDE_KEYS, _INCLUDE_KEYS
 
     includes = tuple(clause.get(key) for key in _INCLUDE_KEYS)
     if any(value is not None for value in includes):
-        mask &= _selector_mask(*includes)
+        mask |= _selector_mask(*includes)
 
     excludes = tuple(clause.get(key) for key in _EXCLUDE_KEYS)
     if any(value is not None for value in excludes):
