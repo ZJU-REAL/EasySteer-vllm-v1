@@ -475,6 +475,13 @@ class InputProcessor:
                     )
                 )
 
+        if steer_vector_request is not None and prompt_token_ids is not None:
+            from vllm.steer_vectors.request import warn_clamped_prompt_positions
+
+            warn_clamped_prompt_positions(
+                steer_vector_request, len(prompt_token_ids), request_id
+            )
+
         return EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,

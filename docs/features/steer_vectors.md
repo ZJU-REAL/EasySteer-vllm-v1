@@ -47,13 +47,14 @@ outputs = llm.generate(prompts, sampling_params, steering=spec)
 
 - **`SteeringSpec`** — the whole configuration: a list of vectors and a `conflict` policy (`"priority"`: first matching vector wins per position; `"sequential"`: all matching vectors apply in order).
 - **`VectorSpec`** — one intervention: the payload (`source` file or in-memory `data`), the `algorithm`, a `scale`, the `layers` it applies to, optional `normalize=True` (rescale the steered hidden state back to its original norm), and its `apply` clause.
-- **`ApplySpec`** — *where* the vector fires. `phases` (`"prompt"`: prefill tokens, correct across chunked prefill; `"generation"`: decode steps; or both) is the outer gate; five include selectors and their five symmetric exclude twins operate within it:
+- **`ApplySpec`** — *where* the vector fires. `phases` (`"prompt"`: prefill tokens, correct across chunked prefill; `"generation"`: decode steps; or both) is the outer gate; six include selectors — three per phase, each named for it — and their six symmetric exclude twins operate within it:
 
     | include | exclude twin | matches |
     |---|---|---|
-    | `tokens` | `exclude_tokens` | the given token ids |
-    | `positions` | `exclude_positions` | absolute (`0`, `1`, …) or negative (`-1` = last prompt token) positions |
+    | `prompt_tokens` | `exclude_prompt_tokens` | the given token ids, prompt occurrences only |
+    | `prompt_positions` | `exclude_prompt_positions` | prompt positions: `0`, `1`, … or negative (`-1` = last prompt token); positive values past the prompt end clamp to the last prompt token (warned at admission) |
     | `prompt_window` | `exclude_prompt_window` | half-open `(start, stop)` over prompt positions; negative bounds and `stop=None` resolve from the prompt end (`(-5, None)` = last five prompt tokens) |
+    | `generation_tokens` | `exclude_generation_tokens` | the given token ids, generated occurrences only |
     | `generation_positions` | `exclude_generation_positions` | exact 0-based decode steps |
     | `generation_window` | `exclude_generation_window` | half-open `(start, stop)` over 0-based decode steps |
 

@@ -564,7 +564,7 @@ def _gen_steer_vector_extra_hash_keys(
 
     keys: list[Any] = [fingerprint]
     prompt_len = request.num_prompt_tokens
-    if is_prompt_length_sensitive(svr) or end_token_idx > prompt_len:
+    if is_prompt_length_sensitive(svr, prompt_len) or end_token_idx > prompt_len:
         keys.append(("steer_prompt_len", prompt_len))
     return keys
 

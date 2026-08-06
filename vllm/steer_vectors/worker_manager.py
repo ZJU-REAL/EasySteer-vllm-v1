@@ -55,7 +55,7 @@ def config_fingerprint(request: SteerVectorRequest) -> str:
     # The file version participates so a vector regenerated at the same
     # path gets a fresh slot (and thus a fresh load) even while requests
     # with the old version are still running.
-    values = [request.local_path, request.payload_sha256, request.debug]
+    values = [request.local_path, request.payload_sha256]
     if request.local_path:
         values.append(file_version(request.local_path))
     values.extend(_canon(request, STEER_APPLY_FIELDS))
@@ -272,7 +272,7 @@ class WorkerSteerVectorManager:
         self, slot: int, model: LoadedSteerVector, request: SteerVectorRequest
     ) -> None:
         """Configure a single-vector request as a one-intervention slot."""
-        fields = {**steer_params_dict(request), "debug": request.debug}
+        fields = steer_params_dict(request)
         self._configure_layer_slots(
             slot, [(fields, model.layer_payloads or {})], "priority"
         )
@@ -288,7 +288,7 @@ class WorkerSteerVectorManager:
             model = self._load_entry(
                 vc.path, vc.algorithm, vc.target_layers, vc.inline_payload
             )
-            fields = {**steer_params_dict(vc), "debug": request.debug}
+            fields = steer_params_dict(vc)
             specs.append((fields, model.layer_payloads or {}))
         self._configure_layer_slots(slot, specs, request.conflict_resolution)
 
@@ -390,7 +390,7 @@ class WorkerSteerVectorManager:
         """Configure a moe_router request as a one-intervention slot on
         the MoE gate controllers (token-routed like any other config)."""
         model = self._build_moe_model(request)
-        fields = {**steer_params_dict(request), "debug": request.debug}
+        fields = steer_params_dict(request)
         self._configure_layer_slots(
             slot,
             [(fields, model.layer_payloads or {})],

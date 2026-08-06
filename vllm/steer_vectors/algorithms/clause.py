@@ -9,18 +9,20 @@ transformations over the positions computed here.
 
 Semantics (see steer_vectors/api.py):
   candidates = tokens of the selected phases
-  if any include selector given (tokens, positions, prompt_window,
-    generation_positions, generation_window):
+  if any include selector given (prompt_tokens, prompt_positions,
+    prompt_window, generation_tokens, generation_positions,
+    generation_window):
       candidates &= union of the include selectors' matches
   candidates &= ~(union of the exclude selectors' matches)
 
 Include and exclude selectors are symmetric twins evaluated by the
-same matchers; windows are half-open (start, stop). Prompt windows
-resolve negative bounds from the prompt end and match only prompt
-tokens; generation positions/windows count 0-based decode steps and
-match only generation tokens. There are no sentinel values and nothing
-bypasses exclusions — where include and exclude overlap, the exclusion
-wins.
+same matchers; windows are half-open (start, stop). Every selector is
+phase-scoped: the prompt_* family matches only prompt tokens (negative
+prompt_positions resolve from the prompt end; positive ones past the
+prompt end clamp to the last prompt token), the generation_* family
+matches only decode steps, counted 0-based. There are no sentinel
+values and nothing bypasses exclusions — where include and exclude
+overlap, the exclusion wins.
 """
 
 import torch
@@ -29,23 +31,26 @@ from vllm.steer_vectors.geometry import resolve_batch_positions
 
 _CLAUSE_KEYS = (
     "phases",
-    "tokens",
-    "positions",
+    "prompt_tokens",
+    "prompt_positions",
     "prompt_window",
+    "generation_tokens",
     "generation_positions",
     "generation_window",
-    "exclude_tokens",
-    "exclude_positions",
+    "exclude_prompt_tokens",
+    "exclude_prompt_positions",
     "exclude_prompt_window",
+    "exclude_generation_tokens",
     "exclude_generation_positions",
     "exclude_generation_window",
 )
 
 # The symmetric selector twins, in matcher-argument order.
 _INCLUDE_KEYS = (
-    "tokens",
-    "positions",
+    "prompt_tokens",
+    "prompt_positions",
     "prompt_window",
+    "generation_tokens",
     "generation_positions",
     "generation_window",
 )
@@ -83,16 +88,11 @@ def selects_all_tokens(apply_spec: dict) -> bool:
 
 
 class ApplyClause:
-    """Holds one intervention's where-clause and debug flag."""
+    """Holds one intervention's where-clause."""
 
     def __init__(self):
         self.apply_spec: dict | None = None
-        self.debug: bool = False
         self.cache_key: tuple | None = None
-
-    def set_debug(self, debug: bool) -> None:
-        """Set debug mode."""
-        self.debug = debug
 
     def configure_from_dict(self, config: dict) -> None:
         """Configure from a canonical steering-parameter dict.
@@ -103,7 +103,7 @@ class ApplyClause:
         """
         from vllm.steer_vectors.request import STEER_CLAUSE_FIELDS
 
-        for name in STEER_CLAUSE_FIELDS + ("debug",):
+        for name in STEER_CLAUSE_FIELDS:
             if name in config:
                 setattr(self, name, config[name])
         self.cache_key = clause_cache_key(self.apply_spec)
@@ -128,30 +128,24 @@ def _match_positions(
     positions: list,
     total_len_per_sample: torch.Tensor,
     sample_ids: torch.Tensor,
+    is_decode_token: torch.Tensor,
 ) -> torch.Tensor:
-    """[total_tokens] mask of tokens at the given absolute positions.
+    """[total_tokens] mask of prompt tokens at the given positions.
 
-    Positive entries match absolute positions directly; negative entries
-    are Python-style indices from each sample's prompt length in
-    `total_len_per_sample` (stable across prefill chunks).
+    Negative entries are Python-style indices from each sample's prompt
+    length in `total_len_per_sample` (stable across prefill chunks).
+    Positive entries past the prompt end clamp to the last prompt token
+    (the admission-time check warns about it); decode tokens never
+    match.
     """
     mask = torch.zeros_like(abs_positions, dtype=torch.bool)
-    positive = [p for p in positions if p >= 0]
-    negative = [p for p in positions if p < 0]
-    if positive:
-        mask |= torch.isin(
-            abs_positions,
-            torch.tensor(
-                positive,
-                dtype=abs_positions.dtype,
-                device=abs_positions.device,
-            ),
-        )
-    if negative:
-        totals = total_len_per_sample[sample_ids]
-        for neg_idx in negative:
-            mask |= abs_positions == totals + neg_idx
-    return mask
+    totals = total_len_per_sample[sample_ids]
+    for p in positions:
+        if p < 0:
+            mask |= abs_positions == totals + p
+        else:
+            mask |= abs_positions == torch.clamp(totals - 1, max=p)
+    return mask & ~is_decode_token
 
 
 def _match_prompt_window(
@@ -232,14 +226,27 @@ def collect_positions_apply_spec(
         return num_output_tokens.to(device)[sample_ids] - 1
 
     def _selector_mask(
-        tokens, positions, prompt_window, generation_positions, generation_window
+        prompt_tokens,
+        prompt_positions,
+        prompt_window,
+        generation_tokens,
+        generation_positions,
+        generation_window,
     ) -> torch.Tensor:
         matched = torch.zeros(total_tokens, dtype=torch.bool, device=device)
-        if tokens is not None:
-            matched |= _isin_token_set(current_tokens, tokens)
-        if positions is not None:
+        if prompt_tokens is not None:
+            matched |= (
+                _isin_token_set(current_tokens, prompt_tokens) & ~is_decode_token
+            )
+        if generation_tokens is not None:
+            matched |= (
+                _isin_token_set(current_tokens, generation_tokens)
+                & is_decode_token
+            )
+        if prompt_positions is not None:
             matched |= _match_positions(
-                abs_positions, positions, neg_base, sample_ids
+                abs_positions, prompt_positions, neg_base, sample_ids,
+                is_decode_token,
             )
         if prompt_window is not None:
             matched |= _match_prompt_window(

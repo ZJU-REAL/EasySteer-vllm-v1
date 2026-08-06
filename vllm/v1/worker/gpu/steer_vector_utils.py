@@ -105,19 +105,19 @@ def _batch_token_slots(
 
 
 def _match_positions_np(
-    abs_pos: np.ndarray, positions, neg_base: np.ndarray
+    abs_pos: np.ndarray, positions, neg_base: np.ndarray, is_dec: np.ndarray
 ) -> np.ndarray:
-    """Mask of tokens at the given absolute positions (numpy mirror of
+    """Mask of prompt tokens at the given positions (numpy mirror of
     clause._match_positions): negative entries index from each sample's
-    prompt length."""
+    prompt length; positive entries past the prompt end clamp to the
+    last prompt token; decode tokens never match."""
     mask = np.zeros(abs_pos.shape[0], dtype=bool)
-    positive = [p for p in positions if p >= 0]
-    if positive:
-        mask |= np.isin(abs_pos, np.asarray(positive, dtype=np.int64))
     for p in positions:
         if p < 0:
             mask |= abs_pos == neg_base + p
-    return mask
+        else:
+            mask |= abs_pos == np.minimum(neg_base - 1, p)
+    return mask & ~is_dec
 
 
 def _match_prompt_window_np(
@@ -166,13 +166,26 @@ def _clause_mask_np(
     n = is_dec.shape[0]
 
     def _selector_mask(
-        tokens, positions, prompt_window, generation_positions, generation_window
+        prompt_tokens,
+        prompt_positions,
+        prompt_window,
+        generation_tokens,
+        generation_positions,
+        generation_window,
     ) -> np.ndarray:
         matched = np.zeros(n, dtype=bool)
-        if tokens is not None:
-            matched |= np.isin(token_ids(), np.asarray(list(tokens)))
-        if positions is not None:
-            matched |= _match_positions_np(abs_pos, positions, neg_base)
+        if prompt_tokens is not None:
+            matched |= (
+                np.isin(token_ids(), np.asarray(list(prompt_tokens))) & ~is_dec
+            )
+        if generation_tokens is not None:
+            matched |= (
+                np.isin(token_ids(), np.asarray(list(generation_tokens))) & is_dec
+            )
+        if prompt_positions is not None:
+            matched |= _match_positions_np(
+                abs_pos, prompt_positions, neg_base, is_dec
+            )
         if prompt_window is not None:
             matched |= _match_prompt_window_np(abs_pos, prompt_window, neg_base, is_dec)
         if generation_positions is not None or generation_window is not None:

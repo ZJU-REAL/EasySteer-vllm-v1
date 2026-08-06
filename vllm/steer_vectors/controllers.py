@@ -101,7 +101,7 @@ class SlotRoutedSteerController(nn.Module):
         """Configure a routing slot from an ordered list of vector specs.
 
         Each spec carries `algorithm`, `payload`, and the canonical
-        steering fields (scale, triggers, normalize, debug) of one
+        steering fields (scale, triggers, normalize) of one
         intervention.
         """
         entries = []

@@ -30,8 +30,13 @@ Semantics (differences from v1 are deliberate):
 - Windows are half-open `(start, stop)`: `generation_window=(0, k)`
   selects exactly the first k decode steps; `prompt_window` bounds may
   be negative (resolved from the end of the prompt).
-- Negative `positions` resolve from the end of the prompt (`-1` = last
-  prompt token), stable across prefill chunks.
+- Every selector is phase-scoped and named for it: `prompt_tokens` /
+  `prompt_positions` / `prompt_window` select prompt tokens,
+  `generation_tokens` / `generation_positions` / `generation_window`
+  select decode steps. Negative `prompt_positions` resolve from the end
+  of the prompt (`-1` = last prompt token), stable across prefill
+  chunks; positive ones past the prompt end clamp to the last prompt
+  token (with a warning at admission).
 """
 
 from typing import Any, Literal
@@ -46,14 +51,16 @@ PHASES = ("prompt", "generation")
 # Single source of truth — engine-side validators import this.
 APPLY_SPEC_KEYS: tuple[str, ...] = (
     "phases",
-    "tokens",
-    "positions",
+    "prompt_tokens",
+    "prompt_positions",
     "prompt_window",
+    "generation_tokens",
     "generation_positions",
     "generation_window",
-    "exclude_tokens",
-    "exclude_positions",
+    "exclude_prompt_tokens",
+    "exclude_prompt_positions",
     "exclude_prompt_window",
+    "exclude_generation_tokens",
     "exclude_generation_positions",
     "exclude_generation_window",
 )
@@ -61,9 +68,10 @@ APPLY_SPEC_KEYS: tuple[str, ...] = (
 # Include selectors and their exclude twins, symmetric by construction.
 # A clause with no include selector set selects the whole gated phases.
 INCLUDE_SELECTOR_KEYS: tuple[str, ...] = (
-    "tokens",
-    "positions",
+    "prompt_tokens",
+    "prompt_positions",
     "prompt_window",
+    "generation_tokens",
     "generation_positions",
     "generation_window",
 )
@@ -96,23 +104,30 @@ class SelectSpec(BaseModel):
             Required and non-empty; the outer gate every selector
             operates within. With no include selector the clause
             selects every token of the listed phases.
-        tokens: Token-id allowlist (real ids, >= 0).
-        positions: Absolute sequence positions; negative values are
-            Python-style from the end of the prompt.
+        prompt_tokens: Token-id allowlist over prompt tokens (real
+            ids, >= 0). Requires "prompt" in phases.
+        prompt_positions: Prompt positions; negative values are
+            Python-style from the end of the prompt (`-1` = last prompt
+            token). Positive values past the prompt end clamp to the
+            last prompt token (warned at admission). Requires "prompt"
+            in phases.
         prompt_window: Half-open (start, stop) over prompt positions;
             negative bounds resolve from the end of the prompt
             (`(-5, None)` = the last five prompt tokens). Requires
             "prompt" in phases.
+        generation_tokens: Token-id allowlist over generated tokens
+            (real ids, >= 0). Requires "generation" in phases.
         generation_positions: 0-based decode step indices (`[0]` = the
             first generated token). Requires "generation" in phases.
         generation_window: Half-open (start, stop) over 0-based decode
             steps; stop=None means unbounded. Requires "generation" in
             phases.
-        exclude_tokens: Token ids to never select.
-        exclude_positions: Positions to never select (same convention
-            as `positions`).
+        exclude_prompt_tokens: Prompt token ids to never select.
+        exclude_prompt_positions: Prompt positions to never select
+            (same convention as `prompt_positions`).
         exclude_prompt_window: Prompt window to never select (same
             convention as `prompt_window`).
+        exclude_generation_tokens: Generated token ids to never select.
         exclude_generation_positions: Decode steps to never select.
         exclude_generation_window: Decode-step window to never select.
 
@@ -124,14 +139,16 @@ class SelectSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     phases: list[Phase]
-    tokens: list[int] | None = None
-    positions: list[int] | None = None
+    prompt_tokens: list[int] | None = None
+    prompt_positions: list[int] | None = None
     prompt_window: tuple[int, int | None] | None = None
+    generation_tokens: list[int] | None = None
     generation_positions: list[int] | None = None
     generation_window: tuple[int, int | None] | None = None
-    exclude_tokens: list[int] | None = None
-    exclude_positions: list[int] | None = None
+    exclude_prompt_tokens: list[int] | None = None
+    exclude_prompt_positions: list[int] | None = None
     exclude_prompt_window: tuple[int, int | None] | None = None
+    exclude_generation_tokens: list[int] | None = None
     exclude_generation_positions: list[int] | None = None
     exclude_generation_window: tuple[int, int | None] | None = None
 
@@ -142,21 +159,42 @@ class SelectSpec(BaseModel):
         if len(set(self.phases)) != len(self.phases):
             raise ValueError(f"phases has duplicates: {self.phases}")
         for name in (
-            "tokens",
-            "positions",
+            "prompt_tokens",
+            "prompt_positions",
+            "generation_tokens",
             "generation_positions",
-            "exclude_tokens",
-            "exclude_positions",
+            "exclude_prompt_tokens",
+            "exclude_prompt_positions",
+            "exclude_generation_tokens",
             "exclude_generation_positions",
         ):
             _require_nonempty(name, getattr(self, name))
-        for name in ("tokens", "exclude_tokens"):
+        for name in (
+            "prompt_tokens",
+            "generation_tokens",
+            "exclude_prompt_tokens",
+            "exclude_generation_tokens",
+        ):
             ids = getattr(self, name)
             if ids is not None and any(t < 0 for t in ids):
                 raise ValueError(
                     f"{name} must contain real token ids (>= 0); the v1 "
                     "-1 sentinel is replaced by the phases field"
                 )
+        for name in (
+            "prompt_tokens",
+            "prompt_positions",
+            "exclude_prompt_tokens",
+            "exclude_prompt_positions",
+        ):
+            if getattr(self, name) is not None and "prompt" not in self.phases:
+                raise ValueError(f"{name} requires 'prompt' in phases")
+        for name in ("generation_tokens", "exclude_generation_tokens"):
+            if (
+                getattr(self, name) is not None
+                and "generation" not in self.phases
+            ):
+                raise ValueError(f"{name} requires 'generation' in phases")
         for name in ("generation_positions", "exclude_generation_positions"):
             ids = getattr(self, name)
             if ids is not None and any(j < 0 for j in ids):
@@ -223,14 +261,16 @@ class SelectSpec(BaseModel):
 
         return {
             "phases": [p for p in PHASES if p in self.phases],
-            "tokens": self.tokens,
-            "positions": self.positions,
+            "prompt_tokens": self.prompt_tokens,
+            "prompt_positions": self.prompt_positions,
             "prompt_window": _window(self.prompt_window),
+            "generation_tokens": self.generation_tokens,
             "generation_positions": self.generation_positions,
             "generation_window": _window(self.generation_window),
-            "exclude_tokens": self.exclude_tokens,
-            "exclude_positions": self.exclude_positions,
+            "exclude_prompt_tokens": self.exclude_prompt_tokens,
+            "exclude_prompt_positions": self.exclude_prompt_positions,
             "exclude_prompt_window": _window(self.exclude_prompt_window),
+            "exclude_generation_tokens": self.exclude_generation_tokens,
             "exclude_generation_positions": self.exclude_generation_positions,
             "exclude_generation_window": _window(self.exclude_generation_window),
         }
@@ -252,14 +292,16 @@ class SelectSpec(BaseModel):
 
         return cls(
             phases=wire.get("phases", []),
-            tokens=wire.get("tokens"),
-            positions=wire.get("positions"),
+            prompt_tokens=wire.get("prompt_tokens"),
+            prompt_positions=wire.get("prompt_positions"),
             prompt_window=_window("prompt_window"),
+            generation_tokens=wire.get("generation_tokens"),
             generation_positions=wire.get("generation_positions"),
             generation_window=_window("generation_window"),
-            exclude_tokens=wire.get("exclude_tokens"),
-            exclude_positions=wire.get("exclude_positions"),
+            exclude_prompt_tokens=wire.get("exclude_prompt_tokens"),
+            exclude_prompt_positions=wire.get("exclude_prompt_positions"),
             exclude_prompt_window=_window("exclude_prompt_window"),
+            exclude_generation_tokens=wire.get("exclude_generation_tokens"),
             exclude_generation_positions=wire.get("exclude_generation_positions"),
             exclude_generation_window=_window("exclude_generation_window"),
         )
@@ -292,7 +334,8 @@ class VectorSpec(BaseModel):
         apply: Where/when the vector applies (required).
         params: Algorithm-specific parameters; validated per algorithm,
             unknown keys are rejected.
-        name: Optional label used in logs only (not identity).
+        name: Optional request label; used as the engine-side request
+            name when set (a generated id otherwise).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -412,14 +455,12 @@ class SteeringSpec(BaseModel):
             'sequential'/'priority' conflict resolution).
         conflict: What to do when several vectors target one position:
             'priority' (first wins), 'sequential' (stack), 'error'.
-        debug: Verbose logging during the forward pass.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     vectors: list[VectorSpec]
     conflict: Literal["priority", "sequential", "error"] = "priority"
-    debug: bool = False
 
     @model_validator(mode="after")
     def _validate(self) -> "SteeringSpec":
@@ -481,7 +522,6 @@ def to_engine_request(
             steer_vector_local_path=v.source or "",
             inline_payload=wire,
             payload_sha256=wire["sha256"] if wire else None,
-            debug=spec.debug,
             scale=v.scale,
             target_layers=v.layers,
             algorithm=v.algorithm,
@@ -506,7 +546,6 @@ def to_engine_request(
     return SteerVectorRequest(
         steer_vector_name=name,
         steer_vector_int_id=int_id,
-        debug=spec.debug,
         conflict_resolution=spec.conflict,
         vector_configs=[_vector_config(v) for v in spec.vectors],
     )

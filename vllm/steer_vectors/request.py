@@ -11,6 +11,10 @@ ApplySpec).
 
 import msgspec
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 # --- Canonical steering parameter schema ---
 #
 # Single source of truth for "what configures how a vector is applied".
@@ -60,16 +64,29 @@ def build_server_request(steer_config) -> "SteerVectorRequest":
     return to_engine_request(spec, name="__server__", int_id=1)
 
 
-def is_prompt_length_sensitive(request) -> bool:
+def is_prompt_length_sensitive(request, prompt_len: int | None = None) -> bool:
     """Whether the config's effect on a token depends on the request's
     prompt length (and not just the token's absolute position).
 
-    True for negative positions, prompt windows with an end-relative
-    bound (negative, or stop=None), and generation-step selectors —
-    everything that resolves from the end of the prompt. Used by
-    prefix-cache block hashing: such configs can only share KV blocks
-    between requests with equal prompt lengths.
+    True for negative prompt positions (resolve from the prompt end),
+    prompt windows with an end-relative bound (negative, or stop=None),
+    and generation-step selectors. Positive prompt positions are
+    absolute — length-sensitive only when they reach past this
+    request's prompt end and clamp to its last token; pass `prompt_len`
+    for that precise check (without it, any positive entry counts as
+    potentially clamping). Used by prefix-cache block hashing: sensitive
+    configs can only share KV blocks between requests with equal prompt
+    lengths.
     """
+
+    def _positions_sensitive(values) -> bool:
+        if not values:
+            return False
+        if any(p < 0 for p in values):
+            return True
+        if prompt_len is None:
+            return True
+        return max(values) >= prompt_len
 
     def _end_relative_window(window) -> bool:
         if window is None:
@@ -82,8 +99,8 @@ def is_prompt_length_sensitive(request) -> bool:
         if spec is None:
             return False
         return (
-            any(p < 0 for p in (spec.get("positions") or []))
-            or any(p < 0 for p in (spec.get("exclude_positions") or []))
+            _positions_sensitive(spec.get("prompt_positions"))
+            or _positions_sensitive(spec.get("exclude_prompt_positions"))
             or _end_relative_window(spec.get("prompt_window"))
             or _end_relative_window(spec.get("exclude_prompt_window"))
             or spec.get("generation_positions") is not None
@@ -95,6 +112,38 @@ def is_prompt_length_sensitive(request) -> bool:
     if _sensitive(request):
         return True
     return any(_sensitive(vc) for vc in request.vector_configs or [])
+
+
+def warn_clamped_prompt_positions(
+    request, prompt_len: int, request_id: str
+) -> None:
+    """Warn when positive prompt_positions lie past the prompt end.
+
+    The clause matchers clamp such entries to the last prompt token;
+    admission is the one place the prompt length is cheaply known, so
+    the warning is emitted here instead of from the per-step hot path.
+    """
+
+    def _check(obj) -> None:
+        spec = obj.apply_spec
+        if spec is None:
+            return
+        for key in ("prompt_positions", "exclude_prompt_positions"):
+            over = [p for p in (spec.get(key) or []) if p >= prompt_len]
+            if over:
+                logger.warning(
+                    "Request %s: %s entries %s are past the prompt end "
+                    "(prompt length %d); clamping to the last prompt "
+                    "token.",
+                    request_id,
+                    key,
+                    over,
+                    prompt_len,
+                )
+
+    _check(request)
+    for vc in request.vector_configs or []:
+        _check(vc)
 
 
 def validate_apply_spec(spec: dict) -> None:
@@ -214,7 +263,6 @@ class SteerVectorRequest(
     steer_vector_name: str
     steer_vector_int_id: int
     steer_vector_local_path: str = ""
-    debug: bool = False
     conflict_resolution: str = "priority"
 
     # === Single-vector mode ===
