@@ -47,14 +47,17 @@ outputs = llm.generate(prompts, sampling_params, steering=spec)
 
 - **`SteeringSpec`** — the whole configuration: a list of vectors and a `conflict` policy (`"priority"`: first matching vector wins per position; `"sequential"`: all matching vectors apply in order).
 - **`VectorSpec`** — one intervention: the payload (`source` file or in-memory `data`), the `algorithm`, a `scale`, the `layers` it applies to, optional `normalize=True` (rescale the steered hidden state back to its original norm), and its `apply` clause.
-- **`ApplySpec`** — *where* the vector fires:
-    - `phases`: `"prompt"` (prefill tokens, correct across chunked prefill), `"generation"` (decode steps), or both;
-    - `positions`: absolute (`0`, `1`, …) or negative (`-1` = last prompt token) prompt positions;
-    - `generation_window`: half-open `(start, end)` window of decode steps;
-    - `tokens`: fire only on the given token ids;
-    - `exclude_positions` / `exclude_tokens`: subtract from any wider selection.
+- **`ApplySpec`** — *where* the vector fires. `phases` (`"prompt"`: prefill tokens, correct across chunked prefill; `"generation"`: decode steps; or both) is the outer gate; five include selectors and their five symmetric exclude twins operate within it:
 
-    Filters compose by intersection: `tokens` and `positions` union into one trigger, which then intersects the phase selection; the `generation_window` constrains only decode tokens (prompt tokens pass through it); excludes always subtract. A window therefore never widens a `positions` filter — to steer the prompt tail *and* the first decode steps, use two vectors with separate apply clauses.
+    | include | exclude twin | matches |
+    |---|---|---|
+    | `tokens` | `exclude_tokens` | the given token ids |
+    | `positions` | `exclude_positions` | absolute (`0`, `1`, …) or negative (`-1` = last prompt token) positions |
+    | `prompt_window` | `exclude_prompt_window` | half-open `(start, stop)` over prompt positions; negative bounds and `stop=None` resolve from the prompt end (`(-5, None)` = last five prompt tokens) |
+    | `generation_positions` | `exclude_generation_positions` | exact 0-based decode steps |
+    | `generation_window` | `exclude_generation_window` | half-open `(start, stop)` over 0-based decode steps |
+
+    The include selectors select the **union** of their matches (with none set, the whole gated phases); the exclude selectors union and always subtract — where include and exclude overlap, the exclusion wins. One clause can therefore steer the prompt tail *and* the first decode steps: `ApplySpec(phases=["prompt", "generation"], prompt_window=(-4, None), generation_window=(0, 4))`.
 
 `steering=` accepts one spec for the whole batch or a list with one entry (or `None`) per prompt — different requests in one batch can carry entirely different configurations, and each is applied only to its own request.
 

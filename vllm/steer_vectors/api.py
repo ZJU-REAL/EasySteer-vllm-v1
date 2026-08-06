@@ -21,9 +21,15 @@ internal engine struct; the apply clause travels as a canonical
 
 Semantics (differences from v1 are deliberate):
 
-- Exclusions always subtract; nothing bypasses them.
-- `generation_window=(start, stop)` is half-open over 0-based decode
-  steps: `(0, k)` steers exactly the first k decode steps.
+- `phases` is the outer gate; include selectors union their matches
+  within it, and with no include selector the whole gated phases are
+  selected.
+- Every include selector has an exclude twin; exclusions union and
+  always subtract. When an include and an exclude overlap, the
+  exclusion wins.
+- Windows are half-open `(start, stop)`: `generation_window=(0, k)`
+  selects exactly the first k decode steps; `prompt_window` bounds may
+  be negative (resolved from the end of the prompt).
 - Negative `positions` resolve from the end of the prompt (`-1` = last
   prompt token), stable across prefill chunks.
 """
@@ -42,9 +48,27 @@ APPLY_SPEC_KEYS: tuple[str, ...] = (
     "phases",
     "tokens",
     "positions",
+    "prompt_window",
+    "generation_positions",
+    "generation_window",
     "exclude_tokens",
     "exclude_positions",
-    "window",
+    "exclude_prompt_window",
+    "exclude_generation_positions",
+    "exclude_generation_window",
+)
+
+# Include selectors and their exclude twins, symmetric by construction.
+# A clause with no include selector set selects the whole gated phases.
+INCLUDE_SELECTOR_KEYS: tuple[str, ...] = (
+    "tokens",
+    "positions",
+    "prompt_window",
+    "generation_positions",
+    "generation_window",
+)
+EXCLUDE_SELECTOR_KEYS: tuple[str, ...] = tuple(
+    f"exclude_{k}" for k in INCLUDE_SELECTOR_KEYS
 )
 
 # Allowed `VectorSpec.params` keys per algorithm; algorithms not listed
@@ -69,19 +93,32 @@ class SelectSpec(BaseModel):
 
     Args:
         phases: Which token kinds to select ("prompt", "generation").
-            Required and non-empty; with no other filters the clause
+            Required and non-empty; the outer gate every selector
+            operates within. With no include selector the clause
             selects every token of the listed phases.
         tokens: Token-id allowlist (real ids, >= 0).
         positions: Absolute sequence positions; negative values are
             Python-style from the end of the prompt.
-        exclude_tokens: Token ids to never select.
-        exclude_positions: Positions to never select (same convention).
+        prompt_window: Half-open (start, stop) over prompt positions;
+            negative bounds resolve from the end of the prompt
+            (`(-5, None)` = the last five prompt tokens). Requires
+            "prompt" in phases.
+        generation_positions: 0-based decode step indices (`[0]` = the
+            first generated token). Requires "generation" in phases.
         generation_window: Half-open (start, stop) over 0-based decode
             steps; stop=None means unbounded. Requires "generation" in
             phases.
+        exclude_tokens: Token ids to never select.
+        exclude_positions: Positions to never select (same convention
+            as `positions`).
+        exclude_prompt_window: Prompt window to never select (same
+            convention as `prompt_window`).
+        exclude_generation_positions: Decode steps to never select.
+        exclude_generation_window: Decode-step window to never select.
 
-    Within the selected phases, `tokens` and `positions` select the
-    union of their matches; exclusions always subtract.
+    Within the gated phases, the include selectors select the union of
+    their matches; the exclude selectors union and always subtract —
+    where an include and an exclude overlap, the exclusion wins.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -89,9 +126,14 @@ class SelectSpec(BaseModel):
     phases: list[Phase]
     tokens: list[int] | None = None
     positions: list[int] | None = None
+    prompt_window: tuple[int, int | None] | None = None
+    generation_positions: list[int] | None = None
+    generation_window: tuple[int, int | None] | None = None
     exclude_tokens: list[int] | None = None
     exclude_positions: list[int] | None = None
-    generation_window: tuple[int, int | None] | None = None
+    exclude_prompt_window: tuple[int, int | None] | None = None
+    exclude_generation_positions: list[int] | None = None
+    exclude_generation_window: tuple[int, int | None] | None = None
 
     @model_validator(mode="after")
     def _validate(self) -> "SelectSpec":
@@ -99,7 +141,14 @@ class SelectSpec(BaseModel):
             raise ValueError("phases must be non-empty")
         if len(set(self.phases)) != len(self.phases):
             raise ValueError(f"phases has duplicates: {self.phases}")
-        for name in ("tokens", "positions", "exclude_tokens", "exclude_positions"):
+        for name in (
+            "tokens",
+            "positions",
+            "generation_positions",
+            "exclude_tokens",
+            "exclude_positions",
+            "exclude_generation_positions",
+        ):
             _require_nonempty(name, getattr(self, name))
         for name in ("tokens", "exclude_tokens"):
             ids = getattr(self, name)
@@ -108,19 +157,59 @@ class SelectSpec(BaseModel):
                     f"{name} must contain real token ids (>= 0); the v1 "
                     "-1 sentinel is replaced by the phases field"
                 )
-        if self.generation_window is not None:
-            start, stop = self.generation_window
-            if "generation" not in self.phases:
+        for name in ("generation_positions", "exclude_generation_positions"):
+            ids = getattr(self, name)
+            if ids is not None and any(j < 0 for j in ids):
                 raise ValueError(
-                    "generation_window requires 'generation' in phases"
+                    f"{name} must contain 0-based decode steps (>= 0); "
+                    "the generation length is not known up front, so "
+                    "end-relative steps cannot resolve"
                 )
+        for name in ("prompt_window", "exclude_prompt_window"):
+            window = getattr(self, name)
+            if window is None:
+                continue
+            if "prompt" not in self.phases:
+                raise ValueError(f"{name} requires 'prompt' in phases")
+            start, stop = window
+            if (
+                stop is not None
+                and (start < 0) == (stop < 0)
+                and stop <= start
+            ):
+                raise ValueError(
+                    f"{name} must be a half-open (start, stop) with "
+                    f"stop > start (or stop=None for the prompt end), "
+                    f"got {window}"
+                )
+        for name in ("generation_window", "exclude_generation_window"):
+            window = getattr(self, name)
+            if window is None:
+                continue
+            if "generation" not in self.phases:
+                raise ValueError(f"{name} requires 'generation' in phases")
+            start, stop = window
             if start < 0:
-                raise ValueError(f"generation_window start must be >= 0, got {start}")
+                raise ValueError(f"{name} start must be >= 0, got {start}")
             if stop is not None and stop <= start:
                 raise ValueError(
-                    f"generation_window must be a half-open (start, stop) "
-                    f"with stop > start or stop=None, got {self.generation_window}"
+                    f"{name} must be a half-open (start, stop) with "
+                    f"stop > start or stop=None, got {window}"
                 )
+        if (
+            self.generation_positions is not None
+            and "generation" not in self.phases
+        ):
+            raise ValueError(
+                "generation_positions requires 'generation' in phases"
+            )
+        if (
+            self.exclude_generation_positions is not None
+            and "generation" not in self.phases
+        ):
+            raise ValueError(
+                "exclude_generation_positions requires 'generation' in phases"
+            )
         return self
 
     def to_wire(self) -> dict[str, Any]:
@@ -129,16 +218,21 @@ class SelectSpec(BaseModel):
         Fixed key order and list-only containers so the config
         fingerprint and msgspec round-trips are deterministic.
         """
-        window = None
-        if self.generation_window is not None:
-            window = [self.generation_window[0], self.generation_window[1]]
+        def _window(value: tuple[int, int | None] | None) -> list | None:
+            return None if value is None else [value[0], value[1]]
+
         return {
             "phases": [p for p in PHASES if p in self.phases],
             "tokens": self.tokens,
             "positions": self.positions,
+            "prompt_window": _window(self.prompt_window),
+            "generation_positions": self.generation_positions,
+            "generation_window": _window(self.generation_window),
             "exclude_tokens": self.exclude_tokens,
             "exclude_positions": self.exclude_positions,
-            "window": window,
+            "exclude_prompt_window": _window(self.exclude_prompt_window),
+            "exclude_generation_positions": self.exclude_generation_positions,
+            "exclude_generation_window": _window(self.exclude_generation_window),
         }
 
     @classmethod
@@ -151,14 +245,23 @@ class SelectSpec(BaseModel):
         unknown = set(wire) - set(APPLY_SPEC_KEYS)
         if unknown:
             raise ValueError(f"unknown selection fields: {sorted(unknown)}")
-        window = wire.get("window")
+
+        def _window(key: str) -> tuple | None:
+            value = wire.get(key)
+            return None if value is None else tuple(value)
+
         return cls(
             phases=wire.get("phases", []),
             tokens=wire.get("tokens"),
             positions=wire.get("positions"),
+            prompt_window=_window("prompt_window"),
+            generation_positions=wire.get("generation_positions"),
+            generation_window=_window("generation_window"),
             exclude_tokens=wire.get("exclude_tokens"),
             exclude_positions=wire.get("exclude_positions"),
-            generation_window=tuple(window) if window is not None else None,
+            exclude_prompt_window=_window("exclude_prompt_window"),
+            exclude_generation_positions=wire.get("exclude_generation_positions"),
+            exclude_generation_window=_window("exclude_generation_window"),
         )
 
 

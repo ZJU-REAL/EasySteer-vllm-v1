@@ -64,11 +64,18 @@ def is_prompt_length_sensitive(request) -> bool:
     """Whether the config's effect on a token depends on the request's
     prompt length (and not just the token's absolute position).
 
-    True for negative positions (resolved from the end of the prompt)
-    and generation windows (relative to the prompt end). Used by
+    True for negative positions, prompt windows with an end-relative
+    bound (negative, or stop=None), and generation-step selectors —
+    everything that resolves from the end of the prompt. Used by
     prefix-cache block hashing: such configs can only share KV blocks
     between requests with equal prompt lengths.
     """
+
+    def _end_relative_window(window) -> bool:
+        if window is None:
+            return False
+        start, stop = window
+        return start < 0 or stop is None or stop < 0
 
     def _sensitive(obj) -> bool:
         spec = obj.apply_spec
@@ -77,7 +84,12 @@ def is_prompt_length_sensitive(request) -> bool:
         return (
             any(p < 0 for p in (spec.get("positions") or []))
             or any(p < 0 for p in (spec.get("exclude_positions") or []))
-            or spec.get("window") is not None
+            or _end_relative_window(spec.get("prompt_window"))
+            or _end_relative_window(spec.get("exclude_prompt_window"))
+            or spec.get("generation_positions") is not None
+            or spec.get("exclude_generation_positions") is not None
+            or spec.get("generation_window") is not None
+            or spec.get("exclude_generation_window") is not None
         )
 
     if _sensitive(request):

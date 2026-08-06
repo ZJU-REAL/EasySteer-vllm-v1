@@ -9,12 +9,18 @@ transformations over the positions computed here.
 
 Semantics (see steer_vectors/api.py):
   candidates = tokens of the selected phases
-  if tokens/positions given: candidates &= (token match | position match)
-  candidates &= ~(exclude_tokens match | exclude_positions match)
-  generation tokens are additionally constrained to the half-open window
-  over 0-based decode steps (step j iff start <= j < stop).
+  if any include selector given (tokens, positions, prompt_window,
+    generation_positions, generation_window):
+      candidates &= union of the include selectors' matches
+  candidates &= ~(union of the exclude selectors' matches)
 
-There are no sentinel values and nothing bypasses exclusions.
+Include and exclude selectors are symmetric twins evaluated by the
+same matchers; windows are half-open (start, stop). Prompt windows
+resolve negative bounds from the prompt end and match only prompt
+tokens; generation positions/windows count 0-based decode steps and
+match only generation tokens. There are no sentinel values and nothing
+bypasses exclusions — where include and exclude overlap, the exclusion
+wins.
 """
 
 import torch
@@ -25,10 +31,25 @@ _CLAUSE_KEYS = (
     "phases",
     "tokens",
     "positions",
+    "prompt_window",
+    "generation_positions",
+    "generation_window",
     "exclude_tokens",
     "exclude_positions",
-    "window",
+    "exclude_prompt_window",
+    "exclude_generation_positions",
+    "exclude_generation_window",
 )
+
+# The symmetric selector twins, in matcher-argument order.
+_INCLUDE_KEYS = (
+    "tokens",
+    "positions",
+    "prompt_window",
+    "generation_positions",
+    "generation_window",
+)
+_EXCLUDE_KEYS = tuple(f"exclude_{key}" for key in _INCLUDE_KEYS)
 
 
 def _canon(value):
@@ -57,14 +78,7 @@ def selects_all_tokens(apply_spec: dict) -> bool:
     all of the slot's token rows directly.
     """
     return len(apply_spec["phases"]) == 2 and all(
-        apply_spec.get(key) is None
-        for key in (
-            "tokens",
-            "positions",
-            "exclude_tokens",
-            "exclude_positions",
-            "window",
-        )
+        apply_spec.get(key) is None for key in _CLAUSE_KEYS if key != "phases"
     )
 
 
@@ -140,6 +154,48 @@ def _match_positions(
     return mask
 
 
+def _match_prompt_window(
+    abs_positions: torch.Tensor,
+    window: tuple,
+    neg_base: torch.Tensor,
+    sample_ids: torch.Tensor,
+    is_decode_token: torch.Tensor,
+) -> torch.Tensor:
+    """[total_tokens] mask of prompt tokens inside the half-open window.
+
+    Negative bounds resolve from each sample's prompt length; stop=None
+    means the prompt end.
+    """
+    totals = neg_base[sample_ids]
+    start, stop = window
+    lo = totals + start if start < 0 else start
+    hi = totals if stop is None else (totals + stop if stop < 0 else stop)
+    return (~is_decode_token) & (abs_positions >= lo) & (abs_positions < hi)
+
+
+def _match_generation_steps(
+    gen_idx: torch.Tensor,
+    is_decode_token: torch.Tensor,
+    steps: list | None,
+    window: tuple | None,
+) -> torch.Tensor:
+    """[total_tokens] mask of generation tokens at the given 0-based
+    decode steps and/or inside the half-open decode-step window."""
+    mask = torch.zeros_like(is_decode_token)
+    if steps is not None:
+        mask |= torch.isin(
+            gen_idx,
+            torch.tensor(list(steps), dtype=gen_idx.dtype, device=gen_idx.device),
+        )
+    if window is not None:
+        start, stop = window
+        in_window = gen_idx >= start
+        if stop is not None:
+            in_window &= gen_idx < stop
+        mask |= in_window
+    return mask & is_decode_token
+
+
 def collect_positions_apply_spec(
     current_tokens: torch.Tensor,
     samples_info: dict[str, torch.Tensor],
@@ -163,6 +219,38 @@ def collect_positions_apply_spec(
     neg_base = total_len if num_prompt is None else num_prompt.to(device)
     is_decode_token = is_decode_mask[sample_ids]
 
+    def _gen_idx() -> torch.Tensor:
+        num_output_tokens = samples_info.get("num_output_tokens")
+        if num_output_tokens is None:
+            raise RuntimeError(
+                "apply_spec selects decode steps but the runner did not "
+                "provide num_output_tokens in samples_info"
+            )
+        # The decode step processing generated token j has
+        # num_output_tokens == j + 1 (the prompt's last position, which
+        # produces the first generated token, is a prompt-phase token).
+        return num_output_tokens.to(device)[sample_ids] - 1
+
+    def _selector_mask(
+        tokens, positions, prompt_window, generation_positions, generation_window
+    ) -> torch.Tensor:
+        matched = torch.zeros(total_tokens, dtype=torch.bool, device=device)
+        if tokens is not None:
+            matched |= _isin_token_set(current_tokens, tokens)
+        if positions is not None:
+            matched |= _match_positions(
+                abs_positions, positions, neg_base, sample_ids
+            )
+        if prompt_window is not None:
+            matched |= _match_prompt_window(
+                abs_positions, prompt_window, neg_base, sample_ids, is_decode_token
+            )
+        if generation_positions is not None or generation_window is not None:
+            matched |= _match_generation_steps(
+                _gen_idx(), is_decode_token, generation_positions, generation_window
+            )
+        return matched
+
     phases = spec["phases"]
     mask = torch.zeros(total_tokens, dtype=torch.bool, device=device)
     if "prompt" in phases:
@@ -170,42 +258,13 @@ def collect_positions_apply_spec(
     if "generation" in phases:
         mask |= is_decode_token
 
-    tokens = spec.get("tokens")
-    positions = spec.get("positions")
-    if tokens is not None or positions is not None:
-        trigger = torch.zeros(total_tokens, dtype=torch.bool, device=device)
-        if tokens is not None:
-            trigger |= _isin_token_set(current_tokens, tokens)
-        if positions is not None:
-            trigger |= _match_positions(abs_positions, positions, neg_base, sample_ids)
-        mask &= trigger
+    includes = tuple(spec.get(key) for key in _INCLUDE_KEYS)
+    if any(value is not None for value in includes):
+        mask &= _selector_mask(*includes)
 
-    exclude_tokens = spec.get("exclude_tokens")
-    if exclude_tokens is not None:
-        mask &= ~_isin_token_set(current_tokens, exclude_tokens)
-    exclude_positions = spec.get("exclude_positions")
-    if exclude_positions is not None:
-        mask &= ~_match_positions(
-            abs_positions, exclude_positions, neg_base, sample_ids
-        )
-
-    window = spec.get("window")
-    if window is not None:
-        num_output_tokens = samples_info.get("num_output_tokens")
-        if num_output_tokens is None:
-            raise RuntimeError(
-                "apply_spec has a generation window but the runner did not "
-                "provide num_output_tokens in samples_info"
-            )
-        # The decode step processing generated token j has
-        # num_output_tokens == j + 1 (the prompt's last position, which
-        # produces the first generated token, is a prompt-phase token).
-        gen_idx = num_output_tokens.to(device)[sample_ids] - 1
-        start, stop = window
-        in_window = gen_idx >= start
-        if stop is not None:
-            in_window &= gen_idx < stop
-        mask &= (~is_decode_token) | in_window
+    excludes = tuple(spec.get(key) for key in _EXCLUDE_KEYS)
+    if any(value is not None for value in excludes):
+        mask &= ~_selector_mask(*excludes)
 
     positions_tensor = torch.nonzero(mask, as_tuple=False).squeeze(-1)
     if positions_tensor.numel() == 0:
