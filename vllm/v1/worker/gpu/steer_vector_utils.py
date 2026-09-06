@@ -2,12 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Steer vector support for the V2 GPU model runner."""
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import torch
 
 from vllm.steer_vectors import trace
 from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+if TYPE_CHECKING:
+    from vllm.forward_context import BatchGeometry
 
 
 class SteerVectorState:
@@ -56,7 +61,11 @@ class SteerVectorState:
         return bool(self._slots)
 
 
-def build_batch_geometry(input_batch: InputBatch) -> "BatchGeometry":
+def build_batch_geometry(
+    input_batch: InputBatch,
+    *,
+    query_start_loc_cpu: np.ndarray | None = None,
+) -> "BatchGeometry":
     """Build the per-step BatchGeometry from the runner's InputBatch.
 
     The single producer of batch geometry: steering triggers, capture
@@ -83,12 +92,19 @@ def build_batch_geometry(input_batch: InputBatch) -> "BatchGeometry":
         num_output=torch.from_numpy(num_output),
         req_ids=list(input_batch.req_ids[:num_reqs]),
         token_ids=input_batch.input_ids[: input_batch.num_tokens],
-        query_start_loc_cpu=input_batch.query_start_loc_np[: num_reqs + 1],
+        query_start_loc_cpu=(
+            input_batch.query_start_loc_np[: num_reqs + 1]
+            if query_start_loc_cpu is None
+            else query_start_loc_cpu[: num_reqs + 1]
+        ),
     )
 
 
 def _batch_token_slots(
-    input_batch: InputBatch, state: SteerVectorState, default_slot: int
+    input_batch: InputBatch,
+    state: SteerVectorState,
+    default_slot: int,
+    query_start_loc_cpu: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Per-request and per-token config-slot routing for this step."""
     num_reqs = input_batch.num_reqs
@@ -100,7 +116,9 @@ def _batch_token_slots(
         dtype=np.int32,
         count=num_reqs,
     )
-    token_slots_np = np.repeat(slots_np, input_batch.num_scheduled_tokens[:num_reqs])
+    # Adaptive verification may redistribute drafts on the GPU, so scheduled
+    # counts are only upper bounds. Route the actual forward-pass row segments.
+    token_slots_np = np.repeat(slots_np, np.diff(query_start_loc_cpu[: num_reqs + 1]))
     return slots_np, token_slots_np
 
 
@@ -175,17 +193,13 @@ def _clause_mask_np(
     ) -> np.ndarray:
         matched = np.zeros(n, dtype=bool)
         if prompt_tokens is not None:
-            matched |= (
-                np.isin(token_ids(), np.asarray(list(prompt_tokens))) & ~is_dec
-            )
+            matched |= np.isin(token_ids(), np.asarray(list(prompt_tokens))) & ~is_dec
         if generation_tokens is not None:
             matched |= (
                 np.isin(token_ids(), np.asarray(list(generation_tokens))) & is_dec
             )
         if prompt_positions is not None:
-            matched |= _match_positions_np(
-                abs_pos, prompt_positions, neg_base, is_dec
-            )
+            matched |= _match_positions_np(abs_pos, prompt_positions, neg_base, is_dec)
         if prompt_window is not None:
             matched |= _match_prompt_window_np(abs_pos, prompt_window, neg_base, is_dec)
         if generation_positions is not None or generation_window is not None:
@@ -256,7 +270,8 @@ def resolve_slot_positions(
     # first token's slot; all its tokens share it).
     active = set(active_slots)
     slot_reqs: dict[int, list[int]] = {}
-    for r, s in enumerate(token_slots_np[starts_all].tolist()):
+    for r in np.flatnonzero(lens > 0):
+        s = int(token_slots_np[starts_all[r]])
         if s in active:
             slot_reqs.setdefault(s, []).append(r)
 
@@ -296,7 +311,7 @@ def resolve_slot_positions(
                     abs_pos,
                     num_prompt[samp],
                     num_output[samp] - 1,
-                    lambda: geo.token_ids_cpu()[tok_idx],
+                    lambda tok_idx=tok_idx: geo.token_ids_cpu()[tok_idx],
                 )
                 pos_np = tok_idx[mask]
             if pos_np.shape[0] == 0:
@@ -322,6 +337,7 @@ def make_steer_vector_forward_kwargs(
     state: SteerVectorState | None = None,
     default_slot: int = -1,
     manager=None,
+    geometry: "BatchGeometry | None" = None,
 ) -> dict:
     """Build the ForwardContext fields consumed by steering and capture.
 
@@ -334,12 +350,13 @@ def make_steer_vector_forward_kwargs(
     `default_slot` is the server-level config's slot (-1 when absent);
     requests without their own steering config are routed to it.
     """
-    num_reqs = input_batch.num_reqs
-    geo = build_batch_geometry(input_batch)
+    geo = build_batch_geometry(input_batch) if geometry is None else geometry
     kwargs = {"batch_geometry": geo}
 
     if state is not None and (state.has_routed() or default_slot >= 0):
-        slots_np, token_slots_np = _batch_token_slots(input_batch, state, default_slot)
+        slots_np, token_slots_np = _batch_token_slots(
+            input_batch, state, default_slot, geo.query_start_loc_cpu
+        )
         token_slots = torch.from_numpy(token_slots_np).to(
             input_batch.input_ids.device, non_blocking=True
         )
@@ -363,7 +380,7 @@ def make_steer_vector_forward_kwargs(
             trace.begin_step(
                 req_ids=input_batch.req_ids,
                 slots=slots_np.tolist(),
-                query_start_loc=input_batch.query_start_loc_np[: num_reqs + 1].tolist(),
+                query_start_loc=geo.query_start_loc_cpu.tolist(),
                 token_ids=geo.token_ids.cpu().tolist(),
                 num_computed=geo.num_computed.tolist(),
                 num_output=geo.num_output.tolist(),
@@ -375,6 +392,7 @@ def fill_graph_steer_buffers(
     input_batch: InputBatch,
     state: SteerVectorState | None,
     manager,
+    geometry: "BatchGeometry | None" = None,
 ) -> None:
     """Fill Tier-1 persistent buffers for this step (full-graph mode).
 
@@ -394,15 +412,16 @@ def fill_graph_steer_buffers(
     if not entries or state is None:
         return
 
+    geo = build_batch_geometry(input_batch) if geometry is None else geometry
     slots_np, token_slots_np = _batch_token_slots(
-        input_batch, state, manager.server_slot
+        input_batch, state, manager.server_slot, geo.query_start_loc_cpu
     )
     rows_np = np.fromiter(
         (entries[s][0] if s in entries else 0 for s in slots_np),
         dtype=np.int64,
         count=slots_np.shape[0],
     )
-    num_scheduled = input_batch.num_scheduled_tokens[: slots_np.shape[0]]
+    num_scheduled = np.diff(geo.query_start_loc_cpu)
     token_rows_np = np.repeat(rows_np, num_scheduled)
     n = token_rows_np.shape[0]
     if n == 0:
@@ -410,9 +429,6 @@ def fill_graph_steer_buffers(
     device = row_buf.device
     row_buf[:n].copy_(torch.from_numpy(token_rows_np).to(device, non_blocking=True))
 
-    # Batch geometry for the trigger collector: the same object the
-    # forward context carries, from the single producer.
-    geo = build_batch_geometry(input_batch)
     batch_slots = set(slots_np.tolist())
     active_slots = sorted(s for s in entries if s in batch_slots)
     resolved = resolve_slot_positions(
@@ -436,13 +452,11 @@ def fill_graph_steer_buffers(
             get_algorithm(request.algorithm).graph_family
         )
         for module in controllers:
-            mask_writes.setdefault(
-                (id(module), mask_attr), (module, mask_attr, [])
-            )[2].append(positions)
+            mask_writes.setdefault((id(module), mask_attr), (module, mask_attr, []))[
+                2
+            ].append(positions)
     for module, mask_attr, position_list in mask_writes.values():
         positions = (
-            position_list[0]
-            if len(position_list) == 1
-            else torch.cat(position_list)
+            position_list[0] if len(position_list) == 1 else torch.cat(position_list)
         )
         getattr(module, mask_attr)[positions] = 1.0

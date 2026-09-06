@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import inspect
+import json as _json
 import multiprocessing
 import multiprocessing.forkserver as forkserver
 import os
@@ -16,8 +17,7 @@ from contextlib import asynccontextmanager
 from typing import Any, cast
 
 import uvloop
-from fastapi import FastAPI, HTTPException
-from fastapi.exceptions import RequestValidationError
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import State
 
@@ -28,10 +28,10 @@ from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.openai.engine.protocol import GenerationError
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.elastic_ep.middleware import ScalingMiddleware
+from vllm.entrypoints.serve.exception_handling.register import init_exception_handler
 from vllm.entrypoints.serve.sagemaker.api_router import sagemaker_standards_bootstrap
 from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
 from vllm.entrypoints.serve.utils.api_utils import (
@@ -42,19 +42,9 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.server_utils import (
-    engine_error_handler,
-    exception_handler,
-    generation_error_handler,
     get_uvicorn_log_config,
-    http_exception_handler,
     lifespan,
     log_response,
-    validation_exception_handler,
-)
-from vllm.exceptions import (
-    VLLMNotFoundError,
-    VLLMUnprocessableEntityError,
-    VLLMValidationError,
 )
 from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
@@ -67,7 +57,6 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.network_utils import is_valid_ipv6_address
 from vllm.utils.system_utils import decorate_logs, set_ulimit
-from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.version import __version__ as VLLM_VERSION
 
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
@@ -269,6 +258,13 @@ def build_app(
 
         register_pooling_api_routers(app, supported_tasks, model_config)
 
+    if args.enable_fault_tolerance:
+        from vllm.entrypoints.serve.fault_tolerance.api_router import (
+            register_fault_tolerance_api_router,
+        )
+
+        register_fault_tolerance_api_router(app)
+
     # Endpoint plugins are attached last so their routes are registered after all core
     # routers. This runs even for the CPU only render server. A plugin eligible for
     # the `render` task still gets its routes registered. It receives
@@ -276,6 +272,7 @@ def build_app(
     _attach_endpoint_plugins(app, supported_tasks)
 
     _register_steering_endpoints(app)
+    init_exception_handler(app)
 
     app.root_path = args.root_path
     app.add_middleware(
@@ -285,25 +282,6 @@ def build_app(
         allow_methods=args.allowed_methods,
         allow_headers=args.allowed_headers,
     )
-
-    app.exception_handler(HTTPException)(http_exception_handler)
-    app.exception_handler(RequestValidationError)(validation_exception_handler)
-    app.exception_handler(EngineGenerateError)(engine_error_handler)
-    app.exception_handler(EngineDeadError)(engine_error_handler)
-    app.exception_handler(GenerationError)(generation_error_handler)
-    # Register specific exception types so they are handled by
-    # ExceptionMiddleware (inside the Prometheus middleware) rather than
-    # ServerErrorMiddleware (outside it). Without this, these exceptions
-    # propagate through Prometheus as unhandled and get recorded as 5xx
-    # even though they result in 4xx responses to the client.
-    app.exception_handler(VLLMValidationError)(exception_handler)
-    app.exception_handler(VLLMUnprocessableEntityError)(exception_handler)
-    app.exception_handler(VLLMNotFoundError)(exception_handler)
-    app.exception_handler(ValueError)(exception_handler)
-    app.exception_handler(TypeError)(exception_handler)
-    app.exception_handler(OverflowError)(exception_handler)
-    app.exception_handler(NotImplementedError)(exception_handler)
-    app.exception_handler(Exception)(exception_handler)
 
     # Ensure --api-key option from CLI takes precedence over VLLM_API_KEY
     if tokens := [key for key in (args.api_key or [envs.VLLM_API_KEY]) if key]:
@@ -425,6 +403,7 @@ async def init_app_state(
         default_chat_template_kwargs=args.default_chat_template_kwargs,
         log_error_stack=args.log_error_stack,
     )
+    state.online_renderer.warmup()
 
     state.online_derenderer = OnlineDerenderer(
         model_config=engine_client.model_config,
@@ -528,6 +507,7 @@ async def init_render_app_state(
         default_chat_template_kwargs=args.default_chat_template_kwargs,
         log_error_stack=args.log_error_stack,
     )
+    state.online_renderer.warmup()
 
     state.online_derenderer = OnlineDerenderer(
         model_config=vllm_config.model_config,
@@ -743,12 +723,11 @@ async def build_and_serve_renderer(
         h11_max_header_count=args.h11_max_header_count,
         **uvicorn_kwargs,
     )
+
+
 ##########################################################################
 # Server-level steering admin endpoints
 ##########################################################################
-
-import asyncio
-import json as _json
 
 _steering_update_lock = asyncio.Lock()
 
@@ -767,9 +746,11 @@ def _register_steering_endpoints(app: FastAPI) -> None:
                 status_code=400,
                 content={"error": "SteerVector is not enabled."},
             )
-        return JSONResponse(content={
-            "preloaded": engine_client.list_preloaded_steer_vectors(),
-        })
+        return JSONResponse(
+            content={
+                "preloaded": engine_client.list_preloaded_steer_vectors(),
+            }
+        )
 
     @app.post("/v1/steering/vectors")
     async def preload_steering_vectors(raw_request: Request):
@@ -805,9 +786,11 @@ def _register_steering_endpoints(app: FastAPI) -> None:
                 status_code=400,
                 content={"error": f"Preload failed: {e}"},
             )
-        return JSONResponse(content={
-            "preloaded": engine_client.list_preloaded_steer_vectors(),
-        })
+        return JSONResponse(
+            content={
+                "preloaded": engine_client.list_preloaded_steer_vectors(),
+            }
+        )
 
     def _steering_status(steer_config) -> dict:
         return {
@@ -838,8 +821,10 @@ def _register_steering_endpoints(app: FastAPI) -> None:
         if steer_config is None or not steer_config.has_server_config:
             return JSONResponse(
                 status_code=400,
-                content={"error": "Engine-default steering is not configured. "
-                         "Start the server with --steering-config to enable."},
+                content={
+                    "error": "Engine-default steering is not configured. "
+                    "Start the server with --steering-config to enable."
+                },
             )
 
         try:
@@ -890,9 +875,7 @@ def _register_steering_endpoints(app: FastAPI) -> None:
                     status_code=400,
                     content={"error": f"Spec rejected at install: {e}"},
                 )
-            object.__setattr__(
-                steer_config, "steering_config", spec.model_dump_json()
-            )
+            object.__setattr__(steer_config, "steering_config", spec.model_dump_json())
             # Cached KV was steered under the old config; drop it so
             # new requests never reuse stale blocks.
             await _reset_prefix_cache_if_enabled()
