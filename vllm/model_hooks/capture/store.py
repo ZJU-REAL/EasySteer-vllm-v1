@@ -4,7 +4,7 @@
 
 import threading
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -15,6 +15,9 @@ from vllm.model_hooks.capture.serialization import (
     serialize_capture_layer,
 )
 from vllm.model_hooks.selection.spec import SelectSpec
+
+if TYPE_CHECKING:
+    from vllm.model_hooks.selection.batch import BatchGeometry
 
 logger = init_logger(__name__)
 
@@ -111,8 +114,8 @@ class StreamStore:
         self._pending: list[tuple[int, torch.Tensor, torch.Tensor, str]] = []
         # Geometry and request selections are fixed during one forward pass.
         # Layers share its row plans; a fresh geometry invalidates every plan.
-        self._row_plan_geometry = None
-        self._row_plan_request_selects = None
+        self._row_plan_geometry: BatchGeometry | None = None
+        self._row_plan_request_selects: dict[str, dict[str, dict]] | None = None
         self._row_plans: dict = {}
         self.lock = threading.Lock()
 
@@ -168,7 +171,7 @@ class StreamStore:
             self._captured_requests.difference_update(req_ids)
 
     def fail_requests(self, errors: dict[str, str]) -> None:
-        """Retain request failures so later fetches cannot imply successful steer."""
+        """Retain request failures so later fetches cannot return invalid capture."""
         if errors:
             with self.lock:
                 self._failed_requests.update(errors)
@@ -344,7 +347,7 @@ class StreamStore:
             if failed:
                 raise RuntimeError(
                     f"capture contains failed request(s) {list(failed.items())[:5]}; "
-                    "their rows do not represent successful steering. Fetch with "
+                    "their rows do not represent valid capture. Fetch with "
                     "req_ids excluding them, or clear the stream."
                 )
             elided = self.elided_reqs

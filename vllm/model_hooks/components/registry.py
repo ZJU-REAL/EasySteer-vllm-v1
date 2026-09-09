@@ -63,7 +63,7 @@ class ComponentDescriptor:
     # None means the discovered component has no usable forward hook;
     # the resolver reports the reason (e.g. a fused MoE gate is bypassed).
     resolve_target: Callable[[str, nn.Module], nn.Module | None]
-    adapter: type
+    adapter: type[DecoderOutputAdapter] | type[GateOutputAdapter]
     steering_op: str
     op_key_suffix: str = ""
 

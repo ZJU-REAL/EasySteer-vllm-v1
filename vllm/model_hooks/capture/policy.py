@@ -17,7 +17,7 @@ def normalize_capture_select(capture_select: dict | None) -> dict | None:
     mid-forward.
     """
     if capture_select is None:
-        return
+        return None
     from vllm.model_hooks.selection.spec import SelectSpec
 
     if not isinstance(capture_select, dict):

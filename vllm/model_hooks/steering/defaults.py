@@ -54,16 +54,19 @@ class DefaultSteeringState:
 
     @classmethod
     def snapshot(cls, spec: SteeringSpec | str, request: SteeringRequest):
-        if isinstance(spec, str):
-            spec = SteeringSpec.model_validate_json(spec)
+        resolved_spec = (
+            SteeringSpec.model_validate_json(spec) if isinstance(spec, str) else spec
+        )
         status = {
             "active": True,
-            "spec": spec.model_dump(
+            "spec": resolved_spec.model_dump(
                 mode="json", exclude={"vectors": {"__all__": {"data"}}}
             ),
         }
         payloads = []
-        for index, (vector, resolved) in enumerate(zip(spec.vectors, request.vectors)):
+        for index, (vector, resolved) in enumerate(
+            zip(resolved_spec.vectors, request.vectors)
+        ):
             if vector.data is not None:
                 payloads.append(
                     {

@@ -224,7 +224,7 @@ class MoERouterAlgorithm(BaseSteerVectorAlgorithm):
             logger.warning_once(
                 "moe_router: expert ids %s are outside [0, %d) for this "
                 "model and are ignored.",
-                sorted(set(invalid)),
+                str(sorted(set(invalid))),
                 n_experts,
             )
         activate_ids = [e for e in activate_ids if 0 <= e < n_experts]

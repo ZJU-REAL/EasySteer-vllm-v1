@@ -166,8 +166,8 @@ def _find_decoder_layers(
                 type(modules[name]).__name__,
             )
     records = [_layer_record(name, module, indices) for name, module in matches.items()]
-    seen = {}
-    seen_modules = {}
+    seen: dict[int, str] = {}
+    seen_modules: dict[int, str] = {}
     for layer in records:
         if layer.layer_id in seen:
             raise ValueError(

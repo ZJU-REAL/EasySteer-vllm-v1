@@ -16,7 +16,6 @@ strings in place of bytes so payloads can also travel as JSON (HTTP).
 algorithm's `_transform` consumes, on the target device and dtype.
 """
 
-import base64
 import copy
 import hashlib
 import json
@@ -24,6 +23,7 @@ import math
 from typing import Any
 
 import numpy as np
+import pybase64 as base64
 
 _WIRE_VERSION = 1
 
@@ -270,7 +270,7 @@ class RouterConfig(Payload):
     def __init__(self, layers: dict[int, dict[str, Any]]):
         if not layers:
             raise ValueError("RouterConfig requires at least one layer")
-        self.layers = {}
+        self.layers: dict[int, dict[str, Any]] = {}
         for layer, config in layers.items():
             layer = int(layer)
             if layer < 0:
@@ -469,6 +469,7 @@ def from_wire(wire: dict[str, Any]) -> Payload:
                 selected[layer] = value
         return selected
 
+    payload: Payload
     if kind == "direction":
         payload = DirectionVector(layers("layer."))
     elif kind == "concept_pair":
@@ -500,7 +501,7 @@ def validate_model_shape(wire: dict[str, Any], hidden_size: int) -> None:
     independent of the model width and may use padded full-graph storage.
     """
     kind = wire["kind"]
-    named_axes = {
+    named_axes: dict[str, dict[str, tuple[int, ...]]] = {
         "linear": {"weight": (0, 1), "bias": (0,)},
         "lowrank": {"projector1": (0,), "projector2": (0,)},
         "reft": {

@@ -62,6 +62,7 @@ class PayloadCache:
                 logger.info("Evicted steer payload: %s", evicted_key[:12])
         if broadcasts:
             # Per-layer dictionaries are private; their immutable tensors are shared.
+            assert target_layers is not None
             return {layer: dict(entry) for layer in target_layers}
         return entry
 

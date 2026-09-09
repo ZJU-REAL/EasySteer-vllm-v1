@@ -53,9 +53,9 @@ def resolve_source_path(path: str) -> str:
     parts = path.split("/")
     if os.path.isabs(path) or path.startswith(".") or len(parts) < 3:
         raise FileNotFoundError(f"Steering source not found: {path}")
-    from huggingface_hub import hf_hub_download
+    from vllm.transformers_utils.repo_utils import hf_api
 
-    return hf_hub_download(
+    return hf_api().hf_hub_download(
         repo_id="/".join(parts[:2]), filename="/".join(parts[2:]), revision="main"
     )
 
@@ -189,7 +189,9 @@ def resolve_vector_payload(
             payload = _router_payload(payload.layers, params)
         return payload.to_wire()
     if source is not None:
-        format = _SOURCE_FORMATS[ALGORITHM_CAPABILITIES[algorithm].payload_kind]
+        kind = ALGORITHM_CAPABILITIES[algorithm].payload_kind
+        assert kind is not None
+        format = _SOURCE_FORMATS[kind]
         return _load_file_wire(source, format, params)
     assert layers is not None  # Validated pure router-parameter input.
     return _router_payload({layer: params for layer in layers}, {}).to_wire()

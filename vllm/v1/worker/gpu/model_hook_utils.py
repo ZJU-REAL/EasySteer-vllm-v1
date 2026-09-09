@@ -10,14 +10,16 @@ import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_hooks.capture.graph import CaptureGraphState
 from vllm.model_hooks.selection.batch import BatchGeometry
+from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 if TYPE_CHECKING:
+    from vllm.v1.worker.capture_model_runner_mixin import CaptureModelRunnerMixin
     from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
-def release_capture_graph(runner: "GPUModelRunner") -> None:
+def release_capture_graph(runner: "CaptureModelRunnerMixin") -> None:
     """Release the native graph before its fixed output buffers."""
     runner.capture_graph_manager = None
     runner.capture_session.release_graph()
@@ -85,8 +87,8 @@ def _initialize_capture_graph(
         runner.vllm_config, runner.device, mode, runner.decode_query_len
     )
     # Capture outputs must never overlap the ordinary graph pool.
-    manager.pool = torch.cuda.graph_pool_handle()
-    allocated_before = torch.cuda.memory_allocated(runner.device)
+    manager.pool = current_platform.graph_pool_handle()
+    allocated_before = torch.accelerator.memory_allocated(runner.device)
     with state.record_outputs(runner.model):
         manager.capture(
             runner.model,
@@ -100,7 +102,7 @@ def _initialize_capture_graph(
             progress_bar_desc="Capturing activation extraction graphs",
         )
     state.allocation_bytes = max(
-        0, torch.cuda.memory_allocated(runner.device) - allocated_before
+        0, torch.accelerator.memory_allocated(runner.device) - allocated_before
     )
     return manager
 

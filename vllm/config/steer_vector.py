@@ -34,7 +34,7 @@ class SteerVectorConfig:
     the capacity wait for a slot; identical configurations share one.
     If None, resolves to min(256, max_num_seqs) at engine build."""
 
-    steer_vector_dtype: SteerVectorDType = "auto"
+    steer_vector_dtype: torch.dtype | SteerVectorDType = "auto"
     """Data type for steer vectors. If 'auto', will default to base model dtype."""
 
     require_preload: bool = False

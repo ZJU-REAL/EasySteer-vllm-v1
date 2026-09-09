@@ -19,10 +19,11 @@ from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.model_hooks.steering.defaults import SteeringRequestChoice
+from vllm.model_hooks.steering.defaults import SteeringChoice, SteeringRequestChoice
 from vllm.renderers import BaseRenderer, ChatParams, merge_kwargs
 from vllm.renderers.inputs.preprocess import (
     conversation_to_seq,
@@ -39,6 +40,7 @@ logger = init_logger(__name__)
 
 
 _P = TypeVar("_P", bound=SamplingParams | PoolingParams | None)
+_S = TypeVar("_S", bound=SteeringChoice | SteeringRequestChoice)
 _O = TypeVar(
     "_O",
     bound=RequestOutput | PoolingRequestOutput,
@@ -247,7 +249,7 @@ class OfflineInferenceMixin:
     ) -> Sequence[_P]:
         if isinstance(params, Sequence):
             if len(params) != num_requests:
-                raise ValueError(
+                raise VLLMValidationError(
                     f"The lengths of prompts ({num_requests}) "
                     f"and params ({len(params)}) must be the same."
                 )
@@ -263,7 +265,7 @@ class OfflineInferenceMixin:
     ) -> Sequence[LoRARequest | None]:
         if isinstance(lora_request, Sequence):
             if len(lora_request) != num_requests:
-                raise ValueError(
+                raise VLLMValidationError(
                     f"The lengths of prompts ({num_requests}) "
                     f"and lora_request ({len(lora_request)}) must be the same."
                 )
@@ -274,9 +276,9 @@ class OfflineInferenceMixin:
 
     def _steer_vector_request_to_seq(
         self,
-        steer_vector_request: SteeringRequestChoice | Sequence[SteeringRequestChoice],
+        steer_vector_request: _S | Sequence[_S],
         num_requests: int,
-    ) -> Sequence[SteeringRequestChoice]:
+    ) -> Sequence[_S]:
         if isinstance(steer_vector_request, Sequence):
             if len(steer_vector_request) != num_requests:
                 raise ValueError(
@@ -296,7 +298,7 @@ class OfflineInferenceMixin:
     ) -> Sequence[int]:
         if priority is not None:
             if len(priority) != num_requests:
-                raise ValueError(
+                raise VLLMValidationError(
                     f"The lengths of prompts ({num_requests}) "
                     f"and priority ({len(priority)}) must be the same."
                 )

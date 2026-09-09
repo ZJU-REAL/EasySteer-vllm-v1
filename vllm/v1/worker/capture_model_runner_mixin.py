@@ -10,16 +10,23 @@ separate capture graph with fixed outputs; other batches needing rows
 use the raw eager forward. Ordinary compiled artifacts omit capture hooks.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from torch import nn
 
 from vllm.model_hooks.capture.session import CaptureSession
 from vllm.v1.worker.gpu.model_hook_utils import release_capture_graph
 
+if TYPE_CHECKING:
+    from vllm.model_hooks.components.registry import ModelComponents
+    from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
+
 
 class CaptureModelRunnerMixin:
     """Capture model lifecycle and RPCs for the V2 GPU runner."""
+
+    capture_session: CaptureSession
+    capture_graph_manager: "ModelCudaGraphManager | None"
 
     def _capture_session(self) -> CaptureSession:
         if not hasattr(self, "capture_session"):
@@ -34,7 +41,9 @@ class CaptureModelRunnerMixin:
             session.detach()
             del self.capture_session
 
-    def _attach_capture_hooks(self, model: nn.Module, components) -> None:
+    def _attach_capture_hooks(
+        self, model: nn.Module, components: "ModelComponents"
+    ) -> None:
         """Attach capture hooks at model load, releasing any previous model.
 
         On compiled engines the hook bodies

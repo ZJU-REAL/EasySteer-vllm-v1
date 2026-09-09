@@ -124,6 +124,7 @@ class SteeringGraphState:
             # Admission validated the global model inventory. This PP stage may
             # own none of the request's target layers and needs no graph row.
             return
+        assert self.config.max_steer_vectors is not None
         assert 0 <= slot < self.config.max_steer_vectors
         row = slot + 1
         self.slot_controllers[slot] = [controller for controller, _ in targets]

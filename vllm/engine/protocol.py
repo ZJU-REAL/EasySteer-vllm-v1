@@ -64,6 +64,23 @@ class EngineClient(ABC):
     @abstractmethod
     def dead_error(self) -> BaseException: ...
 
+    def check_admission(  # noqa: B027
+        self, n: int = 1, request_id: str | None = None
+    ) -> None:
+        """Reject the request up front if it would exceed queue limits.
+
+        Called before a response is started so that overload rejections can
+        carry an HTTP status, which is not possible once a streaming response
+        has begun. Engines without admission control accept everything.
+
+        Args:
+            n: Number of sequences the request will occupy.
+            request_id: Request id, used for logging only.
+
+        Raises:
+            GracefulHTTPError: If the request cannot be admitted.
+        """
+
     @abstractmethod
     async def set_default_steering(self, spec: SteeringSpec | None) -> None:
         """Replace the frontend default used by future requests."""

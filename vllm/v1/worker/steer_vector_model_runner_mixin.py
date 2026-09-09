@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
+    import torch
+
     from vllm.config import VllmConfig
+    from vllm.model_hooks.components.registry import ModelComponents
+    from vllm.model_hooks.steering.worker_manager import WorkerSteeringState
 
 logger = init_logger(__name__)
 
@@ -19,35 +23,43 @@ class SteerVectorModelRunnerMixin:
     Every request carries its effective steering configuration.
     """
 
-    def _init_steer_vector_manager(self, vllm_config: "VllmConfig"):
+    device: "torch.device"
+    vllm_config: "VllmConfig"
+    steer_vector_manager: "WorkerSteeringState | None"
+
+    def _init_steer_vector_manager(self, vllm_config: "VllmConfig") -> None:
         from vllm.model_hooks.steering.worker_manager import WorkerSteeringState
 
+        config = vllm_config.steer_vector_config
+        assert config is not None
         self.steer_vector_manager = WorkerSteeringState(
-            device=self.device,  # type: ignore
-            steer_vector_config=vllm_config.steer_vector_config,  # type: ignore
+            device=self.device,
+            steer_vector_config=config,
             hidden_size=vllm_config.model_config.get_hidden_size(),
         )
-        default = vllm_config.steer_vector_config._default_request
+        default = config._default_request
         if default is not None:
             self.steer_vector_manager.preload_request(default)
         logger.info("Initialized SteerVector worker manager")
 
-    def _attach_steering_hooks(self, components) -> None:
+    def _attach_steering_hooks(self, components: "ModelComponents") -> None:
         """Attach steering to the discovered components after loading the model."""
         self._close_steering()
-        vllm_config = self.vllm_config  # type: ignore
+        vllm_config = self.vllm_config
         if vllm_config.steer_vector_config is not None:
             try:
                 self._init_steer_vector_manager(vllm_config)
+                manager = self.steer_vector_manager
+                assert manager is not None
                 logger.info("Attaching steering hooks")
                 if vllm_config.steer_vector_config.graph_mode == "in_graph":
                     # Tier-1 buffers must exist before compile/graph capture.
-                    self.steer_vector_manager.enable_graph_mode(
+                    manager.enable_graph_mode(
                         vllm_config.model_config.get_hidden_size(),
                         vllm_config.model_config.dtype,
                         vllm_config.scheduler_config.max_num_batched_tokens,
                     )
-                self.steer_vector_manager.attach_steering_hooks(components)
+                manager.attach_steering_hooks(components)
             except Exception:
                 self._close_steering()
                 raise

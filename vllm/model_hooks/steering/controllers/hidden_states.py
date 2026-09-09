@@ -104,6 +104,8 @@ class HiddenStatesController(SteeringController):
         only rank dimensions may be zero-padded into the table slot.
         """
         algo_cls = get_algorithm(algorithm)
+        assert self.normalize_flag is not None
+        assert self.graph_tables is not None
         self.normalize_flag[row] = 1.0 if normalize else 0.0
         family = algo_cls.graph_family
         if family is None:
@@ -140,6 +142,7 @@ class HiddenStatesController(SteeringController):
         """Persistent slot tables, including flags, for clear and rollback."""
         if not self.graph_tables:
             return ()
+        assert self.normalize_flag is not None
         return (
             self.normalize_flag,
             *(
@@ -175,6 +178,7 @@ class HiddenStatesController(SteeringController):
         )
 
         if self._graph_mode:
+            assert self.graph_tables is not None
             steered = apply_decoder_families(
                 self.graph_tables,
                 self.graph_mask,

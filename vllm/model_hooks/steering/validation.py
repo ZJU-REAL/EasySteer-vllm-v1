@@ -59,7 +59,7 @@ def request_position_groups(request) -> tuple[tuple, ...]:
     """Share conflict resolution only for identical ordered layer interventions."""
     from vllm.model_hooks.selection.runtime import clause_cache_key
 
-    layers: dict[tuple[str, int], list[tuple]] = {}
+    layers: dict[tuple[str, int], list[tuple | None]] = {}
     for vector in request.vectors:
         for layer in sorted(effective_layers(vector.payload, vector.target_layers)):
             target = (algorithm_target(vector.algorithm), layer)

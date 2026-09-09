@@ -84,6 +84,7 @@ class CaptureSession:
         # Retain cache-hit metadata even with no stream enabled. A stream
         # started later must check rows that were already skipped.
         self._cache_hits: dict[str, tuple[list[int], int]] = {}
+        self._unsupported_requests: set[str] = set()
         self._hook_handles: list = []
         self._hooked_layers: dict[str, set[int]] = {name: set() for name in COMPONENTS}
         self._attached = False
@@ -95,7 +96,13 @@ class CaptureSession:
     # Per-request selection overrides (runner admission/completion lifecycle)
     # ------------------------------------------------------------------
 
-    def add_request(self, req_id: str, capture_select: dict[str, dict]) -> None:
+    def add_request(
+        self,
+        req_id: str,
+        capture_select: dict[str, dict],
+        *,
+        capture_supported: bool = True,
+    ) -> None:
         """Register a request's selection override ({stream: wire}).
 
         Clause structure is validated at admission (input processor); a
@@ -103,6 +110,10 @@ class CaptureSession:
         and drop the override. Known overrides survive disabled streams and
         preemption; reductions ignore them while enabled.
         """
+        if capture_supported:
+            self._unsupported_requests.discard(req_id)
+        else:
+            self._unsupported_requests.add(req_id)
         accepted = {}
         for stream, wire in capture_select.items():
             store = self._streams.get(stream)
@@ -130,6 +141,7 @@ class CaptureSession:
         for req_id in req_ids:
             self._cache_hits.pop(req_id, None)
             self._request_selects.pop(req_id, None)
+        self._unsupported_requests.difference_update(req_ids)
         for store in self._streams.values():
             if store is not None:
                 store.finish_requests(req_ids)
@@ -230,14 +242,16 @@ class CaptureSession:
                 store = self._streams[stream]
                 if store is None or not store.wants_layer(_lid):
                     return
-                recording = self.graph_state is not None and self.graph_state.recording
+                graph_state = self.graph_state
+                recording = graph_state is not None and graph_state.recording
                 if not recording and store.remaining_rows(_lid) == 0:
                     return
                 tensor, tensor_owned = component.adapter.capture_rows(output)
                 if tensor is None:
                     return
                 if recording:
-                    self.graph_state.record(stream, _lid, tensor, _name)
+                    assert graph_state is not None
+                    graph_state.record(stream, _lid, tensor, _name)
                     return
                 rows, meta = prepare_rows(
                     tensor, store, _lid, stream, self._request_selects, tensor_owned
@@ -260,6 +274,7 @@ class CaptureSession:
         self._streams = dict.fromkeys(COMPONENTS)
         self._request_selects.clear()
         self._cache_hits.clear()
+        self._unsupported_requests.clear()
         for layers in self._hooked_layers.values():
             layers.clear()
 
@@ -311,13 +326,23 @@ class CaptureSession:
 
     def prepare_batch(self, geometry: "BatchGeometry") -> None:
         """Account for full layers even when this batch uses ordinary graphs."""
+        unsupported = (
+            {
+                req_id: "Capture does not support requests with prompt embeddings"
+                for req_id in geometry.req_ids
+                if req_id in self._unsupported_requests
+            }
+            if self._unsupported_requests
+            else {}
+        )
         for stream, store in self._streams.items():
             if store is None:
                 continue
+            store.fail_requests(unsupported)
             # Completion cleanup can arrive one scheduler batch later. Check
             # only requests actually scheduled after this stream started.
             for req_id in geometry.req_ids:
-                if req_id in store._captured_requests:
+                if req_id in unsupported or req_id in store._captured_requests:
                     continue
                 hit = self._cache_hits.get(req_id)
                 if hit is not None:
@@ -353,6 +378,8 @@ class CaptureSession:
             ):
                 continue
             for i, req_id in enumerate(req_ids):
+                if req_id in self._unsupported_requests:
+                    continue
                 select = store.config.select
                 if store.config.reduce == "all":
                     select = self._request_selects.get(req_id, {}).get(stream, select)

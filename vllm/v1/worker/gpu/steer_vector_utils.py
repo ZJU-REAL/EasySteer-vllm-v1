@@ -107,7 +107,7 @@ def resolve_slot_positions(
 
         for clause in clauses:
             key = clause_cache_key(clause)
-            if key is None or (slot, key) in resolved:
+            if clause is None or key is None or (slot, key) in resolved:
                 continue
             if selects_all_tokens(clause):
                 pos_np = tok_idx

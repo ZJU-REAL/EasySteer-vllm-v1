@@ -110,6 +110,7 @@ class RouterLogitsController(SteeringController):
         """Write a lowered router intervention, validating expert width once."""
         params = get_algorithm(algorithm).graph_lower(payload, scale)
         tables = self.graph_tables
+        assert tables is not None
         num_experts = tables["activate"].shape[1]
         mode = params["mode"]
         soft = mode in ("soft", "soft_topk")
@@ -120,7 +121,7 @@ class RouterLogitsController(SteeringController):
             logger.warning_once(
                 "moe_router: expert ids %s are outside [0, %d) for this "
                 "model and are ignored.",
-                sorted(set(invalid)),
+                str(sorted(set(invalid))),
                 num_experts,
             )
         if mode == "soft_topk" and params["topk"] > num_experts:
@@ -162,6 +163,9 @@ class RouterLogitsController(SteeringController):
         if logits is None:
             return None
         if self._graph_mode:
+            assert self.graph_tables is not None
+            assert self.graph_mask is not None
+            assert self.graph_token_rows is not None
             apply_gate_intervention(
                 self.graph_tables,
                 self.graph_mask,

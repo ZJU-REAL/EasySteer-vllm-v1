@@ -152,6 +152,7 @@ class WorkerSteeringState:
             return entry.slot
 
         capacity = self.steer_vector_config.max_steer_vectors
+        assert capacity is not None
         if len(self._config_slots) >= capacity:
             # The scheduler defers requests when all slots are taken
             # (concurrent distinct configurations are a scheduling
@@ -302,6 +303,7 @@ class WorkerSteeringState:
                 width = self.payload_cache.hidden_size
             else:
                 width = controller.output_width
+            assert controller.layer_id is not None
             info.setdefault(controller.component_id, {})[controller.layer_id] = width
         return info
 

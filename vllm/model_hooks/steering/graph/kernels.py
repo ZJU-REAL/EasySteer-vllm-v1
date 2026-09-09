@@ -33,7 +33,7 @@ GRAPH_FAMILIES: dict[str, dict[str, tuple[str, ...]]] = {
 
 # Families whose delta is not neutralized by a zero table row carry
 # their own per-token mask; all others share "graph_mask".
-GRAPH_FAMILY_MASKS: dict[str, str] = {"replace": "replace_mask"}
+GRAPH_FAMILY_MASKS: dict[str | None, str] = {"replace": "replace_mask"}
 
 
 def graph_family_mask_attr(family: str | None) -> str:
@@ -139,8 +139,8 @@ def apply_decoder_families(
     tables: dict[str, dict[str, torch.Tensor]],
     graph_mask: torch.Tensor | None,
     replace_mask: torch.Tensor | None,
-    normalize_flag: torch.Tensor,
-    token_rows: torch.Tensor,
+    normalize_flag: torch.Tensor | None,
+    token_rows: torch.Tensor | None,
     hidden_states: torch.Tensor,
     residual: torch.Tensor | None,
 ) -> torch.Tensor:
@@ -163,6 +163,8 @@ def apply_decoder_families(
     """
     if not tables:
         return hidden_states
+    assert normalize_flag is not None
+    assert token_rows is not None
     if len(tables) == 1 and "additive" in tables and hidden_states.is_cuda:
         assert graph_mask is not None
         return _apply_additive(
