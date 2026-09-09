@@ -26,7 +26,7 @@ from vllm.v1.utils import ConstantList
 
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
-    from vllm.steer_vectors.request import SteerVectorRequest
+    from vllm.model_hooks.steering.request import SteeringRequest
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 
@@ -70,7 +70,7 @@ class Request:
         prompt_is_token_ids: list[bool] | None = None,
         mm_features: list[MultiModalFeatureSpec] | None = None,
         lora_request: "LoRARequest | None" = None,
-        steer_vector_request: "SteerVectorRequest | None" = None,
+        steer_vector_request: "SteeringRequest | None" = None,
         cache_salt: str | None = None,
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
@@ -89,13 +89,11 @@ class Request:
         self.pooling_params = pooling_params
         self.lora_request = lora_request
         self.steer_vector_request = steer_vector_request
-        # Scheduler-side slot identity: requests with equal fingerprints
-        # share one steering slot (the same keying the worker uses), so
-        # the max_steer_vectors constraint counts fingerprints. Computed
-        # once here — it stats vector files.
+        # Shared configuration identity for scheduler slots and prefix-cache
+        # keys, computed once from the admitted payload snapshot.
         self.steer_fingerprint: str | None = None
         if steer_vector_request is not None:
-            from vllm.steer_vectors.worker_manager import config_fingerprint
+            from vllm.model_hooks.steering.request import config_fingerprint
 
             self.steer_fingerprint = config_fingerprint(steer_vector_request)
         self.capture_select = capture_select

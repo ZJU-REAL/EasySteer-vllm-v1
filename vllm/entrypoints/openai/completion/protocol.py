@@ -23,8 +23,8 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
-from vllm.steer_vectors.api import SteeringSpec
 from vllm.logprobs import Logprob
+from vllm.model_hooks.steering.api import SteeringSpec
 from vllm.renderers import TokenizeParams
 from vllm.sampling_params import (
     BeamSearchParams,
@@ -230,14 +230,14 @@ class CompletionRequest(OpenAIBaseModel):
         ),
     )
 
-    steering: "SteeringSpec | None" = Field(
+    steering: "SteeringSpec | Literal[False] | None" = Field(
         default=None,
         description=(
-            "Steering configuration (v2 API) applied to this request. "
+            "Steering configuration for this request. Omit or null to inherit "
+            "the default; false disables steering; an object overrides it. "
             "Requires the server to be started with --enable-steer-vector."
         ),
     )
-
 
     repetition_detection: RepetitionDetectionParams | None = Field(
         default=None,

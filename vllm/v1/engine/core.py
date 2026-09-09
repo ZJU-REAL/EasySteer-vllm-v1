@@ -33,7 +33,6 @@ from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import MultiModalCacheMissError
-from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -231,19 +230,6 @@ class EngineCore:
             self.request_block_hasher = get_request_block_hasher(
                 hash_block_size, caching_hash_fn
             )
-
-            # Server-level steering steers every request without a
-            # per-request config; salt all block hashes with the server
-            # config's identity (see steer_vectors.cache_salt).
-            steer_config = vllm_config.steer_vector_config
-            if steer_config is not None and steer_config.has_server_config:
-                from vllm.steer_vectors.cache_salt import set_server_steer_salt
-                from vllm.steer_vectors.request import build_server_request
-                from vllm.steer_vectors.worker_manager import config_fingerprint
-
-                set_server_steer_salt(
-                    config_fingerprint(build_server_request(steer_config))
-                )
 
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
@@ -952,12 +938,6 @@ class EngineCore:
 
     def pin_lora(self, lora_id: int) -> bool:
         return self.model_executor.pin_lora(lora_id)
-
-    def add_steer_vector(self, steer_vector_request: SteerVectorRequest) -> bool:
-        return self.model_executor.add_steer_vector(steer_vector_request)
-
-    def remove_steer_vector(self, steer_vector_id: int) -> bool:
-        return self.model_executor.remove_steer_vector(steer_vector_id)
 
     def save_sharded_state(
         self,

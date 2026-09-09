@@ -2031,9 +2031,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
     ),
     # Test-only escape hatch: allow steer_graph_mode='in_graph' on a
-    # non-compiled engine so the in-graph steering kernel path can be
-    # byte-golden validated under eager execution (the only
-    # cross-boot-deterministic mode). Not for production use.
+    # non-compiled engine so tests can compare the steering kernels
+    # directly under eager execution. Not for production use.
     "VLLM_STEER_EAGER_IN_GRAPH": lambda: bool(
         int(os.getenv("VLLM_STEER_EAGER_IN_GRAPH", "0"))
     ),

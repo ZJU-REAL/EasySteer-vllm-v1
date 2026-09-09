@@ -52,7 +52,6 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
@@ -1224,25 +1223,30 @@ class Worker(WorkerBase):
     def pin_lora(self, lora_id: int) -> bool:
         return self.model_runner.pin_lora(lora_id)
 
-    def add_steer_vector(self, steer_vector_request: SteerVectorRequest) -> bool:
-        return self.model_runner.add_steer_vector(steer_vector_request)
+    def preload_steer_vectors(self, payloads: list[dict]) -> bool:
+        return self.model_runner.preload_steer_vectors(payloads)
 
-    def preload_steer_vectors(
-        self, paths: list[str], algorithm: str = "direct"
-    ) -> bool:
-        return self.model_runner.preload_steer_vectors(paths, algorithm)
-
-    def remove_steer_vector(self, steer_vector_id: int) -> bool:
-        return self.model_runner.remove_steer_vector(steer_vector_id)
+    def get_steering_model_info(self) -> dict:
+        manager = self.model_runner.steer_vector_manager
+        return manager.model_info() if manager is not None else {}
 
     def list_steer_vectors(self) -> set[int]:
         return self.model_runner.list_steer_vectors()
 
     # Capture stream RPCs
+    def _check_capture_compatible(self) -> None:
+        if not self.use_v2_model_runner:
+            raise RuntimeError(
+                "Capture requires the V2 model runner. Set "
+                "VLLM_USE_V2_MODEL_RUNNER=1 before creating the engine."
+            )
+
     def start_capture(self, stream: str, **config_kwargs) -> bool:
+        self._check_capture_compatible()
         return self.model_runner.start_capture(stream, **config_kwargs)
 
     def stop_capture(self, stream: str) -> bool:
+        self._check_capture_compatible()
         return self.model_runner.stop_capture(stream)
 
     def fetch_captured(
@@ -1252,14 +1256,17 @@ class Worker(WorkerBase):
         layers: list[int] | None = None,
         req_ids: list[str] | None = None,
     ) -> dict:
+        self._check_capture_compatible()
         return self.model_runner.fetch_captured(
             stream, clear=clear, layers=layers, req_ids=req_ids
         )
 
     def clear_captured(self, stream: str) -> bool:
+        self._check_capture_compatible()
         return self.model_runner.clear_captured(stream)
 
     def capture_status(self, stream: str) -> dict:
+        self._check_capture_compatible()
         return self.model_runner.capture_status(stream)
 
     def check_health(self) -> None:

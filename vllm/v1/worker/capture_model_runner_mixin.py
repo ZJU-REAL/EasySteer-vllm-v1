@@ -1,67 +1,53 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-runner mixin exposing hook-based capture (hidden states, MoE
 router logits) over collective_rpc.
 
-The capture mechanism lives in vllm.capture.session.CaptureSession;
+The capture mechanism lives in vllm.model_hooks.capture.session.CaptureSession;
 this mixin owns one session per worker, attaches its hooks at model
-load, and exposes stream lifecycle RPCs. Capture works on any engine:
-while a stream is enabled the runner dispatches batches to the raw
-eager forward (skip_compiled), where the hooks run natively; compiled
-artifacts and CUDA graphs carry no capture code.
+load, and exposes stream lifecycle RPCs. Eligible FULL batches use a
+separate capture graph with fixed outputs; other batches needing rows
+use the raw eager forward. Ordinary compiled artifacts omit capture hooks.
 """
 
 from typing import Any
 
 from torch import nn
 
-from vllm.capture.session import CaptureSession
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
+from vllm.model_hooks.capture.session import CaptureSession
+from vllm.v1.worker.gpu.model_hook_utils import release_capture_graph
 
 
 class CaptureModelRunnerMixin:
-    """Capture support for the GPU model runner (V1 and V2)."""
+    """Capture model lifecycle and RPCs for the V2 GPU runner."""
 
     def _capture_session(self) -> CaptureSession:
         if not hasattr(self, "capture_session"):
             self.capture_session = CaptureSession()
+            self.capture_graph_manager = None
         return self.capture_session
 
-    def _check_capture_compatible(self) -> None:
-        """Reject capture on engines where it would be silently incomplete.
+    def _detach_capture_hooks(self) -> None:
+        session = getattr(self, "capture_session", None)
+        if session is not None:
+            release_capture_graph(self)
+            session.detach()
+            del self.capture_session
 
-        Prefix caching needs no engine-level restriction: cache-hit
-        tokens are never recomputed, so capture requests carry a unique
-        cache_salt (full recompute, no hits), and unsalted requests that
-        do hit the cache while capture is enabled are flagged at
-        admission and fail explicitly at fetch.
-        """
-        vllm_config = self.vllm_config
-        if not vllm_config.use_v2_model_runner:
-            raise RuntimeError(
-                "Capture requires the V2 model runner (the V1 runner "
-                "provides degraded batch geometry: no prompt lengths, no "
-                "request identity on its graph path). Set "
-                "VLLM_USE_V2_MODEL_RUNNER=1 — architectures outside the "
-                "default-V2 list either work or fail explicitly at "
-                "engine build."
-            )
+    def _attach_capture_hooks(self, model: nn.Module, components) -> None:
+        """Attach capture hooks at model load, releasing any previous model.
 
-    def _attach_capture_hooks(self, model: nn.Module) -> nn.Module:
-        """Attach capture hooks (once, at load). Model tree is untouched.
-
-        Attached on every engine: on compiled engines the hook bodies
+        On compiled engines the hook bodies
         trace to nothing (torch.compiler.is_compiling guard), so
-        compiled artifacts and CUDA graphs carry no capture code;
-        capture-active batches are dispatched to the raw eager forward
-        (skip_compiled), where the hooks run natively.
+        ordinary compiled artifacts carry no capture code. Capture
+        graphs record a separate raw forward into fixed output buffers;
+        other capture-active batches use raw eager execution.
 
         Must run after the steering hooks are registered so gate-hook
         ordering makes captured router logits post-steering.
         """
-        self._capture_session().attach(model)
-        return model
+        self._detach_capture_hooks()
+        self._capture_session().attach(model, components)
 
     # ------------------------------------------------------------------
     # Stream API
@@ -70,12 +56,11 @@ class CaptureModelRunnerMixin:
     def start_capture(self, stream: str, **config_kwargs) -> bool:
         """Enable a capture stream ('hidden_states' or 'router_logits').
 
-        config_kwargs: layers (list|None), dtype (e.g. 'float16'),
-        select (SelectSpec wire dict — the shared where-clause language,
-        see vllm.steer_vectors.SelectSpec.to_wire()), reduce
-        ('all'|'last'|'mean'), budget_rows (int|None).
+        Args:
+            stream: Component name, such as 'hidden_states' or 'router_logits'.
+            **config_kwargs: StreamConfig options: layers, dtype, select,
+                reduce, and budget_rows. Select uses SelectSpec.to_wire().
         """
-        self._check_capture_compatible()
         self._capture_session().enable_stream(stream, **config_kwargs)
         return True
 
@@ -107,4 +92,6 @@ class CaptureModelRunnerMixin:
         return True
 
     def capture_status(self, stream: str) -> dict[str, Any]:
-        return self._capture_session().stream_status(stream)
+        status = self._capture_session().stream_status(stream)
+        status["graph_ready"] = self.capture_graph_manager is not None
+        return status

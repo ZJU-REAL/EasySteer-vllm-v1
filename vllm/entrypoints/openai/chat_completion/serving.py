@@ -333,6 +333,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     request_id=sub_request_id,
                     params=sampling_params,
                     lora_request=lora_request,
+                    steer_vector_request=steer_vector_request,
                     trace_headers=trace_headers,
                     session_id=session_id,
                 )

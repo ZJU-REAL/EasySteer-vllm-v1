@@ -515,7 +515,7 @@ def _gen_steer_vector_extra_hash_keys(
 ) -> list[Any]:
     """Generate steering-related extra keys for block hash computation.
 
-    The key is the steering config fingerprint (vector file + version,
+    The key is the steering config fingerprint (payload content,
     scale, triggers, algorithm parameters) — the exact identity of what
     steering does to hidden states — so KV blocks are only shared
     between requests whose steering is identical. The request's prompt
@@ -528,16 +528,10 @@ def _gen_steer_vector_extra_hash_keys(
     svr = request.steer_vector_request
     if not svr:
         return []
-    fingerprint = getattr(request, "_steer_config_fingerprint", None)
-    if fingerprint is None:
-        from vllm.steer_vectors.worker_manager import config_fingerprint
 
-        fingerprint = config_fingerprint(svr)
-        request._steer_config_fingerprint = fingerprint
+    from vllm.model_hooks.steering.request import is_prompt_length_sensitive
 
-    from vllm.steer_vectors.request import is_prompt_length_sensitive
-
-    keys: list[Any] = [fingerprint]
+    keys: list[Any] = [request.steer_fingerprint]
     prompt_len = request.num_prompt_tokens
     if is_prompt_length_sensitive(svr, prompt_len) or end_token_idx > prompt_len:
         keys.append(("steer_prompt_len", prompt_len))
@@ -594,11 +588,6 @@ def generate_block_hash_extra_keys(
     steer_vector_extra_keys: list[Any] = _gen_steer_vector_extra_hash_keys(
         request, start_token_idx, end_token_idx
     )
-    from vllm.steer_vectors.cache_salt import get_server_steer_salt
-
-    server_salt = get_server_steer_salt()
-    if server_salt is not None:
-        steer_vector_extra_keys.append(("steer_server", server_salt))
     cache_salt_keys: list[str] = (
         [request.cache_salt] if (start_token_idx == 0 and request.cache_salt) else []
     )

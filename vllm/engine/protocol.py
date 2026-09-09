@@ -13,8 +13,9 @@ from vllm.distributed.weight_transfer.base import (
 )
 from vllm.inputs import EngineInput, PromptType
 from vllm.lora.request import LoRARequest
+from vllm.model_hooks.steering.api import SteeringSpec
+from vllm.model_hooks.steering.defaults import SteeringRequestChoice
 from vllm.outputs import PoolingRequestOutput, RequestOutput
-from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
@@ -64,6 +65,28 @@ class EngineClient(ABC):
     def dead_error(self) -> BaseException: ...
 
     @abstractmethod
+    async def set_default_steering(self, spec: SteeringSpec | None) -> None:
+        """Replace the frontend default used by future requests."""
+        ...
+
+    @abstractmethod
+    def get_default_steering(self) -> dict:
+        """Return the default authoring configuration and active status."""
+        ...
+
+    @abstractmethod
+    async def preload_steer_vectors(
+        self, paths: list[str], algorithm: str = "direct", params: dict | None = None
+    ) -> None:
+        """Resolve and preload source payloads on every worker."""
+        ...
+
+    @abstractmethod
+    def list_preloaded_steer_vectors(self) -> list[str]:
+        """Return source paths registered by successful preloads."""
+        ...
+
+    @abstractmethod
     def generate(
         self,
         prompt: EngineCoreRequest
@@ -75,7 +98,7 @@ class EngineClient(ABC):
         *,
         prompt_text: str | None = None,
         lora_request: LoRARequest | None = None,
-        steer_vector_request: SteerVectorRequest | None = None,
+        steer_vector_request: SteeringRequestChoice = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,

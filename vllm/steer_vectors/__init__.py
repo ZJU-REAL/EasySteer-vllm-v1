@@ -1,56 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Public steering specifications and payload types."""
 
-"""Steer Vectors for vLLM V1.
+from importlib import import_module
 
-This module provides runtime intervention capabilities for LLMs through
-steer vectors, allowing dynamic control over model behavior.
-"""
+_EXPORTS = {
+    "ApplySpec": "api",
+    "SelectSpec": "api",
+    "VectorSpec": "api",
+    "SteeringSpec": "api",
+    "to_engine_request": "api",
+    "Payload": "payloads",
+    "DirectionVector": "payloads",
+    "LinearMap": "payloads",
+    "LowRankProjector": "payloads",
+    "ReftIntervention": "payloads",
+    "ConceptPair": "payloads",
+    "RouterConfig": "payloads",
+}
+__all__ = list(_EXPORTS)
 
-from vllm.steer_vectors.api import (
-    ApplySpec,
-    SelectSpec,
-    SteeringSpec,
-    VectorSpec,
-    to_engine_request,
-)
-from vllm.steer_vectors.payloads import (
-    ConceptPair,
-    DirectionVector,
-    LinearMap,
-    LowRankProjector,
-    ReftIntervention,
-)
-from vllm.steer_vectors.controllers import DecoderSteerController
-from vllm.steer_vectors.controller_manager import (
-    LoadedSteerVector,
-    SteerControllerManager,
-    create_steer_controller_manager,
-)
-from vllm.steer_vectors.request import SteerVectorRequest, VectorConfig
-from vllm.steer_vectors.worker_manager import WorkerSteerVectorManager
 
-__all__ = [
-    # v2 user-facing API
-    "ApplySpec",
-    "SelectSpec",
-    "SteeringSpec",
-    "VectorSpec",
-    "to_engine_request",
-    # In-memory payloads (VectorSpec.data)
-    "ConceptPair",
-    "DirectionVector",
-    "LinearMap",
-    "LowRankProjector",
-    "ReftIntervention",
-    # Layers
-    "DecoderSteerController",
-    # Models
-    "LoadedSteerVector",
-    "SteerControllerManager",
-    "create_steer_controller_manager",
-    # Internal engine request structs (produced by to_engine_request)
-    "SteerVectorRequest",
-    "VectorConfig",
-    # Worker Manager
-    "WorkerSteerVectorManager",
-]
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(f"vllm.model_hooks.steering.{_EXPORTS[name]}"), name)
+    globals()[name] = value
+    return value

@@ -39,9 +39,9 @@ from vllm.entrypoints.openai.engine.protocol import (
     validate_structured_outputs_structural_tag,
 )
 from vllm.exceptions import VLLMValidationError
-from vllm.steer_vectors.api import SteeringSpec
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
+from vllm.model_hooks.steering.api import SteeringSpec
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
 from vllm.sampling_params import (
     BeamSearchParams,
@@ -498,14 +498,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
 
-    steering: "SteeringSpec | None" = Field(
+    steering: "SteeringSpec | Literal[False] | None" = Field(
         default=None,
         description=(
-            "Steering configuration (v2 API) applied to this request. "
+            "Steering configuration for this request. Omit or null to inherit "
+            "the default; false disables steering; an object overrides it. "
             "Requires the server to be started with --enable-steer-vector."
         ),
     )
-
 
     repetition_detection: RepetitionDetectionParams | None = Field(
         default=None,

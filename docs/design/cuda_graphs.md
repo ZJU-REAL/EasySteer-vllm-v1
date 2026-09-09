@@ -231,116 +231,60 @@ Long term, we've added the ability to partition the graph in Inductor instead of
 
 ## Steering Vectors and CUDA Graphs
 
-By default, enabling steering vectors (`--enable-steer-vector`) disables CUDA
-graphs because conditional steering (per-token trigger matching) uses
-data-dependent operations (`torch.isin`, `index_select`) incompatible with
-static graphs.
+Steering uses the declared workload to select its graph integration. Enabling
+`--enable-steer-vector` does not disable CUDA graphs, chunked prefill, or prefix
+caching. The same `SteeringSpec` API is used for eager execution and both steering
+graph tiers:
 
-### Server-level steering (recommended)
+* **`in_graph`** keeps steering inside captured graphs. Configurations are stored in
+  persistent slot tables; per-token row indices select the request's payload and
+  application mask. It supports single-vector configurations of graph-capable
+  algorithms, subject to their payload conditions.
+* **`split`** runs steering between compiled graph segments. It supports all
+  registered algorithms and multi-vector composition with piecewise CUDA graphs.
 
-The simplest way to use steering with CUDA graphs is **server-level steering**:
-configure the steering vector at server startup so every request is steered
-identically.  The vector loads *before* CUDA graph capture, so graphs record
-the steered forward path.
+The default `--steer-graph-mode auto` selects the tier from `--steer-algorithms`,
+`--steer-multi-vector`, and any engine-default spec, and logs its reason. A concrete
+engine-default spec uses the same payload checks as request admission. A
+names-only declaration selects split when any declared algorithm has payload
+restrictions, such as a rank limit or a split-only variant. For example:
 
 ```bash
 vllm serve Qwen/Qwen2.5-1.5B-Instruct \
-  --steer-vector-path vectors/happy.gguf \
-  --steer-scale 4.0 \
-  --steer-target-layers 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 \
-  --steer-normalize
+  --enable-steer-vector --steer-algorithms direct
 ```
 
-`--steer-vector-path` implies `--enable-steer-vector` and
-`--steer-allow-cuda-graphs`.  Requests need no `steer_vector_request` — steering
-is applied server-side.  Per-request `steer_vector_request` is **rejected** to
-prevent silent config conflicts.
+Requests then carry the current `steering` JSON field. Token- and position-specific
+selectors are supported; they do not require disabling graphs. Explicit
+`--steer-graph-mode in_graph` requires compiled execution and validates each spec
+against the supported graph families. Use `split` for algorithms or compositions
+that need it, or `--enforce-eager` for ordinary eager execution.
 
-#### Runtime reconfiguration
+`moe_router` uses the gate-logit component and persistent expert tables.
+Its `activate`, `deactivate`, `soft`, and `soft_topk` modes support `in_graph`
+with either file-backed or inline configs. Both forms are resolved before
+admission and use the same per-layer payloads on the worker. `soft_random`
+requires split execution, so a names-only `moe_router` declaration selects split
+under auto; an explicit in-graph engine admits the four supported modes.
 
-The `scale` can be changed at runtime via the admin endpoint:
+Engine-default steering is configured with `--steering-config spec.json`, where the
+file contains a complete `SteeringSpec`. `POST /v1/steering` replaces the complete
+spec with a body of `{"spec": ...}` and resets the prefix cache. Updates may change
+vectors, scales and layers within the engine's declared workload and graph
+capabilities; they are not limited to changing the scale. There is no `DELETE`
+endpoint or empty-spec clearing operation.
 
-```bash
-# Change scale
-curl -X POST http://localhost:8017/v1/steering \
-  -d '{"scale": 2.0}'
+Activation capture leaves ordinary graphs unchanged. Steps without selected
+capture rows keep their normal dispatch. Selected steps can use a separate FULL
+graph on a single worker, without speculative decoding or LoRA, when steering
+is disabled or `in_graph` and the batch is eligible for FULL replay. Other
+capture steps execute eagerly. The capture graph writes fixed GPU buffers;
+selection, reduction and storage happen after replay. Its stream/layer variant
+is reused across selector, reduction and output-dtype changes.
 
-# Disable steering (scale=0 is a no-op)
-curl -X POST http://localhost:8017/v1/steering \
-  -d '{"scale": 0.0}'
-
-# Check current config
-curl http://localhost:8017/v1/steering
-```
-
-Only `scale` changes are supported without CUDA graph re-capture.  Structural
-changes (different vector path, layers, algorithm) require a server restart.
-
-### Per-request steering with CUDA graphs (advanced)
-
-If your workload only uses **global triggers** (`prefill_trigger_tokens=[-1]`,
-`generate_trigger_tokens=[-1]`), you can re-enable CUDA graphs for ~2.6x speedup
-without server-level steering:
-
-    --enable-steer-vector --steer-allow-cuda-graphs
-
-The global trigger path (`is_global_only_config()` fast path in `template.py`)
-applies a static tensor transformation to all tokens, which is CUDA-graph safe.
-Requests with non-global triggers will error loudly if sent while CUDA graphs
-are active.
-
-### How it works (and common pitfalls)
-
-Both `--steer-vector-path` and `--steer-allow-cuda-graphs` make **three**
-coupled config changes:
-
-1. Keeps `enforce_eager=False` (so CUDA graphs remain possible)
-2. Sets `CompilationMode.NONE` (disables `torch.compile`)
-3. Sets `CUDAGraphMode.FULL_DECODE_ONLY` (only full graphs, no piecewise)
-
-All three are necessary. The steering layer wrappers call
-`.algorithms.update()` during forward, which mutates module state. This is
-incompatible with `torch.compile` (causes `InternalTorchDynamoError` during
-graph tracing). Disabling compilation also means piecewise CUDA graphs are
-unavailable, so only `FULL_DECODE_ONLY` works (full graph capture for decode
-batches, eager for prefill/mixed).
-
-For server-level steering, the vector is loaded during model initialization
-(in `_wrap_model_with_steer_vectors()`) before any CUDA graph capture.
-The `AlgorithmTemplate.set_steer_vector()` uses an in-place buffer strategy
-so that runtime scale changes via `POST /v1/steering` can `copy_()` into the
-same tensor address without invalidating captured graphs.
-
-!!! tip "Run the verification script before experiments"
-    Before running any experiments that depend on steering correctness,
-    verify your model/hardware combination:
-
-        CUDA_VISIBLE_DEVICES=0 python scripts/verify_steering_correctness.py \
-            --model Qwen/Qwen2.5-1.5B-Instruct \
-            --vector vectors/happy_diffmean.gguf \
-            --target-layers 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25
-
-    This checks: (1) disabling chunked prefill is safe, (2) scale=0 steering
-    is transparent, (3) CUDA graphs match eager mode, (4) steering actually
-    changes output.  All four must pass.
-
-!!! danger "Chunked prefill and prefix caching MUST be disabled with steering"
-    When steering is enabled, `enable_chunked_prefill` and
-    `enable_prefix_caching` are automatically forced to `False`.
-    Chunked prefill is not supported by the steering wrappers.
-    Prefix caching keys on `steer_vector_name` but NOT on `scale` —
-    reusing KV states across different scales silently disables steering.
-    This caused a real data-invalidation bug (commit `9b999cb`).  The
-    vLLM config validation now enforces this automatically, but you should
-    still set the flags explicitly for clarity.
-
-!!! success "Greedy decoding is bit-identical between eager and CUDA graph modes"
-    With server-level steering and the mandatory settings (chunked prefill
-    and prefix caching disabled), eager and CUDA graph modes produce
-    **identical logprobs** (diff = 0.000000) at `temperature=0`.  Earlier
-    observations of divergence were caused by prefix caching silently
-    reusing KV states across different steering scales (fixed in commit
-    `9b999cb`), not by float precision differences in CUDA graph capture.
+See [Steer Vectors](../features/steer_vectors.md) for the algorithm capability table,
+current CLI arguments and HTTP examples, and [Steer Vectors design](steer_vectors.md)
+for the slot tables, trigger routing, cache fingerprints and capture interaction.
 
 ## About the Performance
 

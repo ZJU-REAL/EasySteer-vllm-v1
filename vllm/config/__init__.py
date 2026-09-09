@@ -26,7 +26,6 @@ from vllm.config.model import (
     str_dtype_to_torch_dtype,
     try_match_architecture_defaults,
 )
-from vllm.config.steer_vector import SteerVectorConfig
 from vllm.config.multimodal import MultiModalConfig
 from vllm.config.observability import ObservabilityConfig
 from vllm.config.offload import (
@@ -42,6 +41,7 @@ from vllm.config.reasoning import ReasoningConfig
 from vllm.config.scheduler import SchedulerConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.speech_to_text import SpeechToTextConfig, SpeechToTextParams
+from vllm.config.steer_vector import SteerVectorConfig
 from vllm.config.structured_outputs import StructuredOutputsConfig
 from vllm.config.utils import (
     ConfigType,

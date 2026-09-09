@@ -17,6 +17,15 @@ from vllm.inputs import (
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_hooks.capture.policy import (
+    CaptureRequestPolicy,
+    normalize_capture_select,
+)
+from vllm.model_hooks.steering.defaults import (
+    DefaultSteeringState,
+    SteeringRequestChoice,
+)
+from vllm.model_hooks.steering.request import SteeringRequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -25,7 +34,6 @@ from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer, renderer_from_config
 from vllm.sampling_params import SamplingParams
-from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.tasks import GENERATION_TASKS, POOLING_TASKS, SupportedTask
 from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
@@ -50,6 +58,25 @@ class InputProcessor:
         # Vector paths preloaded into the workers' steering stores
         # (frontend mirror for the require_preload check).
         self._steer_preloaded_paths: set[str] = set()
+        self._steer_preloaded_payloads: set[tuple[str, str]] = set()
+        self._default_steering = DefaultSteeringState()
+        self._steering_model_info: dict | None = None
+        steer_config = vllm_config.steer_vector_config
+        if steer_config is not None and steer_config.has_default_config:
+            from vllm.model_hooks.steering.defaults import build_default_request
+
+            request = build_default_request(steer_config)
+            for vector in request.vectors:
+                self.note_steer_vectors_preloaded(
+                    [vector.payload],
+                    vector.algorithm,
+                    [vector.source],
+                )
+            self._validate_steer_vector(request)
+            self._default_steering = DefaultSteeringState.snapshot(
+                steer_config.steering_config, request
+            )
+        self.capture_policy = CaptureRequestPolicy()
         self.lora_config = vllm_config.lora_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
@@ -179,106 +206,97 @@ class InputProcessor:
                 "[lora_path]` to use the LoRA tokenizer."
             )
 
-    def note_steer_vectors_preloaded(self, paths: list[str]) -> None:
-        """Record vector paths preloaded into the workers' stores (used by
-        the require_preload frontend check)."""
-        self._steer_preloaded_paths.update(paths)
+    def note_steer_vectors_preloaded(
+        self, payloads: list[dict], algorithm: str, paths: list[str]
+    ) -> None:
+        """Track exact preloaded content, not merely a mutable source path."""
+        self._steer_preloaded_paths.update(path for path in paths if path)
+        self._steer_preloaded_payloads.update(
+            (algorithm, payload["sha256"]) for payload in payloads
+        )
 
-    def _validate_capture_select(self, capture_select: dict | None) -> None:
-        """Reject malformed per-request capture selections at admission.
+    def set_default_steering(self, spec) -> None:
+        """Replace the default for future requests after full admission validation."""
+        from vllm.model_hooks.steering.api import SteeringSpec, to_engine_request
 
-        Shape: {stream_name: SelectSpec wire dict}. Validating here
-        gives the client a clean error instead of a worker-side failure
-        mid-forward.
-        """
-        if capture_select is None:
-            return
-        from vllm.steer_vectors.api import SelectSpec
-
-        if not isinstance(capture_select, dict):
+        if self.vllm_config.steer_vector_config is None:
+            raise VLLMValidationError("SteerVector is not enabled!")
+        if self.vllm_config.parallel_config._api_process_count > 1:
             raise VLLMValidationError(
-                "capture_select must be {stream_name: SelectSpec wire dict}"
+                "Runtime default steering updates require --api-server-count=1; "
+                "use per-request steering with multiple API processes."
             )
-        for stream, wire in capture_select.items():
-            if not isinstance(wire, dict):
-                raise VLLMValidationError(
-                    f"capture_select[{stream!r}] must be a SelectSpec "
-                    "wire dict (SelectSpec.to_wire())"
-                )
-            try:
-                SelectSpec.from_wire(wire)
-            except (ValueError, TypeError) as exc:
-                raise VLLMValidationError(
-                    f"Invalid capture_select[{stream!r}]: {exc}"
-                ) from exc
+        state = DefaultSteeringState()
+        if spec is not None:
+            if not isinstance(spec, SteeringSpec):
+                raise TypeError("default steering must be a SteeringSpec or None")
+            spec = spec.model_copy(deep=True)
+            request = to_engine_request(spec)
+            self._validate_steer_vector(request)
+            state = DefaultSteeringState.snapshot(spec, request)
+        self._default_steering = state
+
+    def get_default_steering(self) -> dict:
+        """Return the authoring configuration without serialized weight payloads."""
+        return self._default_steering.status()
+
+    def set_steering_model_info(self, workers: list[dict]) -> None:
+        from vllm.model_hooks.steering.validation import merge_model_info
+
+        self._steering_model_info = merge_model_info(workers)
+        self._validate_steer_vector(self._default_steering.resolve(None))
+
+    def prepare_steering_preload(
+        self, paths: list[str], algorithm: str, params: dict | None
+    ) -> list[dict]:
+        """Prepare all payloads before either frontend sends a worker RPC."""
+        from vllm.model_hooks.steering.loading import prepare_preload
+
+        if self.vllm_config.steer_vector_config is None:
+            raise VLLMValidationError("SteerVector is not enabled!")
+        try:
+            return prepare_preload(
+                paths,
+                algorithm,
+                params,
+                hidden_size=self.model_config.get_hidden_size(),
+            )
+        except (ValueError, TypeError, OSError) as exc:
+            raise VLLMValidationError(f"Invalid steering source: {exc}") from exc
+
+    def resolve_steering_request(
+        self, request: SteeringRequestChoice
+    ) -> SteeringRequest | None:
+        return self._default_steering.resolve(request)
+
+    def freeze_steering_request(self, request: SteeringRequestChoice):
+        """Resolve before an async boundary; False preserves an unsteered snapshot."""
+        return self.resolve_steering_request(request) or False
 
     def _validate_steer_vector(
-        self, steer_vector_request: SteerVectorRequest | None
+        self, steer_vector_request: SteeringRequest | None
     ) -> None:
         if steer_vector_request is None:
             return
 
         if not self.vllm_config.steer_vector_config:
             raise VLLMValidationError(
-                f"Got steer_vector_request {steer_vector_request} "
-                "but SteerVector is not enabled!"
+                "Got a steering request but SteerVector is not enabled!"
             )
 
-        if self.vllm_config.steer_vector_config.require_preload:
-            if steer_vector_request.is_multi_vector:
-                paths = [vc.path for vc in steer_vector_request.vector_configs]
-            elif steer_vector_request.local_path:
-                paths = [steer_vector_request.local_path]
-            else:
-                paths = []
-            missing = [p for p in paths if p not in self._steer_preloaded_paths]
-            if missing:
-                raise VLLMValidationError(
-                    f"steer_require_preload is set and these vectors are "
-                    f"not preloaded: {missing}. Preload them via "
-                    f"LLM.preload_steer_vectors([...]) or "
-                    f"POST /v1/steering/vectors."
-                )
+        from vllm.model_hooks.steering.validation import validate_request_admission
 
-        # The workload declaration is the serving contract on every
-        # engine: undeclared algorithms are rejected regardless of the
-        # graph mode, so behavior does not depend on the resolved tier.
-        cfg = self.vllm_config.steer_vector_config
-        if cfg.algorithms != "all":
-            if steer_vector_request.is_multi_vector:
-                used = sorted(
-                    {vc.algorithm for vc in steer_vector_request.vector_configs}
-                )
-            else:
-                used = [steer_vector_request.algorithm]
-            undeclared = sorted(set(used) - set(cfg.algorithms or []))
-            if undeclared:
-                raise VLLMValidationError(
-                    f"steering algorithm(s) {undeclared} were not "
-                    f"declared at launch (declared: {cfg.algorithms}). "
-                    f"Add them to steer_algorithms and restart the "
-                    f"engine."
-                )
-            if steer_vector_request.is_multi_vector and not cfg.multi_vector:
-                raise VLLMValidationError(
-                    "multi-vector steering was not declared at launch; "
-                    "start the engine with steer_multi_vector=True."
-                )
-
-        # Reject non-graph-safe configs at the frontend so a bad request
-        # errors instead of reaching (and killing) the engine core.
-        if self.vllm_config.steer_vector_config.graph_mode == "in_graph":
-            from vllm.steer_vectors.graph_support import (
-                graph_reject_message,
-                graph_request_problem,
-            )
-
-            problem = graph_request_problem(
+        try:
+            validate_request_admission(
                 steer_vector_request,
-                self.vllm_config.steer_vector_config.graph_max_rank,
+                self.vllm_config.steer_vector_config,
+                hidden_size=self.model_config.get_hidden_size(),
+                model_info=self._steering_model_info,
+                preloaded_payloads=self._steer_preloaded_payloads,
+                has_kv_transfer=self.vllm_config.kv_transfer_config is not None,
             )
-            if problem is not None:
-                raise VLLMValidationError(graph_reject_message(problem))
+        except ValueError as exc:
+            raise VLLMValidationError(str(exc)) from exc
 
     def _get_mm_identifier(
         self,
@@ -365,7 +383,7 @@ class InputProcessor:
         supported_tasks: tuple[SupportedTask, ...],
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
-        steer_vector_request: SteerVectorRequest | None = None,
+        steer_vector_request: SteeringRequestChoice = None,
         capture_select: dict | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
@@ -374,10 +392,11 @@ class InputProcessor:
         resumable: bool = False,
         session_id: str | None = None,
     ) -> EngineCoreRequest:
+        steer_vector_request = self.resolve_steering_request(steer_vector_request)
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
         self._validate_steer_vector(steer_vector_request)
-        self._validate_capture_select(capture_select)
+        capture_select = normalize_capture_select(capture_select)
 
         parallel_config = self.vllm_config.parallel_config
         dp_size = parallel_config.data_parallel_size
@@ -436,6 +455,8 @@ class InputProcessor:
         if isinstance(params, SamplingParams):
             # TODO: can we avoid cloning here in multiproc case?
             sampling_params = params.clone()
+            if self.capture_policy.skip_prefix_read(prompt_token_ids, capture_select):
+                sampling_params.skip_reading_prefix_cache = True
             # If unset max tokens, then generate up to the max_model_len.
             if sampling_params.max_tokens is None:
                 seq_len = length_from_prompt_token_ids_or_embeds(
@@ -491,7 +512,13 @@ class InputProcessor:
                 )
 
         if steer_vector_request is not None and prompt_token_ids is not None:
-            from vllm.steer_vectors.request import warn_clamped_prompt_positions
+            from vllm.model_hooks.steering.request import warn_clamped_prompt_positions
+            from vllm.model_hooks.steering.validation import validate_prompt_conflicts
+
+            try:
+                validate_prompt_conflicts(steer_vector_request, prompt_token_ids)
+            except ValueError as exc:
+                raise VLLMValidationError(str(exc)) from exc
 
             warn_clamped_prompt_positions(
                 steer_vector_request, len(prompt_token_ids), request_id

@@ -563,7 +563,7 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
-        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        self.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -768,8 +768,21 @@ class KVCacheManager:
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
         """
-        if self.enable_caching:
-            self.coordinator.cache_blocks(request, num_computed_tokens)
+        if not self.enable_caching:
+            return
+        steering = request.steer_vector_request
+        if (
+            steering is not None
+            and steering.conflict_resolution == "error"
+            and len(steering.vectors) > 1
+        ):
+            # A token-dependent conflict is detected on the worker, after
+            # allocation would already publish these blocks to other requests.
+            # Do not publish this request's speculative result. Delaying until
+            # output processing is unsafe for mutable Mamba tails when async
+            # scheduling has already advanced the next forward.
+            return
+        self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]

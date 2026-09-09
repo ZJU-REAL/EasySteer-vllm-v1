@@ -11,6 +11,11 @@ from vllm import RequestOutput, TextPrompt, TokensPrompt
 from vllm.entrypoints.offline_utils import OfflineInferenceMixin
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_hooks.steering.defaults import (
+    SteeringChoice,
+    require_unsteered_beam,
+    resolve_steering_choice,
+)
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import (
     BeamSearchParams,
@@ -62,6 +67,7 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
         lora_request: list[LoRARequest] | LoRARequest | None = None,
         use_tqdm: bool = False,
         concurrency_limit: int | None = None,
+        steering: Sequence[SteeringChoice] | SteeringChoice = None,
     ) -> list[BeamSearchOutput]:
         """
         Generate sequences using beam search.
@@ -74,7 +80,16 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
             use_tqdm: Whether to use tqdm to display the progress bar.
             concurrency_limit: The maximum number of concurrent requests.
                 If None, the number of concurrent requests is unlimited.
+            steering: Pass False to disable an active default. Steering
+                interventions are not supported by beam search.
         """
+        choices = self._steer_vector_request_to_seq(steering, len(prompts))
+        for choice in choices:
+            snapshot = self.llm_engine.input_processor.freeze_steering_request(
+                resolve_steering_choice(choice)
+            )
+            require_unsteered_beam(snapshot)
+
         # TODO: how does beam search work together with length penalty,
         # frequency, penalty, and stopping criteria, etc.?
         beam_width = params.beam_width
@@ -271,6 +286,7 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
             params=active_params,
             output_type=RequestOutput,
             lora_requests=[beam.lora_request for beam in active_beams],
+            steer_vector_requests=[False] * len(active_beams),
             use_tqdm=False,
         )
 

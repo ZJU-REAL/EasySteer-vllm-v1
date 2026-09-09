@@ -11,6 +11,10 @@ from vllm import CompletionOutput, RequestOutput
 from vllm.engine.protocol import EngineClient
 from vllm.inputs import EngineInput
 from vllm.lora.request import LoRARequest
+from vllm.model_hooks.steering.defaults import (
+    SteeringRequestChoice,
+    require_unsteered_beam,
+)
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils import random_uuid
@@ -33,7 +37,12 @@ class BeamSearchOnlineMixin(ABC):
         lora_request: LoRARequest | None = None,
         trace_headers: Mapping[str, str] | None = None,
         session_id: str | None = None,
+        steer_vector_request: SteeringRequestChoice = None,
     ) -> AsyncGenerator[RequestOutput, None]:
+        snapshot = self.engine_client.input_processor.freeze_steering_request(
+            steer_vector_request
+        )
+        require_unsteered_beam(snapshot)
         beam_width = params.beam_width
         max_tokens = params.max_tokens
         ignore_eos = params.ignore_eos
@@ -90,6 +99,7 @@ class BeamSearchOnlineMixin(ABC):
                             sampling_params,
                             request_id_item,
                             lora_request=lora_request_item,
+                            steer_vector_request=False,
                             trace_headers=trace_headers,
                             session_id=session_id,
                         )

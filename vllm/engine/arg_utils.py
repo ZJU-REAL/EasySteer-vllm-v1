@@ -103,6 +103,7 @@ from vllm.config.parallel import (
     ExpertPlacementStrategy,
 )
 from vllm.config.scheduler import SchedulerPolicy
+from vllm.config.steer_vector import SteerVectorConfig
 from vllm.config.utils import get_field
 from vllm.config.vllm import OptimizationLevel, PerformanceMode
 from vllm.logger import init_logger, suppress_logging
@@ -617,14 +618,14 @@ class EngineArgs:
     enable_moe_shared_loras: bool = LoRAConfig.enable_moe_shared_loras
     # Steer Vector fields
     enable_steer_vector: bool = False
-    steer_algorithms: list[str] | str | None = None
-    steer_multi_vector: bool = False
-    max_steer_vectors: int | None = None
-    steer_vector_dtype: str = "auto"
-    steer_graph_mode: str = "auto"
-    steer_graph_max_rank: int = 32
-    steer_require_preload: bool = False
-    steering_config: str | None = None
+    steer_algorithms: list[str] | str | None = SteerVectorConfig.algorithms
+    steer_multi_vector: bool = SteerVectorConfig.multi_vector
+    max_steer_vectors: int | None = SteerVectorConfig.max_steer_vectors
+    steer_vector_dtype: str = SteerVectorConfig.steer_vector_dtype
+    steer_graph_mode: str = SteerVectorConfig.graph_mode
+    steer_graph_max_rank: int = SteerVectorConfig.graph_max_rank
+    steer_require_preload: bool = SteerVectorConfig.require_preload
+    steering_config: str | None = SteerVectorConfig.steering_config
 
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
@@ -1452,9 +1453,10 @@ class EngineArgs:
         )
 
         # Steer Vector related configs
+        steer_kwargs = get_kwargs(SteerVectorConfig)
         steer_vector_group = parser.add_argument_group(
             title="SteerVectorConfig",
-            description="Configuration for steer vector support.",
+            description=SteerVectorConfig.__doc__,
         )
         steer_vector_group.add_argument(
             "--enable-steer-vector",
@@ -1462,83 +1464,33 @@ class EngineArgs:
             help="If True, enable handling of steer vector adapters.",
         )
         steer_vector_group.add_argument(
-            "--max-steer-vectors",
-            type=int,
-            default=EngineArgs.max_steer_vectors,
-            help=(
-                "Slot capacity: maximum distinct steering "
-                "configurations live at once (a scheduling constraint "
-                "like max_loras; identical configurations share a "
-                "slot). Default: min(256, max_num_seqs)."
-            ),
+            "--max-steer-vectors", **steer_kwargs["max_steer_vectors"]
         )
         steer_vector_group.add_argument(
-            "--steer-algorithms",
-            type=str,
-            default=None,
-            help=(
-                "The steering workload declaration: comma-separated "
-                "algorithm names requests will use (e.g. "
-                "'direct,lm_steer'), or 'all' to allow every algorithm "
-                "(runs in split graph mode). Required when steering is "
-                "enabled without --steering-config. Requests using "
-                "undeclared algorithms are rejected."
-            ),
+            "--steer-vector-dtype", **steer_kwargs["steer_vector_dtype"]
+        )
+        # Preserve the existing single comma-separated value, including 'all'.
+        steer_kwargs["algorithms"].pop("nargs", None)
+        steer_kwargs["algorithms"]["type"] = str
+        steer_vector_group.add_argument(
+            "--steer-algorithms", **steer_kwargs["algorithms"]
         )
         steer_vector_group.add_argument(
-            "--steer-multi-vector",
-            action="store_true",
-            default=EngineArgs.steer_multi_vector,
-            help=(
-                "Declare that requests may carry multi-vector steering "
-                "configs (resolves auto graph mode to 'split')."
-            ),
+            "--steer-multi-vector", **steer_kwargs["multi_vector"]
         )
         steer_vector_group.add_argument(
             "--steer-graph-mode",
-            type=str,
             choices=["auto", "split", "in_graph"],
-            default=EngineArgs.steer_graph_mode,
-            help=(
-                "Expert override for the steering graph tier: "
-                "'in_graph' (steering runs inside full CUDA graphs; "
-                "graph-safe workloads only, requires compiled "
-                "execution), 'split' (all algorithms; the compiled "
-                "graph is partitioned at steered layers), or 'auto' "
-                "(default: resolved conservatively from "
-                "--steer-algorithms)."
-            ),
+            **steer_kwargs["graph_mode"],
         )
         steer_vector_group.add_argument(
-            "--steer-graph-max-rank",
-            type=int,
-            default=EngineArgs.steer_graph_max_rank,
-            help=(
-                "Rank capacity of the full-graph low-rank steering buffers "
-                "(loreft/lm_steer); higher-rank payloads are rejected under "
-                "steer-graph-mode=full."
-            ),
+            "--steer-graph-max-rank", **steer_kwargs["graph_max_rank"]
         )
         steer_vector_group.add_argument(
-            "--steer-require-preload",
-            action=argparse.BooleanOptionalAction,
-            help=(
-                "Reject per-request steering configs whose vectors were not "
-                "explicitly preloaded, instead of lazily loading from disk "
-                "at request admission."
-            ),
+            "--steer-require-preload", **steer_kwargs["require_preload"]
         )
         steer_vector_group.add_argument(
-            "--steering-config",
-            type=str,
-            default=None,
-            help=(
-                "Engine-default steering (v2 API): a SteeringSpec as inline "
-                "JSON or a path to a JSON file. Every request is steered "
-                "with this config and per-request steering is rejected; "
-                "replace it at runtime via POST /v1/steering. Implies "
-                "--enable-steer-vector."
-            ),
+            "--steering-config", **steer_kwargs["steering_config"]
         )
         # Observability arguments
         observability_kwargs = get_kwargs(ObservabilityConfig)
@@ -2469,8 +2421,6 @@ class EngineArgs:
             )
 
         # Steer Vector configuration
-        from vllm.config.steer_vector import SteerVectorConfig
-
         # An engine-default steering config implies --enable-steer-vector
         enable_steer = self.enable_steer_vector or self.steering_config is not None
         steer_vector_config = (

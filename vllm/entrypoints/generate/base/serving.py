@@ -29,6 +29,7 @@ from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob, PromptLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.model_hooks.steering.defaults import SteeringRequestChoice
 from vllm.tokenizers import TokenizerLike
 from vllm.tracing import (
     contains_trace_headers,
@@ -155,34 +156,24 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
     def _maybe_get_steer_vector(
         self,
         request: AnyRequest,
-    ) -> "SteerVectorRequest | None":
-        """Resolve the API request's `steering` spec into an engine
-        SteerVectorRequest. Returns None when no steering is requested.
-
-        Raises ValueError if per-request steering is rejected because
-        engine-default steering is active (callers already catch
-        ValueError).
-        """
-        from vllm.steer_vectors.api import SteeringSpec, to_engine_request
-
-        spec: SteeringSpec | None = getattr(request, "steering", None)
-        if spec is None:
-            return None
-
-        steer_vector_config = getattr(
-            self.engine_client.vllm_config, "steer_vector_config", None
+    ) -> SteeringRequestChoice:
+        """Freeze the HTTP request's effective steering before scheduling its work."""
+        from vllm.exceptions import VLLMValidationError
+        from vllm.model_hooks.steering.defaults import (
+            require_unsteered_beam,
+            resolve_steering_choice,
         )
-        if (
-            steer_vector_config is not None
-            and steer_vector_config.has_server_config
-        ):
-            raise ValueError(
-                "Per-request steering is not allowed when engine-default "
-                "steering is active (--steering-config). Use POST "
-                "/v1/steering to change the engine steering config."
-            )
 
-        return to_engine_request(spec)
+        try:
+            choice = resolve_steering_choice(getattr(request, "steering", None))
+            snapshot = self.engine_client.input_processor.freeze_steering_request(
+                choice
+            )
+            if getattr(request, "use_beam_search", False):
+                require_unsteered_beam(snapshot)
+            return snapshot
+        except (ValueError, TypeError, OSError) as exc:
+            raise VLLMValidationError(f"Invalid steering: {exc}") from exc
 
     def create_streaming_error_response(
         self,

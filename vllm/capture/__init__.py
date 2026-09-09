@@ -1,33 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-"""
-Capture of intermediate model state for vLLM.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Public capture selection and labelled result API."""
 
-Hook-based capture of decoder-layer hidden states and MoE router logits
-(see vllm.capture.session.CaptureSession). Worker-side RPCs live in
-vllm.v1.worker.capture_model_runner_mixin.
-"""
+from importlib import import_module
 
-from vllm.capture.serde import (
-    CaptureMeta,
-    deserialize_captured,
-    match_capture_request_id,
-)
-from vllm.capture.session import (
-    HIDDEN_STATES,
-    ROUTER_LOGITS,
-    CaptureSession,
-)
-from vllm.capture.store import StreamConfig, StreamStore
+_EXPORTS = {
+    "SelectSpec": "vllm.model_hooks.selection.spec",
+    "HIDDEN_STATES": "vllm.model_hooks.components.registry",
+    "ROUTER_LOGITS": "vllm.model_hooks.components.registry",
+    "CaptureMeta": "vllm.model_hooks.capture.serialization",
+    "deserialize_captured": "vllm.model_hooks.capture.serialization",
+    "match_capture_request_id": "vllm.model_hooks.capture.serialization",
+    "CaptureSession": "vllm.model_hooks.capture.session",
+    "StreamConfig": "vllm.model_hooks.capture.store",
+    "StreamStore": "vllm.model_hooks.capture.store",
+}
+__all__ = list(_EXPORTS)
 
-__all__ = [
-    "HIDDEN_STATES",
-    "ROUTER_LOGITS",
-    "CaptureSession",
-    "StreamConfig",
-    "StreamStore",
-    "CaptureMeta",
-    "deserialize_captured",
-    "match_capture_request_id",
-]
 
-__version__ = "2.0.0"
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(_EXPORTS[name]), name)
+    globals()[name] = value
+    return value

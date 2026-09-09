@@ -83,13 +83,11 @@ class Scheduler(SchedulerInterface):
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.steer_vector_config = vllm_config.steer_vector_config
-        # Steering slots available to per-request configs: the
-        # engine-default config, if any, permanently occupies one.
-        self.num_steer_slots = 0
-        if self.steer_vector_config:
-            self.num_steer_slots = self.steer_vector_config.max_steer_vectors - (
-                1 if self.steer_vector_config.has_server_config else 0
-            )
+        self.num_steer_slots = (
+            self.steer_vector_config.max_steer_vectors
+            if self.steer_vector_config
+            else 0
+        )
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
@@ -839,8 +837,7 @@ class Scheduler(SchedulerInterface):
                     and request.steer_vector_request
                     and (
                         len(scheduled_steer_vectors) >= self.num_steer_slots
-                        and request.steer_fingerprint
-                        not in scheduled_steer_vectors
+                        and request.steer_fingerprint not in scheduled_steer_vectors
                     )
                 ):
                     # Scheduling would exceed steering slot capacity:
@@ -1855,6 +1852,8 @@ class Scheduler(SchedulerInterface):
                     output_is_stale = True
                     request.num_stale_output_tokens -= num_tokens_scheduled
                     assert request.num_stale_output_tokens >= 0
+            if req_id in model_runner_output.steering_errors:
+                continue
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
                 continue
@@ -2086,6 +2085,7 @@ class Scheduler(SchedulerInterface):
             self.skipped_waiting.remove_requests(stopped_preempted_reqs)
 
         error_req_ids = set(self.grammar_compile_error_reqs)
+        error_req_ids.update(model_runner_output.steering_errors)
         self.grammar_compile_error_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             error_req_ids.update(failed_kv_load_req_ids)
@@ -2100,6 +2100,9 @@ class Scheduler(SchedulerInterface):
                         request_id=request.request_id,
                         new_token_ids=[],
                         finish_reason=request.get_finished_reason(),
+                        stop_reason=model_runner_output.steering_errors.get(
+                            request.request_id
+                        ),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
                     )

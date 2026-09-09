@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 if TYPE_CHECKING:
-    import numpy as np
+    from vllm.model_hooks.selection.batch import BatchGeometry
 
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
@@ -132,66 +132,6 @@ class DPMetadata:
 
 
 @dataclass
-class BatchGeometry:
-    """Per-step batch geometry consumed by steering triggers and capture.
-
-    All arrays are in batch order, aligned with query_start_loc
-    segments. Built once per step from the runner's InputBatch (see
-    vllm.v1.worker.gpu.steer_vector_utils.build_batch_geometry) — the
-    single source of truth replacing per-layer attention-metadata
-    parsing.
-    """
-
-    query_start_loc: torch.Tensor
-    """(num_samples + 1,) cumulative token counts per sample."""
-    num_computed: torch.Tensor
-    """(num_samples,) cached/computed tokens per request (prefix offset)."""
-    num_prompt: torch.Tensor
-    """(num_samples,) prompt length per request (negative positions,
-    chunked-prefill-stable)."""
-    num_output: torch.Tensor
-    """(num_samples,) tokens generated so far (0 while prefilling; also
-    classifies prompt vs generation phase)."""
-    req_ids: list[str]
-    """Engine-internal request id per sample (capture row labels)."""
-    token_ids: torch.Tensor
-    """(total_tokens,) flat input token ids of the unpadded batch."""
-    query_start_loc_cpu: "np.ndarray | None" = None
-    """(num_samples + 1,) host copy of query_start_loc, for host-side
-    trigger resolution (see resolve_slot_positions)."""
-
-    def token_ids_cpu(self) -> "np.ndarray":
-        """Host copy of `token_ids`, fetched once per step on first use.
-
-        Only token-id filters need the ids host-side; the copy (a device
-        sync) is paid once per step, never per clause.
-        """
-        cached = getattr(self, "_token_ids_cpu", None)
-        if cached is None:
-            cached = self.token_ids.cpu().numpy()
-            self._token_ids_cpu = cached
-        return cached
-
-    def samples_info(self) -> dict[str, torch.Tensor]:
-        """The trigger collector's samples_info view of this geometry.
-
-        Consumers index the per-sample tensors with GPU sample ids, so
-        everything is moved to query_start_loc's device once here.
-        """
-        device = self.query_start_loc.device
-        num_computed = self.num_computed.to(device, non_blocking=True)
-        num_output = self.num_output.to(device, non_blocking=True)
-        num_prompt = self.num_prompt.to(device, non_blocking=True)
-        return {
-            "query_start_loc": self.query_start_loc,
-            "num_computed": num_computed,
-            "is_decode_mask": num_output > 0,
-            "num_output_tokens": num_output,
-            "num_prompt_tokens": num_prompt,
-        }
-
-
-@dataclass
 class ForwardContext:
     # copy from vllm_config.compilation_config.static_forward_context
     no_compile_layers: dict[str, Any]
@@ -216,22 +156,17 @@ class ForwardContext:
     batch_geometry: "BatchGeometry | None" = None
     """Per-step batch geometry for steering triggers and capture.
     One cohesive object (see BatchGeometry) built once per step by the
-    V2 runner's steering/capture kwargs builder; backend-agnostic, so
+    V2 runner; backend-agnostic, so
     consumers never parse per-layer attention metadata.
-    """
-
-    steer_token_slots: torch.Tensor | None = None
-    """Per-request steering routing: [total_tokens] config slot id for each
-    batch token (-1 = unsteered). None when no per-request configs are live.
     """
 
     steer_active_slots: list[int] | None = None
     """Config slots present in the current batch, for layer-side iteration."""
 
     steer_slot_positions: dict[tuple, torch.Tensor | None] | None = None
-    """(slot, clause_cache_key) -> steered token positions for this step,
-    resolved once by the runner and shared by every layer hook (clauses
-    are layer-invariant). None value = clause matched nothing this step;
+    """(slot, intervention_group, index) -> steered token positions for this step,
+    resolved once by the runner and shared by hooks with the same ordered
+    interventions. None value = intervention matched nothing this step;
     missing key = resolver/hook drift (layer hooks raise).
     """
 
@@ -306,7 +241,6 @@ def create_forward_context(
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
     batch_geometry: "BatchGeometry | None" = None,
-    steer_token_slots: torch.Tensor | None = None,
     steer_active_slots: list[int] | None = None,
     steer_slot_positions: dict[tuple, torch.Tensor | None] | None = None,
 ):
@@ -328,7 +262,6 @@ def create_forward_context(
         additional_kwargs=additional_kwargs or {},
         is_padding=is_padding,
         batch_geometry=batch_geometry,
-        steer_token_slots=steer_token_slots,
         steer_active_slots=steer_active_slots,
         steer_slot_positions=steer_slot_positions,
     )
@@ -362,7 +295,6 @@ def set_forward_context(
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
     batch_geometry: "BatchGeometry | None" = None,
-    steer_token_slots: torch.Tensor | None = None,
     steer_active_slots: list[int] | None = None,
     steer_slot_positions: dict[tuple, torch.Tensor | None] | None = None,
 ):
@@ -435,7 +367,6 @@ def set_forward_context(
         skip_compiled,
         is_padding=is_padding,
         batch_geometry=batch_geometry,
-        steer_token_slots=steer_token_slots,
         steer_active_slots=steer_active_slots,
         steer_slot_positions=steer_slot_positions,
     )

@@ -124,6 +124,10 @@ from vllm.v1.worker.gpu.lora_utils import (
 )
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
+from vllm.v1.worker.gpu.model_hook_utils import (
+    build_batch_geometry,
+    prepare_capture_graph,
+)
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
@@ -147,10 +151,8 @@ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.steer_vector_utils import (
-    SteerVectorState,
-    build_batch_geometry,
     fill_graph_steer_buffers,
-    make_steer_vector_forward_kwargs,
+    make_steering_forward_kwargs,
 )
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -319,7 +321,6 @@ class GPUModelRunner(
 
         # LoRA-related workers.
         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
-        self.steer_vector_state = SteerVectorState()
         self.lora_capture_cases = [0]
         if self.lora_config:
             self.lora_capture_cases = get_lora_capture_cases(
@@ -379,13 +380,12 @@ class GPUModelRunner(
                 self.model = self.load_lora_model(
                     self.model, self.vllm_config, self.device
                 )
-            # Wrap model with steer vector support if enabled
-            # (hook-based; the model tree is untouched).
-            self.model = self._wrap_model_with_steer_vectors(self.model)
-            # Attach capture hooks (hidden states / router logits);
-            # after the steering wrap so captured logits are
-            # post-steering. Capture-active batches dispatch eagerly.
-            self.model = self._attach_capture_hooks(self.model)
+            from vllm.model_hooks.components.registry import discover_components
+
+            components = discover_components(self.model)
+            self._attach_steering_hooks(components)
+            # Capture observes the outputs after steering has run.
+            self._attach_capture_hooks(self.model, components)
 
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
@@ -948,14 +948,15 @@ class GPUModelRunner(
         if self.prompt_logprobs_worker is not None:
             self.prompt_logprobs_worker.remove_request(req_id)
         self.lora_state.remove_request(req_id)
-        self.steer_vector_state.remove_request(req_id, self.steer_vector_manager)
-        capture_session = getattr(self, "capture_session", None)
-        if capture_session is not None:
-            capture_session.remove_request(req_id)
+        if self.steer_vector_manager is not None:
+            self.steer_vector_manager.release_config(req_id)
         return True
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
         finished_req_ids = scheduler_output.finished_req_ids
+        capture_session = getattr(self, "capture_session", None)
+        if capture_session is not None:
+            capture_session.finish_requests(finished_req_ids)
         if self.pooling_runner is not None:
             # Preempted docs keep their query-use reservation until rescheduled.
             self.pooling_runner.on_requests_finished(finished_req_ids)
@@ -983,7 +984,6 @@ class GPUModelRunner(
             assert new_req_data.prompt_token_ids is not None
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
-            known_req = req_id in self.req_states.req_id_to_index
 
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
@@ -1020,20 +1020,24 @@ class GPUModelRunner(
                 req_index, new_req_data.block_ids, overwrite=True
             )
             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
-            self.steer_vector_state.add_request(
-                req_id,
-                new_req_data.steer_vector_request,
-                self.steer_vector_manager,
-            )
-            if new_req_data.capture_select is not None:
-                self._capture_session().add_request(req_id, new_req_data.capture_select)
-            if not known_req and new_req_data.num_computed_tokens > 0:
-                capture_session = getattr(self, "capture_session", None)
-                if capture_session is not None and capture_session.any_enabled():
-                    # Prefix-cache hit (or remote KV): the skipped prompt
-                    # head is never recomputed locally, so its rows cannot
-                    # be captured for this request.
-                    capture_session.mark_cache_elided(req_id)
+            if new_req_data.steer_vector_request is not None:
+                if self.steer_vector_manager is None:
+                    raise RuntimeError(
+                        "Request carries steering but worker has no manager"
+                    )
+                self.steer_vector_manager.acquire_config(
+                    req_id, new_req_data.steer_vector_request
+                )
+            capture_session = self._capture_session()
+            capture_session.add_request(req_id, new_req_data.capture_select or {})
+            if new_req_data.num_computed_tokens > 0:
+                # Prefix-cache hit (or remote KV): the skipped prompt head
+                # is never recomputed locally, so its rows cannot be captured.
+                capture_session.mark_cache_elided(
+                    req_id,
+                    new_req_data.prompt_token_ids,
+                    new_req_data.num_computed_tokens,
+                )
 
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
                 assert self.sampler is not None
@@ -1488,6 +1492,8 @@ class GPUModelRunner(
             )
 
         skip_compiled = False
+        dispatch_manager = self.cudagraph_manager
+        capture_graph = None
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             # Encoder-decoder models such as Whisper should run eager/non-compiled
             # when encoder inputs are scheduled, because this step updates
@@ -1496,14 +1502,34 @@ class GPUModelRunner(
         if not dummy_run and not skip_compiled:
             capture_session = getattr(self, "capture_session", None)
             if capture_session is not None and capture_session.any_enabled():
-                # Capture-active batches run the raw eager forward: the
-                # capture hooks are traced out of compiled artifacts, so
-                # compiled or graph-replayed execution would silently
-                # skip them. Idle batches keep the normal dispatch.
-                skip_compiled = True
+                assert batch_req_state is not None
+                # Hooks are absent from compiled artifacts. Only batches whose
+                # effective selections may contain rows need raw eager forward.
+                skip_compiled = capture_session.needs_capture_for_batch(
+                    batch_req_state.req_ids,
+                    self.req_states.num_computed_tokens_np[
+                        batch_req_state.idx_mapping_np
+                    ],
+                    batch_req_state.num_scheduled_tokens,
+                    self.req_states.prompt_len.np[batch_req_state.idx_mapping_np],
+                    batch_req_state.is_prefilling_np,
+                )
+                if skip_compiled and not is_profile:
+                    # Capture warmup precedes staging of this batch's inputs.
+                    capture_graph = prepare_capture_graph(
+                        self,
+                        num_reqs,
+                        num_toks,
+                        uniform_tok_count,
+                        num_active_loras,
+                        max_query_len,
+                    )
+                    if capture_graph is not None:
+                        dispatch_manager = capture_graph
+                        skip_compiled = False
 
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-            self.cudagraph_manager,
+            dispatch_manager,
             num_reqs,
             num_toks,
             uniform_tok_count,
@@ -1513,6 +1539,10 @@ class GPUModelRunner(
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
         )
+        if capture_graph is not None:
+            assert batch_desc.cg_mode == CUDAGraphMode.FULL, (
+                "Capture graph dispatch must match its recorded FULL variant"
+            )
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
@@ -1674,13 +1704,11 @@ class GPUModelRunner(
         steer_full_graph = (
             steer_config is not None and steer_config.graph_mode == "in_graph"
         )
-        steer_geometry = None
+        batch_geometry = None
         capture_session = getattr(self, "capture_session", None)
         capture_enabled = capture_session is not None and capture_session.any_enabled()
         manager = self.steer_vector_manager
-        has_steering = manager is not None and (
-            self.steer_vector_state.has_routed() or manager.server_slot >= 0
-        )
+        has_steering = manager is not None and bool(manager.slot_clauses())
         if not dummy_run and (has_steering or capture_enabled):
             query_start_loc_cpu = None
             if (
@@ -1698,17 +1726,20 @@ class GPUModelRunner(
                         .cpu()
                         .numpy()
                     )
-            steer_geometry = build_batch_geometry(
-                input_batch, query_start_loc_cpu=query_start_loc_cpu
+            batch_geometry = build_batch_geometry(
+                input_batch,
+                self.req_states.prompt_len.np[input_batch.idx_mapping_np],
+                query_start_loc_cpu=query_start_loc_cpu,
             )
+            if capture_enabled:
+                capture_session.prepare_batch(batch_geometry)
         if steer_full_graph and not dummy_run:
             # Tier-1: fill the persistent row/mask buffers the captured
             # steering kernel reads; no forward-context fields needed.
             fill_graph_steer_buffers(
                 input_batch,
-                self.steer_vector_state,
                 self.steer_vector_manager,
-                geometry=steer_geometry,
+                geometry=batch_geometry,
             )
         self.step_timing.record_batch(
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
@@ -1716,6 +1747,7 @@ class GPUModelRunner(
         self.step_timing.forward_start()
 
         # Run model.
+        steering_errors: dict[str, str] = {}
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -1730,7 +1762,17 @@ class GPUModelRunner(
                 )
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            model_output = dispatch_manager.run_fullgraph(batch_desc)
+            if capture_graph is not None:
+                with set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    batch_geometry=batch_geometry,
+                ):
+                    capture_session.collect_graph_outputs(
+                        input_batch.num_tokens_after_padding
+                    )
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -1739,35 +1781,17 @@ class GPUModelRunner(
                 num_active_loras=batch_desc.num_active_loras,
             )
 
-            steer_vector_kwargs = {}
-            if steer_config is not None and not steer_full_graph and not dummy_run:
-                if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE and (
-                    "vllm::steer_apply"
-                    not in (self.compilation_config.splitting_ops or [])
-                ):
-                    # Piecewise graphs without the steer_apply split would
-                    # bake steering into the captured segments.
-                    raise RuntimeError(
-                        "Steer vectors under piecewise cudagraphs require "
-                        "vllm::steer_apply in splitting_ops. Launch with "
-                        "enforce_eager=True or default config validation."
-                    )
-                manager = self.steer_vector_manager
-                steer_vector_kwargs = make_steer_vector_forward_kwargs(
+            steering_kwargs = {}
+            if has_steering and not steer_full_graph and not dummy_run:
+                assert batch_geometry is not None
+                steering_kwargs = make_steering_forward_kwargs(
                     input_batch,
-                    self.steer_vector_state,
-                    default_slot=(-1 if manager is None else manager.server_slot),
                     manager=manager,
-                    geometry=steer_geometry,
+                    geometry=batch_geometry,
+                    errors=steering_errors,
                 )
-            if not steer_vector_kwargs and not dummy_run and capture_enabled:
-                # Capture-only runs still need batch geometry in the
-                # forward context (per-sample position reductions, which
-                # are chunk-aware and read prompt lengths / computed
-                # counts as well as sample boundaries).
-                steer_vector_kwargs = make_steer_vector_forward_kwargs(
-                    input_batch, geometry=steer_geometry
-                )
+                if capture_enabled:
+                    capture_session.fail_requests(steering_errors)
 
             with set_forward_context(
                 attn_metadata,
@@ -1779,7 +1803,8 @@ class GPUModelRunner(
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
-                **steer_vector_kwargs,
+                batch_geometry=batch_geometry,
+                **steering_kwargs,
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
@@ -1824,6 +1849,7 @@ class GPUModelRunner(
             finished_req_ids=finished_req_ids,
             ec_connector_output=ec_connector_output,
             routed_experts=routed_experts,
+            steering_errors=steering_errors,
         )
 
         if not self.is_last_pp_rank:
@@ -1848,6 +1874,7 @@ class GPUModelRunner(
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
         routed_experts = self.execute_model_state.routed_experts
+        steering_errors = self.execute_model_state.steering_errors
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1906,6 +1933,7 @@ class GPUModelRunner(
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            steering_errors=steering_errors,
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
@@ -2003,6 +2031,7 @@ class GPUModelRunner(
         hidden_states = self.execute_model_state.hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
+        steering_errors = self.execute_model_state.steering_errors
         self.execute_model_state = None
 
         # Post-step KV connector related operations.
@@ -2024,6 +2053,7 @@ class GPUModelRunner(
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output,
+            steering_errors=steering_errors,
         )
         async_output = AsyncPoolingOutput(
             model_runner_output=model_runner_output,
@@ -2047,7 +2077,9 @@ class GPUModelRunner(
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
+        self._close_steering()
         torch.accelerator.synchronize()
+        self._detach_capture_hooks()
         self.cudagraph_manager = None
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
@@ -2115,6 +2147,7 @@ class ExecuteModelState(NamedTuple):
     finished_req_ids: set[str]
     ec_connector_output: ECConnectorOutput | None
     routed_experts: RoutedExpertsTensors | None
+    steering_errors: dict[str, str]
 
 
 class BatchReqState(NamedTuple):

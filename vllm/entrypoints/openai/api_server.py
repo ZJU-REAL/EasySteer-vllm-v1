@@ -3,7 +3,6 @@
 import asyncio
 import importlib
 import inspect
-import json as _json
 import multiprocessing
 import multiprocessing.forkserver as forkserver
 import os
@@ -265,13 +264,18 @@ def build_app(
 
         register_fault_tolerance_api_router(app)
 
+    from vllm.entrypoints.serve.steering.api_router import (
+        attach_router as register_steering_api_router,
+    )
+
+    register_steering_api_router(app)
+
     # Endpoint plugins are attached last so their routes are registered after all core
     # routers. This runs even for the CPU only render server. A plugin eligible for
     # the `render` task still gets its routes registered. It receives
     # `engine_client=None` at Phase B (see `_init_endpoint_plugins_state`).
     _attach_endpoint_plugins(app, supported_tasks)
 
-    _register_steering_endpoints(app)
     init_exception_handler(app)
 
     app.root_path = args.root_path
@@ -723,163 +727,6 @@ async def build_and_serve_renderer(
         h11_max_header_count=args.h11_max_header_count,
         **uvicorn_kwargs,
     )
-
-
-##########################################################################
-# Server-level steering admin endpoints
-##########################################################################
-
-_steering_update_lock = asyncio.Lock()
-
-
-def _register_steering_endpoints(app: FastAPI) -> None:
-    """Register GET/POST /v1/steering endpoints on the app."""
-    from starlette.requests import Request
-    from starlette.responses import JSONResponse
-
-    @app.get("/v1/steering/vectors")
-    async def list_steering_vectors(raw_request: Request):
-        """List vector paths preloaded into the steering store."""
-        engine_client = raw_request.app.state.engine_client
-        if raw_request.app.state.vllm_config.steer_vector_config is None:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "SteerVector is not enabled."},
-            )
-        return JSONResponse(
-            content={
-                "preloaded": engine_client.list_preloaded_steer_vectors(),
-            }
-        )
-
-    @app.post("/v1/steering/vectors")
-    async def preload_steering_vectors(raw_request: Request):
-        """Preload steering vectors: {"paths": [...], "algorithm": "direct"}.
-
-        With --steer-require-preload, only preloaded vectors are accepted
-        in per-request steering configs.
-        """
-        if raw_request.app.state.vllm_config.steer_vector_config is None:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "SteerVector is not enabled."},
-            )
-        try:
-            body = await raw_request.json()
-        except _json.JSONDecodeError as e:
-            return JSONResponse(
-                status_code=400, content={"error": f"Invalid JSON: {e}"}
-            )
-        paths = body.get("paths")
-        if not isinstance(paths, list) or not paths:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "'paths' must be a non-empty list."},
-            )
-        engine_client = raw_request.app.state.engine_client
-        try:
-            await engine_client.preload_steer_vectors(
-                paths, body.get("algorithm", "direct")
-            )
-        except Exception as e:
-            return JSONResponse(
-                status_code=400,
-                content={"error": f"Preload failed: {e}"},
-            )
-        return JSONResponse(
-            content={
-                "preloaded": engine_client.list_preloaded_steer_vectors(),
-            }
-        )
-
-    def _steering_status(steer_config) -> dict:
-        return {
-            "active": True,
-            "spec": _json.loads(steer_config.steering_config),
-        }
-
-    @app.get("/v1/steering")
-    async def get_steering_config(raw_request: Request):
-        """Return the current engine-default steering configuration."""
-        vllm_config = raw_request.app.state.vllm_config
-        steer_config = vllm_config.steer_vector_config
-        if steer_config is None or not steer_config.has_server_config:
-            return JSONResponse(content={"active": False})
-        return JSONResponse(content=_steering_status(steer_config))
-
-    @app.post("/v1/steering")
-    async def update_steering_config(raw_request: Request):
-        """Replace the engine-default steering config at runtime.
-
-        ``{"spec": <SteeringSpec JSON>}`` replaces the whole config; the
-        prefix cache is reset afterwards so cached KV steered under the
-        old config is never reused. Backends validate the new spec at
-        install and unsupported specs are rejected with 400.
-        """
-        vllm_config = raw_request.app.state.vllm_config
-        steer_config = vllm_config.steer_vector_config
-        if steer_config is None or not steer_config.has_server_config:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "Engine-default steering is not configured. "
-                    "Start the server with --steering-config to enable."
-                },
-            )
-
-        try:
-            body = await raw_request.json()
-        except _json.JSONDecodeError as e:
-            return JSONResponse(
-                status_code=400,
-                content={"error": f"Invalid JSON: {e}"},
-            )
-
-        engine_client = raw_request.app.state.engine_client
-
-        async def _reset_prefix_cache_if_enabled():
-            client_config = getattr(engine_client, "vllm_config", None)
-            if (
-                client_config is not None
-                and client_config.cache_config is not None
-                and client_config.cache_config.enable_prefix_caching
-            ):
-                await engine_client.reset_prefix_cache()
-
-        if "spec" not in body:
-            return JSONResponse(
-                status_code=400,
-                content={"error": 'Body must be {"spec": <SteeringSpec>}.'},
-            )
-
-        from pydantic import ValidationError
-
-        from vllm.steer_vectors.api import SteeringSpec, to_engine_request
-
-        try:
-            spec = SteeringSpec.model_validate(body["spec"])
-        except ValidationError as e:
-            return JSONResponse(
-                status_code=400,
-                content={"error": f"Invalid SteeringSpec: {e}"},
-            )
-        async with _steering_update_lock:
-            try:
-                await engine_client.add_steer_vector(
-                    to_engine_request(spec, name="__server__", int_id=1)
-                )
-            except Exception as e:
-                # The workers rejected the spec (e.g. not graph-safe
-                # on a full-graph engine); the old config stays live.
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": f"Spec rejected at install: {e}"},
-                )
-            object.__setattr__(steer_config, "steering_config", spec.model_dump_json())
-            # Cached KV was steered under the old config; drop it so
-            # new requests never reuse stale blocks.
-            await _reset_prefix_cache_if_enabled()
-        return JSONResponse(content=_steering_status(steer_config))
 
 
 async def run_server(args, **uvicorn_kwargs) -> None:

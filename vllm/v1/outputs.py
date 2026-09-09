@@ -342,6 +342,9 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    # Dynamic selector conflicts finish only their requests, not the engine.
+    steering_errors: dict[str, str] = field(default_factory=dict)
+
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 

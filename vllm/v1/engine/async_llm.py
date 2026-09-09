@@ -6,7 +6,7 @@ import socket
 import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
-from copy import copy
+from copy import copy, deepcopy
 from typing import Any
 
 import torch
@@ -25,13 +25,13 @@ from vllm.exceptions import VLLMClientError, VLLMValidationError
 from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_hooks.steering.defaults import SteeringRequestChoice
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.outputs import STREAM_FINISHED, PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import renderer_from_config
 from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.sampling_params import RequestOutputKind, SamplingParams
-from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.tasks import SupportedTask
 from vllm.tokenizers import TokenizerLike
 from vllm.tracing import init_tracer
@@ -137,6 +137,7 @@ class AsyncLLM(EngineClient):
 
         # Convert EngineInput --> EngineCoreRequest.
         self.input_processor = InputProcessor(self.vllm_config, renderer)
+        self._steering_info_task: asyncio.Task | None = None
 
         # Converts EngineCoreOutputs --> RequestOutput.
         self.output_processor = OutputProcessor(
@@ -275,11 +276,23 @@ class AsyncLLM(EngineClient):
             cancel_task_threadsafe(handler)
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        await self._ensure_steering_model_info()
         if not hasattr(self, "_supported_tasks"):
             # Cache the result
             self._supported_tasks = await self.engine_core.get_supported_tasks_async()
 
         return self._supported_tasks
+
+    async def _ensure_steering_model_info(self) -> None:
+        if self.vllm_config.steer_vector_config is None:
+            return
+        if self._steering_info_task is None:
+            self._steering_info_task = asyncio.create_task(
+                self.engine_core.collective_rpc_async("get_steering_model_info")
+            )
+        if self.input_processor._steering_model_info is None:
+            workers = await asyncio.shield(self._steering_info_task)
+            self.input_processor.set_steering_model_info(workers)
 
     async def add_request(
         self,
@@ -291,7 +304,7 @@ class AsyncLLM(EngineClient):
         params: SamplingParams | PoolingParams,
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
-        steer_vector_request: SteerVectorRequest | None = None,
+        steer_vector_request: SteeringRequestChoice = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
@@ -305,6 +318,11 @@ class AsyncLLM(EngineClient):
 
         if self.errored:
             raise EngineDeadError()
+
+        if not isinstance(prompt, EngineCoreRequest):
+            steer_vector_request = self.input_processor.freeze_steering_request(
+                steer_vector_request
+            )
 
         is_pooling = isinstance(params, PoolingParams)
 
@@ -347,6 +365,8 @@ class AsyncLLM(EngineClient):
             )
 
             request = prompt
+            await self._ensure_steering_model_info()
+            self.input_processor._validate_steer_vector(request.steer_vector_request)
             if request_id != request.request_id:
                 logger.warning_once(
                     "AsyncLLM.add_request() was passed a request_id parameter that "
@@ -450,7 +470,7 @@ class AsyncLLM(EngineClient):
         sampling_params: SamplingParams | PoolingParams,
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
-        steer_vector_request: SteerVectorRequest | None = None,
+        steer_vector_request: SteeringRequestChoice = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
@@ -483,6 +503,8 @@ class AsyncLLM(EngineClient):
             params=sampling_params,
             **inputs,  # type: ignore[arg-type]
         )
+        # Every chunk belongs to this request's original effective default.
+        inputs["steer_vector_request"] = final_req.steer_vector_request or False
         self.input_processor.assign_request_id(final_req)
         internal_req_id = final_req.request_id
 
@@ -565,7 +587,7 @@ class AsyncLLM(EngineClient):
         *,
         prompt_text: str | None = None,
         lora_request: LoRARequest | None = None,
-        steer_vector_request: SteerVectorRequest | None = None,
+        steer_vector_request: SteeringRequestChoice = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
@@ -793,6 +815,7 @@ class AsyncLLM(EngineClient):
             cache_salt=None,
             data_parallel_rank=data_parallel_rank,
             abort_immediately=True,
+            steer_vector_request=None,
         )
         await self.engine_core.add_request_async(request)
 
@@ -1016,18 +1039,25 @@ class AsyncLLM(EngineClient):
         """Prevent an adapter from being evicted."""
         return await self.engine_core.pin_lora_async(lora_id)
 
-    async def add_steer_vector(self, steer_vector_request: SteerVectorRequest) -> bool:
-        """Load (or reload) a steer vector on all workers."""
-        return await self.engine_core.add_steer_vector_async(steer_vector_request)
+    async def set_default_steering(self, spec) -> None:
+        """Atomically replace the frontend default for future requests."""
+        snapshot = deepcopy(spec)
+        if self.input_processor._steering_model_info is None:
+            await self._ensure_steering_model_info()
+        await asyncio.to_thread(self.input_processor.set_default_steering, snapshot)
+
+    def get_default_steering(self) -> dict:
+        return self.input_processor.get_default_steering()
 
     async def preload_steer_vectors(
-        self, paths: list[str], algorithm: str = "direct"
+        self, paths: list[str], algorithm: str = "direct", params: dict | None = None
     ) -> None:
-        """Load steering vectors into all workers' stores ahead of use."""
-        await self.collective_rpc(
-            "preload_steer_vectors", args=(list(paths), algorithm)
+        """Resolve once at the frontend, then preload exact content on all workers."""
+        payloads = await asyncio.to_thread(
+            self.input_processor.prepare_steering_preload, paths, algorithm, params
         )
-        self.input_processor.note_steer_vectors_preloaded(paths)
+        await self.collective_rpc("preload_steer_vectors", args=(payloads,))
+        self.input_processor.note_steer_vectors_preloaded(payloads, algorithm, paths)
 
     def list_preloaded_steer_vectors(self) -> list[str]:
         return sorted(self.input_processor._steer_preloaded_paths)
@@ -1042,9 +1072,12 @@ class AsyncLLM(EngineClient):
         """
         Perform a collective RPC call to the given path.
         """
-        return await self.engine_core.collective_rpc_async(
+        kwargs = self.input_processor.capture_policy.snapshot_kwargs(method, kwargs)
+        results = await self.engine_core.collective_rpc_async(
             method, timeout, args, kwargs
         )
+        self.input_processor.capture_policy.record_rpc(method, args, kwargs)
+        return results
 
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""

@@ -223,10 +223,8 @@ from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunne
 from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
-from vllm.v1.worker.capture_model_runner_mixin import CaptureModelRunnerMixin
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.steer_vector_model_runner_mixin import SteerVectorModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -500,11 +498,7 @@ class ExecuteModelState(NamedTuple):
 
 
 class GPUModelRunner(
-    CaptureModelRunnerMixin,  # Unified capture mixin (hidden states, MoE router logits, etc.)
-    SteerVectorModelRunnerMixin,
-    LoRAModelRunnerMixin,
-    KVConnectorModelRunnerMixin,
-    ECConnectorModelRunnerMixin
+    LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
     def __init__(
         self,
@@ -1360,7 +1354,6 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
-                steer_vector_request=new_req_data.steer_vector_request,
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -2347,9 +2340,6 @@ class GPUModelRunner(
             self.set_active_loras(
                 self.input_batch, num_scheduled_tokens, num_sampled_tokens
             )
-
-        # Steer vectors run on the V2 model runner only (config validation
-        # enforces this); no V1 hot-swap.
 
         return (
             logits_indices,
@@ -4554,10 +4544,6 @@ class GPUModelRunner(
                 num_tokens_unpadded,
                 ubatch_slices_padded,
             )
-
-        # Steering and capture both require the V2 runner (enforced at
-        # config validation and capture enable respectively), so this
-        # runner provides no steering/capture forward-context fields.
         with (
             set_forward_context(
                 attn_metadata,
@@ -5453,8 +5439,6 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
-                # Wrap model with steer vector support if enabled
-                self.model = self._wrap_model_with_steer_vectors(self.model)
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     if hasattr(self.drafter, "load_model"):
@@ -6264,8 +6248,6 @@ class GPUModelRunner(
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
 
-            # Steering/capture forward-context fields are V2-runner-only
-            # (both features are gated onto V2), so none are set here.
             with (
                 self.maybe_randomize_inputs(
                     input_ids, inputs_embeds, randomize_inputs=randomize_inputs

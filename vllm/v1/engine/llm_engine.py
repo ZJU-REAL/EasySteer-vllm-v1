@@ -18,8 +18,8 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_hooks.steering.defaults import SteeringRequestChoice
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import renderer_from_config
@@ -110,6 +110,11 @@ class LLMEngine:
             executor_class=executor_class,
             log_stats=self.log_stats,
         )
+
+        if vllm_config.steer_vector_config is not None:
+            self.input_processor.set_steering_model_info(
+                self.engine_core.collective_rpc("get_steering_model_info")
+            )
 
         self.logger_manager: StatLoggerManager | None = None
         if self.log_stats:
@@ -223,7 +228,7 @@ class LLMEngine:
         params: SamplingParams | PoolingParams,
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
-        steer_vector_request: SteerVectorRequest | None = None,
+        steer_vector_request: SteeringRequestChoice = None,
         capture_select: dict | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
@@ -244,6 +249,7 @@ class LLMEngine:
             )
 
             request = prompt
+            self.input_processor._validate_steer_vector(request.steer_vector_request)
             if request_id != request.request_id:
                 logger.warning_once(
                     "LLMEngine.add_request() was passed a request_id parameter that "
@@ -423,13 +429,21 @@ class LLMEngine:
         """Prevent an adapter from being evicted."""
         return self.engine_core.pin_lora(lora_id)
 
-    def add_steer_vector(self, steer_vector_request: SteerVectorRequest) -> bool:
-        """Load a new steer vector into the engine for future requests."""
-        return self.engine_core.add_steer_vector(steer_vector_request)
+    def set_default_steering(self, spec) -> None:
+        """Atomically replace the frontend default for future requests."""
+        self.input_processor.set_default_steering(spec)
 
-    def remove_steer_vector(self, steer_vector_id: int) -> bool:
-        """Remove an already loaded steer vector."""
-        return self.engine_core.remove_steer_vector(steer_vector_id)
+    def get_default_steering(self) -> dict:
+        return self.input_processor.get_default_steering()
+
+    def preload_steer_vectors(
+        self, paths: list[str], algorithm: str = "direct", params: dict | None = None
+    ) -> None:
+        payloads = self.input_processor.prepare_steering_preload(
+            paths, algorithm, params
+        )
+        self.collective_rpc("preload_steer_vectors", args=(payloads,))
+        self.input_processor.note_steer_vectors_preloaded(payloads, algorithm, paths)
 
     def collective_rpc(
         self,
@@ -438,7 +452,10 @@ class LLMEngine:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
-        return self.engine_core.collective_rpc(method, timeout, args, kwargs)
+        kwargs = self.input_processor.capture_policy.snapshot_kwargs(method, kwargs)
+        results = self.engine_core.collective_rpc(method, timeout, args, kwargs)
+        self.input_processor.capture_policy.record_rpc(method, args, kwargs)
+        return results
 
     def set_weight_version(self, weight_version: str) -> None:
         self.engine_core.set_weight_version(weight_version)

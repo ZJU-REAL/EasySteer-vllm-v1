@@ -22,6 +22,7 @@ from vllm.entrypoints.chat_utils import (
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_hooks.steering.defaults import SteeringRequestChoice
 from vllm.renderers import BaseRenderer, ChatParams, merge_kwargs
 from vllm.renderers.inputs.preprocess import (
     conversation_to_seq,
@@ -29,7 +30,6 @@ from vllm.renderers.inputs.preprocess import (
     prompt_to_seq,
 )
 from vllm.sampling_params import RequestOutputKind
-from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.utils.counter import Counter
 from vllm.utils.mistral import is_mistral_tokenizer
 from vllm.utils.tqdm_utils import maybe_tqdm
@@ -274,11 +274,9 @@ class OfflineInferenceMixin:
 
     def _steer_vector_request_to_seq(
         self,
-        steer_vector_request: SteerVectorRequest
-        | None
-        | Sequence[SteerVectorRequest | None],
+        steer_vector_request: SteeringRequestChoice | Sequence[SteeringRequestChoice],
         num_requests: int,
-    ) -> Sequence[SteerVectorRequest | None]:
+    ) -> Sequence[SteeringRequestChoice]:
         if isinstance(steer_vector_request, Sequence):
             if len(steer_vector_request) != num_requests:
                 raise ValueError(
@@ -316,9 +314,8 @@ class OfflineInferenceMixin:
         *,
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
-        steer_vector_request: Sequence[SteerVectorRequest]
-        | SteerVectorRequest
-        | None = None,
+        steer_vector_request: Sequence[SteeringRequestChoice]
+        | SteeringRequestChoice = None,
         capture_select: "Sequence[dict | None] | dict | None" = None,
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -371,9 +368,8 @@ class OfflineInferenceMixin:
         *,
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
-        steer_vector_request: Sequence[SteerVectorRequest]
-        | SteerVectorRequest
-        | None = None,
+        steer_vector_request: Sequence[SteeringRequestChoice]
+        | SteeringRequestChoice = None,
         capture_select: "Sequence[dict | None] | dict | None" = None,
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -542,6 +538,7 @@ class OfflineInferenceMixin:
         output_type: type[_O],
         *,
         lora_requests: Sequence[LoRARequest | None] | None = None,
+        steer_vector_requests: Sequence[SteeringRequestChoice] | None = None,
         priorities: Sequence[int] | None = None,
         use_tqdm: bool | Callable[..., tqdm] = True,
     ):
@@ -559,6 +556,7 @@ class OfflineInferenceMixin:
             prompts=prompts,
             params=params,
             lora_requests=lora_requests,
+            steer_vector_requests=steer_vector_requests,
             priorities=priorities,
         )
 
@@ -570,7 +568,7 @@ class OfflineInferenceMixin:
         params: Sequence[SamplingParams | PoolingParams],
         *,
         lora_requests: Sequence[LoRARequest | None] | None = None,
-        steer_vector_requests: Sequence[SteerVectorRequest | None] | None = None,
+        steer_vector_requests: Sequence[SteeringRequestChoice] | None = None,
         capture_selects: "Sequence[dict | None] | None" = None,
         priorities: Sequence[int] | None = None,
     ) -> list[str]:
@@ -606,7 +604,7 @@ class OfflineInferenceMixin:
         prompt: EngineInput,
         params: SamplingParams | PoolingParams,
         lora_request: LoRARequest | None = None,
-        steer_vector_request: SteerVectorRequest | None = None,
+        steer_vector_request: SteeringRequestChoice = None,
         capture_select: dict | None = None,
         priority: int = 0,
     ) -> str:

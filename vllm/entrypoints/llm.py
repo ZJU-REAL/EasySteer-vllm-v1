@@ -45,9 +45,13 @@ from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_hooks.steering.api import SteeringSpec
+from vllm.model_hooks.steering.defaults import (
+    SteeringChoice,
+    SteeringRequestChoice,
+    resolve_steering_choice,
+)
 from vllm.outputs import PoolingRequestOutput, RequestOutput
-from vllm.steer_vectors.api import SteeringSpec, to_engine_request
-from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
@@ -67,21 +71,12 @@ logger = init_logger(__name__)
 
 
 def _resolve_steering(
-    steering: "Sequence[SteeringSpec | None] | SteeringSpec | None",
-) -> Sequence[SteerVectorRequest] | SteerVectorRequest | None:
-    """Translate the `steering` argument into engine requests.
-
-    A sequence pairs one spec per prompt; None entries leave that prompt
-    unsteered.
-    """
-    if steering is None:
-        return None
-    if isinstance(steering, SteeringSpec):
-        return to_engine_request(steering)
-    return [
-        to_engine_request(spec) if spec is not None else None
-        for spec in steering
-    ]
+    steering: Sequence[SteeringChoice] | SteeringChoice,
+) -> Sequence[SteeringRequestChoice] | SteeringRequestChoice:
+    """Convert each choice; None inherits the default and False disables it."""
+    if isinstance(steering, Sequence):
+        return [resolve_steering_choice(spec) for spec in steering]
+    return resolve_steering_choice(steering)
 
 
 class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
@@ -442,7 +437,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         *,
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
-        steering: "Sequence[SteeringSpec | None] | SteeringSpec | None" = None,
+        steering: Sequence[SteeringChoice] | SteeringChoice = None,
         capture_select: "Sequence[dict | None] | dict | None" = None,
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -470,7 +465,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             lora_request: LoRA request to use for generation, if any.
             steering: Steering configuration (`SteeringSpec`) applied to
                 the request(s); a sequence pairs one spec per prompt
-                (None entries leave that prompt unsteered).
+                (None inherits the default; False disables steering).
             capture_select: Per-request capture selection override
                 ({stream: SelectSpec wire dict}); a sequence pairs one
                 override per prompt (None entries use the enabled
@@ -519,7 +514,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         prompts: PromptType | Sequence[PromptType],
         sampling_params: SamplingParams | Sequence[SamplingParams] | None = None,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
-        steering: "Sequence[SteeringSpec | None] | SteeringSpec | None" = None,
+        steering: Sequence[SteeringChoice] | SteeringChoice = None,
         priority: list[int] | None = None,
         use_tqdm: bool | Callable[..., tqdm] = True,
         tokenization_kwargs: dict[str, Any] | None = None,
@@ -878,21 +873,30 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         """
         self.llm_engine.wake_up(tags)
 
+    def set_default_steering(self, spec: SteeringSpec | None) -> None:
+        """Set the default for future requests, or clear it with None.
+
+        Explicit per-request configurations override this default. Requests
+        already admitted retain their effective weight and selection snapshot.
+        """
+        self.llm_engine.set_default_steering(spec)
+
+    def get_default_steering(self) -> dict:
+        """Return the current default authoring configuration and active status."""
+        return self.llm_engine.get_default_steering()
+
     def preload_steer_vectors(
-        self, paths: list[str], algorithm: str = "direct"
+        self, paths: list[str], algorithm: str = "direct", params: dict | None = None
     ) -> None:
         """Load steering vectors on all workers ahead of use.
 
-        Preloaded vectors are held in a per-worker LRU store (capacity
-        ``max_steer_vectors``), so subsequent ``generate`` calls with
-        ``steer_vector_request`` configs referencing these paths never
-        block on disk I/O. Any number of configs (e.g. different scales
-        or triggers) share one resident copy of a vector.
+        The frontend resolves each file once and sends the same immutable
+        payload to every worker store. Different configurations share its
+        content identity. Changing a file requires preloading its new content
+        when steer_require_preload is enabled. For router files, params must
+        match the mode/lambda/topk overrides used by the request.
         """
-        self.llm_engine.collective_rpc(
-            "preload_steer_vectors", args=(paths, algorithm)
-        )
-        self.llm_engine.input_processor.note_steer_vectors_preloaded(paths)
+        self.llm_engine.preload_steer_vectors(paths, algorithm, params)
 
     def get_metrics(self) -> list["Metric"]:
         """Return a snapshot of aggregated metrics from Prometheus.

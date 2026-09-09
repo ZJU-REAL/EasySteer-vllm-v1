@@ -15,11 +15,11 @@ if TYPE_CHECKING:
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
     from vllm.lora.request import LoRARequest
+    from vllm.model_hooks.steering.request import SteeringRequest
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
-    from vllm.steer_vectors.request import SteerVectorRequest
     from vllm.v1.request import Request
 else:
     ECConnectorMetadata = object
@@ -29,7 +29,7 @@ else:
     MultiModalFeatureSpec = object
     PoolingParams = object
     SamplingParams = object
-    SteerVectorRequest = object
+    SteeringRequest = object
     Request = object
 
 
@@ -43,7 +43,7 @@ class NewRequestData:
     block_ids: tuple[list[int], ...]
     num_computed_tokens: int
     lora_request: LoRARequest | None
-    steer_vector_request: SteerVectorRequest | None = None
+    steer_vector_request: SteeringRequest | None = None
     capture_select: dict[str, dict] | None = None
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
