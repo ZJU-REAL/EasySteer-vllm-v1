@@ -4,9 +4,10 @@
 router logits) over collective_rpc.
 
 The capture mechanism lives in vllm.model_hooks.capture.session.CaptureSession;
-this mixin owns one session per worker, attaches its hooks at model
-load, and exposes stream lifecycle RPCs. Eligible FULL batches use a
-separate capture graph with fixed outputs; other batches needing rows
+this mixin owns one session per worker, registers components at model
+load, and exposes stream lifecycle RPCs that install and remove hooks.
+Eligible FULL batches use a separate capture graph with fixed outputs;
+other batches needing rows
 use the raw eager forward. Ordinary compiled artifacts omit capture hooks.
 """
 
@@ -44,7 +45,7 @@ class CaptureModelRunnerMixin:
     def _attach_capture_hooks(
         self, model: nn.Module, components: "ModelComponents"
     ) -> None:
-        """Attach capture hooks at model load, releasing any previous model.
+        """Register capture components at model load, releasing the previous model.
 
         On compiled engines the hook bodies
         trace to nothing (torch.compiler.is_compiling guard), so
@@ -52,8 +53,8 @@ class CaptureModelRunnerMixin:
         graphs record a separate raw forward into fixed output buffers;
         other capture-active batches use raw eager execution.
 
-        Must run after the steering hooks are registered so gate-hook
-        ordering makes captured router logits post-steering.
+        Stream enablement installs capture hooks after steering hooks, so
+        captured router logits retain the post-steering order.
         """
         self._detach_capture_hooks()
         self._capture_session().attach(model, components)

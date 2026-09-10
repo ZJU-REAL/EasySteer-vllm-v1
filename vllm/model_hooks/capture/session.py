@@ -14,7 +14,7 @@ One CaptureSession per worker owns named capture *streams*:
   attention, before the output projection and after any head-output steering.
 
 Hooks never mutate the model tree (no wrappers, no module renames) and
-are inert until a stream is enabled. On the V2 runner, hook bodies trace
+are installed only while a stream is enabled. On the V2 runner, hook bodies trace
 to nothing under torch.compile (ordinary compiled artifacts and CUDA
 graphs carry no capture code). Selected rows use a separate
 FULL graph with fixed capture buffers when supported, or raw eager
@@ -88,8 +88,13 @@ class CaptureSession:
         # started later must check rows that were already skipped.
         self._cache_hits: dict[str, tuple[list[int], int]] = {}
         self._unsupported_requests: set[str] = set()
-        self._hook_handles: list = []
-        self._hooked_layers: dict[str, set[int]] = {name: set() for name in COMPONENTS}
+        self._hook_handles: dict[str, list] = {}
+        self._flush_handle = None
+        self._model: nn.Module | None = None
+        self._components: ModelComponents = dict.fromkeys(COMPONENTS, ())
+        self._available_layers: dict[str, set[int]] = {
+            name: set() for name in COMPONENTS
+        }
         self._layouts: dict[str, dict[int, dict[str, int]]] = {}
         self._attached = False
         self.graph_state: CaptureGraphState | None = None
@@ -197,12 +202,14 @@ class CaptureSession:
             store.mark_elided(req_id)
 
     # ------------------------------------------------------------------
-    # Hook attachment (once, at model load; inert until a stream enables)
+    # Discover at model load; install hooks only for enabled streams.
     # ------------------------------------------------------------------
 
     def attach(self, model: nn.Module, components: ModelComponents) -> None:
         if self._attached:
             return
+        self._model = model
+        self._components = components
         for component in COMPONENTS.values():
             self._layouts[component.id] = {
                 target.layer_id: {
@@ -213,37 +220,36 @@ class CaptureSession:
                 for target in components[component.id]
                 if target.width is not None
             }
-            self._hooked_layers[component.id] = self._attach_stream_hooks(
-                components[component.id], component
-            )
-
-        def flush_hook(mod, args, output):
-            if self.graph_state is not None and self.graph_state.recording:
-                return
-            if any(
-                store is not None and store._pending for store in self._streams.values()
-            ):
-                self._eager_capture_forwards += 1
-            for store in self._streams.values():
-                if store is not None:
-                    store.flush()
-
-        # One post-forward flush per step: per-layer hooks only stage
-        # GPU rows; the D2H copies coalesce here (pinned, non-blocking,
-        # single sync).
-        self._hook_handles.append(model.register_forward_hook(flush_hook))
+            self._available_layers[component.id] = {
+                target.layer_id for target in components[component.id]
+            }
         self._attached = True
+
+    def _flush_hook(self, mod, args, output):
+        if self.graph_state is not None and self.graph_state.recording:
+            return
+        if any(
+            store is not None and store._pending for store in self._streams.values()
+        ):
+            self._eager_capture_forwards += 1
+        for store in self._streams.values():
+            if store is not None:
+                store.flush()
 
     def _attach_stream_hooks(
         self,
         targets: tuple[ComponentTarget, ...],
         component: ComponentDescriptor,
-    ) -> set[int]:
+    ) -> None:
         """Attach capture with the same discovery and output contract as steering."""
         stream = component.id
-        hooked = set()
+        store = self._streams[stream]
+        assert store is not None
+        handles = self._hook_handles.setdefault(stream, [])
         for layer in targets:
             name, layer_id = layer.name, layer.layer_id
+            if not store.wants_layer(layer_id):
+                continue
             target = layer.module
 
             def hook(mod, args, output, _lid=layer_id, _name=name, _width=layer.width):
@@ -279,24 +285,23 @@ class CaptureSession:
                 if rows is not None:
                     store.append(_lid, rows, meta, _name)
 
-            self._hook_handles.append(target.register_forward_hook(hook))
-            hooked.add(layer_id)
-        if hooked:
-            logger.info("[Capture] hooked %d layers for %s", len(hooked), stream)
-        return hooked
+            handles.append(target.register_forward_hook(hook))
+        if handles:
+            logger.info("[Capture] hooked %d layers for %s", len(handles), stream)
 
     def detach(self) -> None:
-        for handle in self._hook_handles:
-            handle.remove()
-        self._hook_handles.clear()
+        for stream in self._streams:
+            self.disable_stream(stream)
         self._attached = False
+        self._model = None
+        self._components = dict.fromkeys(COMPONENTS, ())
         self.release_graph()
         self._streams = dict.fromkeys(COMPONENTS)
         self._request_selects.clear()
         self._cache_hits.clear()
         self._unsupported_requests.clear()
         self._layouts.clear()
-        for layers in self._hooked_layers.values():
+        for layers in self._available_layers.values():
             layers.clear()
 
     # ------------------------------------------------------------------
@@ -313,7 +318,7 @@ class CaptureSession:
                 tuple(
                     sorted(
                         lid
-                        for lid in self._hooked_layers[stream]
+                        for lid in self._available_layers[stream]
                         if store.wants_layer(lid)
                     )
                 ),
@@ -373,7 +378,7 @@ class CaptureSession:
                 continue
             full_layers = sum(
                 store.wants_layer(layer) and store.remaining_rows(layer) == 0
-                for layer in self._hooked_layers[stream]
+                for layer in self._available_layers[stream]
             )
             if full_layers:
                 store.drop_rows(
@@ -395,7 +400,7 @@ class CaptureSession:
         for stream, store in self._streams.items():
             if store is None or not any(
                 store.wants_layer(layer) and store.remaining_rows(layer) != 0
-                for layer in self._hooked_layers[stream]
+                for layer in self._available_layers[stream]
             ):
                 continue
             for i, req_id in enumerate(req_ids):
@@ -420,12 +425,12 @@ class CaptureSession:
             raise ValueError(f"Unknown capture stream: {stream}")
         if not self._attached:
             raise RuntimeError(
-                "Capture hooks are not attached to this model; "
-                "attachment happens once at model load."
+                "Capture components are not attached to this model; "
+                "discovery happens once at model load."
             )
         config = StreamConfig(**config_kwargs)
         if stream == ATTENTION_HEADS:
-            available = self._hooked_layers[stream]
+            available = self._available_layers[stream]
             if not available:
                 raise ValueError("No supported decoder attention head outputs found")
             if config.layers is not None and config.layers - available:
@@ -433,16 +438,27 @@ class CaptureSession:
                     "Unsupported attention head capture layers: "
                     f"{sorted(config.layers - available)}"
                 )
-        if not self._hooked_layers[stream]:
+        if not self._available_layers[stream]:
             logger.warning(
-                "Enabling %s capture but no usable component hooks were found.",
+                "Enabling %s capture but no usable components were found.",
                 stream,
             )
+        self.disable_stream(stream)
         self._streams[stream] = StreamStore(config)
+        self._attach_stream_hooks(self._components[stream], COMPONENTS[stream])
+        if self._flush_handle is None:
+            assert self._model is not None
+            # Stage per layer, then coalesce transfers once after the model forward.
+            self._flush_handle = self._model.register_forward_hook(self._flush_hook)
 
     def disable_stream(self, stream: str) -> None:
         if stream in self._streams:
             self._streams[stream] = None
+            for handle in self._hook_handles.pop(stream, ()):
+                handle.remove()
+            if not self.any_enabled() and self._flush_handle is not None:
+                self._flush_handle.remove()
+                self._flush_handle = None
 
     def fetch_stream(
         self,
@@ -478,7 +494,7 @@ class CaptureSession:
 
     def stream_status(self, stream: str) -> dict[str, Any]:
         store = self._streams.get(stream)
-        hooked = len(self._hooked_layers.get(stream, ()))
+        hooked = len(self._hook_handles.get(stream, ()))
         execution = {
             "layouts": self._layouts.get(stream, {}),
             "graph_ready": self.graph_state is not None and self.graph_state.ready,
