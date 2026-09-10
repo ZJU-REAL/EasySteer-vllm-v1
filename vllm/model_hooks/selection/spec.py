@@ -32,7 +32,7 @@ class SelectSpec(BaseModel):
     the whole generation" is therefore one clause:
     `SelectSpec(prompt_positions=[-1], generation="all")`.
 
-    Args:
+    Attributes:
         prompt: "all" selects every prompt token — the widest prompt
             include selector; unions with the others like any include.
         generation: "all" selects every generated token — the widest

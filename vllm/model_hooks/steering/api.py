@@ -59,7 +59,7 @@ class ApplySpec(SelectSpec):
 class VectorSpec(BaseModel):
     """One steering vector and how it applies.
 
-    Args:
+    Attributes:
         source: Path to a vector file in a format EasySteer itself
             defines (its GGUF export; moe_router JSON). For third-party
             checkpoint formats, load the file yourself (or use an
@@ -109,7 +109,7 @@ class VectorSpec(BaseModel):
 class SteeringSpec(BaseModel):
     """A complete steering configuration: ordered vectors + conflict policy.
 
-    Args:
+    Attributes:
         vectors: The vectors to apply (non-empty; order matters for
             'sequential'/'priority' conflict resolution).
         conflict: What to do when several vectors target one position:
