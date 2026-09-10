@@ -21,6 +21,7 @@ from vllm.model_hooks.components.outputs import (
 
 HIDDEN_STATES = "hidden_states"
 ROUTER_LOGITS = "router_logits"
+ATTENTION_HEADS = "attention_heads"
 
 
 class DecoderOutputAdapter:
@@ -52,7 +53,7 @@ class GateOutputAdapter:
         return extract_gate_logits(output), False
 
 
-def _decoder_target(name: str, module: nn.Module) -> nn.Module:
+def _module_target(name: str, module: nn.Module) -> nn.Module:
     return module
 
 
@@ -72,7 +73,7 @@ COMPONENTS = {
     HIDDEN_STATES: ComponentDescriptor(
         HIDDEN_STATES,
         attrgetter("decoder_layers"),
-        _decoder_target,
+        _module_target,
         DecoderOutputAdapter,
         steering_op="vllm::steer_apply",
     ),
@@ -84,6 +85,14 @@ COMPONENTS = {
         steering_op="vllm::steer_moe_gate",
         op_key_suffix="::gate",
     ),
+    ATTENTION_HEADS: ComponentDescriptor(
+        ATTENTION_HEADS,
+        attrgetter("attention_heads"),
+        _module_target,
+        DecoderOutputAdapter,
+        steering_op="vllm::steer_apply",
+        op_key_suffix="::attention_heads",
+    ),
 }
 
 
@@ -94,6 +103,10 @@ class ComponentTarget:
     name: str
     layer_id: int
     module: nn.Module
+    width: int | None = None
+    num_heads: int | None = None
+    # Per-head output width, which can differ from the query/key head size.
+    head_size: int | None = None
 
 
 ModelComponents = dict[str, tuple[ComponentTarget, ...]]
@@ -108,7 +121,16 @@ def discover_components(model: nn.Module) -> ModelComponents:
         for layer in component.discover(discovery):
             target = component.resolve_target(layer.name, layer.module)
             if target is not None:
-                targets.append(ComponentTarget(layer.name, layer.layer_id, target))
+                layout = {}
+                if component.id == ATTENTION_HEADS:
+                    layout = {
+                        "width": target.num_heads * target.head_size_v,
+                        "num_heads": target.num_heads,
+                        "head_size": target.head_size_v,
+                    }
+                targets.append(
+                    ComponentTarget(layer.name, layer.layer_id, target, **layout)
+                )
         result[component.id] = tuple(targets)
     return result
 

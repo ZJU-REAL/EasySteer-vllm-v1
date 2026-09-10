@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Module discovery shared by steering and capture.
 
-Locates decoder layers and sparse-MoE blocks on an arbitrary model.
+Locates decoder layers, attention outputs and sparse-MoE blocks.
 Discovery uses vLLM component interfaces and decoder-stack contracts,
 without model-family names. Output adapters live in outputs.py; token
 selection is shared through model_hooks.selection.
@@ -45,6 +45,68 @@ class ModelDiscovery:
     @cached_property
     def moe_blocks(self) -> list[DiscoveredLayer]:
         return _find_moe_blocks(self.model, self.stack_indices, self.decoder_layers)
+
+    @cached_property
+    def attention_heads(self) -> list[DiscoveredLayer]:
+        return _find_attention_heads(self.decoder_layers)
+
+
+def _find_attention_heads(decoders: list[DiscoveredLayer]) -> list[DiscoveredLayer]:
+    """Find ordinary decoder attention outputs before their output projection."""
+    from vllm.model_executor.layers.attention.attention import Attention
+    from vllm.v1.attention.backend import AttentionType
+
+    layers = []
+    seen_modules: dict[int, str] = {}
+    shared_modules: set[int] = set()
+    for decoder in decoders:
+        modules = dict(decoder.module.named_modules(remove_duplicate=False))
+        for name, module in modules.items():
+            if not isinstance(module, Attention):
+                continue
+            full_name = f"{decoder.name}.{name}"
+            if id(module) in seen_modules:
+                logger.warning_once(
+                    "Attention module is shared by %s and %s; "
+                    "attention-head hooks cannot distinguish their layer indices.",
+                    seen_modules[id(module)],
+                    full_name,
+                )
+                shared_modules.add(id(module))
+            else:
+                seen_modules[id(module)] = full_name
+        matches = [
+            (name, module)
+            for name, module in modules.items()
+            if isinstance(module, Attention)
+            and type(module).forward is Attention.forward
+            and module.attn_type == AttentionType.DECODER
+            # Latent-KV fallbacks can pad V and trim head outputs afterwards.
+            and not any(
+                getattr(owner, "kv_lora_rank", None) is not None
+                for owner_name, owner in modules.items()
+                if not owner_name or name.startswith(owner_name + ".")
+            )
+        ]
+        if len(matches) > 1:
+            logger.warning_once(
+                "Decoder %s has multiple attention head outputs (%s); "
+                "attention-head steering and capture are unavailable for this layer.",
+                decoder.name,
+                tuple(name for name, _ in matches),
+            )
+            continue
+        for name, module in matches:
+            full_name = f"{decoder.name}.{name}"
+            if module.num_heads <= 0 or module.head_size_v <= 0:
+                logger.warning_once(
+                    "Invalid attention head layout on %s; "
+                    "attention-head steering and capture are unavailable.",
+                    full_name,
+                )
+                continue
+            layers.append(DiscoveredLayer(full_name, module, decoder.layer_id))
+    return [layer for layer in layers if id(layer.module) not in shared_modules]
 
 
 def _stack_indices(model: nn.Module) -> dict[str, int]:

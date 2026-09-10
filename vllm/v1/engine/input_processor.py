@@ -287,6 +287,7 @@ class InputProcessor:
                 algorithm,
                 params,
                 hidden_size=self.model_config.get_hidden_size(),
+                model_info=self._steering_model_info,
             )
         except (ValueError, TypeError, OSError) as exc:
             raise VLLMValidationError(f"Invalid steering source: {exc}") from exc

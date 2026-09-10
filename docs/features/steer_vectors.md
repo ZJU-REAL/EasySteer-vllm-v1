@@ -76,6 +76,7 @@ execution path and slot cache as explicit steering.
 | Algorithm | Intervention | Payload | Graph tiers |
 | --- | --- | --- | --- |
 | `direct` | add a vector: `h' = h + s·v` | `.gguf` or data | split, in-graph |
+| `attention_add` | add to concatenated attention head outputs before the output projection | `.gguf` or data | split, in-graph |
 | `erase` | remove a direction (projection) | `.gguf` or data | split, in-graph |
 | `replace` | replace the hidden state | `.gguf` or data | split, in-graph |
 | `concept_replace` | swap one direction for another | data | split, in-graph |
@@ -85,8 +86,19 @@ execution path and slot cache as explicit steering.
 | `moe_router` | adjust MoE expert routing at the gate | `RouterConfig`, inline config, or file | split; in-graph for `activate`, `deactivate`, `soft`, and `soft_topk` |
 
 Algorithms select their target component: `moe_router` edits `router_logits` at
-an accessible gate; the other algorithms edit decoder `hidden_states`. Steering
-and capture share component discovery and availability checks.
+an accessible gate; `attention_add` edits `attention_heads` before the attention
+output projection. The other algorithms edit decoder `hidden_states`.
+Steering and capture share component discovery and availability checks.
+
+`attention_add` supports standard decoder MHA/GQA with tensor parallel size 1.
+MLA, encoder attention, and cross-attention are not exposed as head outputs.
+Vectors concatenate query head slices, with zero slices for unselected heads,
+and require `normalize=False`. The width is the query head count times the
+per-head value-output size, which can differ from the residual hidden size.
+Capture the same activations with `stream="attention_heads"`; fetch results
+include per-layer `layouts` with `width`, `num_heads`, and `head_size`.
+The [ITI example](https://github.com/ZJU-REAL/EasySteer/tree/main/replications/iti)
+constructs these vectors from a small TruthfulQA subset.
 
 Native source files and in-memory data are normalized to canonical payloads
 before execution. Algorithms consume their payload kind rather than implement

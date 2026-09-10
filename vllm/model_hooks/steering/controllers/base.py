@@ -37,6 +37,11 @@ class SteeringController(nn.Module):
         # Key under which this controller is reachable from its custom
         # op (set when the hook is registered).
         self._op_key: str | None = None
+        self._output_width: int | None = None
+
+    @property
+    def output_width(self) -> int | None:
+        return self._output_width
 
     def configure_slot(
         self,

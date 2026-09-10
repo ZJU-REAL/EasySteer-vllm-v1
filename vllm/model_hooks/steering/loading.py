@@ -31,7 +31,6 @@ from vllm.model_hooks.steering.payloads import (
     Payload,
     RouterConfig,
     from_wire,
-    validate_model_shape,
 )
 
 _SOURCE_FORMATS = {
@@ -198,12 +197,21 @@ def resolve_vector_payload(
 
 
 def prepare_preload(
-    paths: list[str], algorithm: str, params: dict | None, *, hidden_size: int
+    paths: list[str],
+    algorithm: str,
+    params: dict | None,
+    *,
+    hidden_size: int,
+    model_info: dict | None,
 ) -> list[dict]:
     """Resolve and validate the complete preload batch before worker materialization."""
+    from vllm.model_hooks.steering.validation import validate_payload_model
+
     payloads = [
         resolve_vector_payload(path, None, algorithm, params=params) for path in paths
     ]
     for payload in payloads:
-        validate_model_shape(payload, hidden_size)
+        validate_payload_model(
+            payload, algorithm, hidden_size=hidden_size, model_info=model_info
+        )
     return payloads

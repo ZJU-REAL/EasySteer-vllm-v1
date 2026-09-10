@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Interventions on complete decoder hidden states."""
+"""Interventions on decoder states and concatenated attention head outputs."""
 
 import torch
 
@@ -15,7 +15,7 @@ from .base import SteeringController
 
 
 class HiddenStatesController(SteeringController):
-    """DecoderLayer intervention controller for full hidden states.
+    """Tensor intervention controller with optional decoder residuals.
 
     Hook-based: the controller stays outside the model tree and
     `process_output_hook` is registered as a forward hook on the
@@ -172,10 +172,17 @@ class HiddenStatesController(SteeringController):
         """
         if self._op_key is None:
             return output
-        adapter = COMPONENTS[HIDDEN_STATES].adapter
+        adapter = COMPONENTS[self.component_id].adapter
         hidden_states, residual, other_outputs, original_format = adapter.read_output(
             output
         )
+        if self.output_width is not None and (
+            hidden_states.ndim != 2 or hidden_states.shape[-1] != self.output_width
+        ):
+            raise ValueError(
+                f"{self.component_id} requires [tokens, {self.output_width}] output, "
+                f"got {tuple(hidden_states.shape)}"
+            )
 
         if self._graph_mode:
             assert self.graph_tables is not None

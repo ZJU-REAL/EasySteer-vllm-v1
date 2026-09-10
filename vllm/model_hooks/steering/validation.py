@@ -72,42 +72,61 @@ def request_position_groups(request) -> tuple[tuple, ...]:
 
 
 def validate_request_model(request, hidden_size: int, model_info: dict | None) -> None:
-    for index, vector in enumerate(request.vectors):
-        validate_model_shape(vector.payload, hidden_size)
-        if model_info is None:
-            # Initial defaults are constructed before workers load the model.
-            # They are checked again when the discovered inventory arrives.
-            continue
-        component = algorithm_target(vector.algorithm)
-        available = model_info.get(component, {})
-        layers = effective_layers(vector.payload, vector.target_layers)
-        if not layers or not layers.intersection(available):
-            raise ValueError(
-                f"Steering vector {index} targets no modules: {component} "
-                f"layers {sorted(layers)}; available layers {sorted(available)}"
-            )
-        missing = layers.difference(available)
-        if missing:
-            raise ValueError(
-                f"Steering vector {index} targets unavailable {component} "
-                f"layers {sorted(missing)}"
-            )
-        if vector.payload["kind"] == "router":
-            configs = vector.payload["extra"]["layers"]
-            for layer in layers:
-                config = configs[str(layer)]
-                if config["mode"] == "soft_topk":
-                    width = available[layer]
-                    if width is None:
-                        raise ValueError(
-                            f"Cannot validate moe_router topk: gate at layer "
-                            f"{layer} does not expose its output width"
-                        )
-                    if config["topk"] > width:
-                        raise ValueError(
-                            f"moe_router topk {config['topk']} exceeds expert "
-                            f"count {width} at layer {layer}"
-                        )
+    for vector in request.vectors:
+        validate_payload_model(
+            vector.payload,
+            vector.algorithm,
+            hidden_size=hidden_size,
+            model_info=model_info,
+            target_layers=vector.target_layers,
+        )
+
+
+def validate_payload_model(
+    payload: dict,
+    algorithm: str,
+    *,
+    hidden_size: int,
+    model_info: dict | None,
+    target_layers: list[int] | None = None,
+) -> None:
+    """Validate requests and preloads against the same discovered component."""
+    component = algorithm_target(algorithm)
+    if component == "hidden_states":
+        validate_model_shape(payload, hidden_size)
+    if model_info is None:
+        # Startup defaults are checked again after workers load the model.
+        return
+    available = model_info.get(component, {})
+    layers = effective_layers(payload, target_layers)
+    if not layers or not layers.intersection(available):
+        raise ValueError(
+            f"Steering vector targets no modules: {component} "
+            f"layers {sorted(layers)}; available layers {sorted(available)}"
+        )
+    missing = layers.difference(available)
+    if missing:
+        raise ValueError(
+            f"Steering vector targets unavailable {component} layers {sorted(missing)}"
+        )
+    if component == "attention_heads":
+        validate_model_shape(payload, {layer: available[layer] for layer in layers})
+    if payload["kind"] == "router":
+        configs = payload["extra"]["layers"]
+        for layer in layers:
+            config = configs[str(layer)]
+            if config["mode"] == "soft_topk":
+                width = available[layer]
+                if width is None:
+                    raise ValueError(
+                        f"Cannot validate moe_router topk: gate at layer "
+                        f"{layer} does not expose its output width"
+                    )
+                if config["topk"] > width:
+                    raise ValueError(
+                        f"moe_router topk {config['topk']} exceeds expert "
+                        f"count {width} at layer {layer}"
+                    )
 
 
 def validate_request_admission(

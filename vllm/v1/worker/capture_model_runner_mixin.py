@@ -63,10 +63,10 @@ class CaptureModelRunnerMixin:
     # ------------------------------------------------------------------
 
     def start_capture(self, stream: str, **config_kwargs) -> bool:
-        """Enable a capture stream ('hidden_states' or 'router_logits').
+        """Enable a capture stream for a discovered model component.
 
         Args:
-            stream: Component name, such as 'hidden_states' or 'router_logits'.
+            stream: 'hidden_states', 'router_logits', or 'attention_heads'.
             **config_kwargs: StreamConfig options: layers, dtype, select,
                 reduce, and budget_rows. Select uses SelectSpec.to_wire().
         """

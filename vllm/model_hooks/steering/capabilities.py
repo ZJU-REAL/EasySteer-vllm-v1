@@ -22,6 +22,9 @@ class AlgorithmCapabilities:
 
 ALGORITHM_CAPABILITIES = {
     "direct": AlgorithmCapabilities("direction", "gguf", True),
+    "attention_add": AlgorithmCapabilities(
+        "direction", "gguf", target_component="attention_heads"
+    ),
     "linear": AlgorithmCapabilities("linear", "none"),
     "loreft": AlgorithmCapabilities("reft", "none"),
     "lm_steer": AlgorithmCapabilities("lowrank", "none"),

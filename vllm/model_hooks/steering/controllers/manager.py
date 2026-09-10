@@ -8,7 +8,11 @@ shared with capture.
 """
 
 from vllm.logger import init_logger
-from vllm.model_hooks.components.registry import ModelComponents, get_component
+from vllm.model_hooks.components.registry import (
+    ATTENTION_HEADS,
+    ModelComponents,
+    get_component,
+)
 from vllm.model_hooks.steering import ops as steer_ops
 
 from .base import SteeringController
@@ -22,6 +26,7 @@ _CONTROLLER_REGISTRY: dict[str, type[SteeringController]] = {
     controller.component_id: controller
     for controller in (HiddenStatesController, RouterLogitsController)
 }
+_CONTROLLER_REGISTRY[ATTENTION_HEADS] = HiddenStatesController
 
 
 class ControllerManager:
@@ -58,7 +63,9 @@ class ControllerManager:
             if op_key in self.controllers:
                 continue
             controller = controller_class()
+            controller.component_id = component_id
             controller.layer_id = layer.layer_id
+            controller._output_width = layer.width
             controller._op_key = op_key
             # Keep a reference to the hooked module without registering
             # it as a submodule (that would cycle the module tree); the

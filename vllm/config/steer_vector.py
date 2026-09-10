@@ -130,10 +130,25 @@ class SteerVectorConfig:
             else frozenset()
         )
         moe_gate = self.graph_mode != "split" and declared_graph_gate(self.algorithms)
+        components = sorted(declared_components(self.algorithms))
         factors = (
             self.graph_mode,
-            tuple(sorted(declared_components(self.algorithms))),
-            tuple(sorted(families)),
+            tuple(components),
+            tuple(
+                (
+                    component,
+                    tuple(
+                        sorted(
+                            declared_graph_families(
+                                self.algorithms, component_id=component
+                            )
+                        )
+                    ),
+                )
+                for component in components
+            )
+            if self.graph_mode != "split"
+            else (),
             moe_gate,
             self.max_steer_vectors if families or moe_gate else None,
             self.graph_max_rank if "lowrank" in families else None,
@@ -192,10 +207,12 @@ class SteerVectorConfig:
         from vllm.model_hooks.components.registry import get_component
         from vllm.model_hooks.steering.capabilities import declared_components
 
-        return [
-            get_component(component).steering_op
-            for component in sorted(declared_components(self.algorithms))
-        ]
+        return sorted(
+            {
+                get_component(component).steering_op
+                for component in declared_components(self.algorithms)
+            }
+        )
 
     @property
     def adapter_dtype(self) -> torch.dtype:

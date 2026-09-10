@@ -55,9 +55,8 @@ class WorkerSteeringState:
         self._controller_manager: ControllerManager | None = None
         self.steer_vector_config = steer_vector_config
         self.device = device
-        self.payload_cache = PayloadCache(
-            str(device), steer_vector_config, hidden_size=hidden_size
-        )
+        self.hidden_size = hidden_size
+        self.payload_cache = PayloadCache(str(device), steer_vector_config)
         self._config_slots: dict[str, _ConfigSlot] = {}
         self._slot_clauses: dict[int, list[dict | None]] = {}
         self._slot_groups: dict[int, tuple[tuple, ...]] = {}
@@ -299,10 +298,11 @@ class WorkerSteeringState:
                 not controller._graph_mode or not controller.graph_tables
             ):
                 continue
-            if controller.component_id == HIDDEN_STATES:
-                width = self.payload_cache.hidden_size
-            else:
-                width = controller.output_width
+            width = (
+                self.hidden_size
+                if controller.component_id == HIDDEN_STATES
+                else controller.output_width
+            )
             assert controller.layer_id is not None
             info.setdefault(controller.component_id, {})[controller.layer_id] = width
         return info

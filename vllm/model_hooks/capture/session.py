@@ -10,6 +10,8 @@ One CaptureSession per worker owns named capture *streams*:
   each MoE block's gate/router submodule (works for any architecture
   exposing a separate gate/router module). When router-logits steering is
   active, the captured logits are the post-steering ones.
+- ``attention_heads``: concatenated query-head outputs of ordinary decoder
+  attention, before the output projection and after any head-output steering.
 
 Hooks never mutate the model tree (no wrappers, no module renames) and
 are inert until a stream is enabled. On the V2 runner, hook bodies trace
@@ -62,6 +64,7 @@ from vllm.model_hooks.capture.selection import (
 )
 from vllm.model_hooks.capture.store import StreamConfig, StreamStore
 from vllm.model_hooks.components.registry import (
+    ATTENTION_HEADS,
     COMPONENTS,
     ComponentDescriptor,
     ComponentTarget,
@@ -87,6 +90,7 @@ class CaptureSession:
         self._unsupported_requests: set[str] = set()
         self._hook_handles: list = []
         self._hooked_layers: dict[str, set[int]] = {name: set() for name in COMPONENTS}
+        self._layouts: dict[str, dict[int, dict[str, int]]] = {}
         self._attached = False
         self.graph_state: CaptureGraphState | None = None
         self._graph_replays = 0
@@ -200,6 +204,15 @@ class CaptureSession:
         if self._attached:
             return
         for component in COMPONENTS.values():
+            self._layouts[component.id] = {
+                target.layer_id: {
+                    key: value
+                    for key in ("width", "num_heads", "head_size")
+                    if (value := getattr(target, key)) is not None
+                }
+                for target in components[component.id]
+                if target.width is not None
+            }
             self._hooked_layers[component.id] = self._attach_stream_hooks(
                 components[component.id], component
             )
@@ -233,7 +246,7 @@ class CaptureSession:
             name, layer_id = layer.name, layer.layer_id
             target = layer.module
 
-            def hook(mod, args, output, _lid=layer_id, _name=name):
+            def hook(mod, args, output, _lid=layer_id, _name=name, _width=layer.width):
                 if torch.compiler.is_compiling():
                     # Ordinary compiled artifacts stay free of capture.
                     # A capture graph records raw forward with skip_compiled;
@@ -249,6 +262,13 @@ class CaptureSession:
                 tensor, tensor_owned = component.adapter.capture_rows(output)
                 if tensor is None:
                     return
+                if _width is not None and (
+                    tensor.ndim != 2 or tensor.shape[-1] != _width
+                ):
+                    raise ValueError(
+                        f"{stream} on {_name!r} expects (tokens, {_width}), "
+                        f"got {tuple(tensor.shape)}"
+                    )
                 if recording:
                     assert graph_state is not None
                     graph_state.record(stream, _lid, tensor, _name)
@@ -275,6 +295,7 @@ class CaptureSession:
         self._request_selects.clear()
         self._cache_hits.clear()
         self._unsupported_requests.clear()
+        self._layouts.clear()
         for layers in self._hooked_layers.values():
             layers.clear()
 
@@ -402,12 +423,22 @@ class CaptureSession:
                 "Capture hooks are not attached to this model; "
                 "attachment happens once at model load."
             )
+        config = StreamConfig(**config_kwargs)
+        if stream == ATTENTION_HEADS:
+            available = self._hooked_layers[stream]
+            if not available:
+                raise ValueError("No supported decoder attention head outputs found")
+            if config.layers is not None and config.layers - available:
+                raise ValueError(
+                    "Unsupported attention head capture layers: "
+                    f"{sorted(config.layers - available)}"
+                )
         if not self._hooked_layers[stream]:
             logger.warning(
                 "Enabling %s capture but no usable component hooks were found.",
                 stream,
             )
-        self._streams[stream] = StreamStore(StreamConfig(**config_kwargs))
+        self._streams[stream] = StreamStore(config)
 
     def disable_stream(self, stream: str) -> None:
         if stream in self._streams:
@@ -425,13 +456,19 @@ class CaptureSession:
             return {}
         store.flush()  # capture any rows staged since the last step
         if req_ids is not None:
-            return store.serialize(layers=layers, req_ids=req_ids, clear_selected=clear)
-        result = store.serialize(layers=layers)
-        if clear:
-            if layers is None:
-                store.clear()
-            else:
-                store.drop_layers(list(result))
+            result = store.serialize(
+                layers=layers, req_ids=req_ids, clear_selected=clear
+            )
+        else:
+            result = store.serialize(layers=layers)
+            if clear:
+                if layers is None:
+                    store.clear()
+                else:
+                    store.drop_layers(list(result))
+        for layer, info in result.items():
+            if layout := self._layouts.get(stream, {}).get(layer):
+                info["layout"] = layout.copy()
         return result
 
     def clear_stream(self, stream: str) -> None:
@@ -443,6 +480,7 @@ class CaptureSession:
         store = self._streams.get(stream)
         hooked = len(self._hooked_layers.get(stream, ()))
         execution = {
+            "layouts": self._layouts.get(stream, {}),
             "graph_ready": self.graph_state is not None and self.graph_state.ready,
             "graph_buffer_bytes": 0
             if self.graph_state is None

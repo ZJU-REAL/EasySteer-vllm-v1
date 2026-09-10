@@ -24,8 +24,9 @@ The public entry points remain `vllm.steer_vectors` and `vllm.capture`.
 The component descriptors live in `model_hooks/components/registry.py`.
 Each descriptor supplies layer discovery, hook-target resolution, output adapters,
 and availability checks. `hidden_states` targets decoder outputs;
-`router_logits` targets an accessible MoE gate. A fused router that bypasses the
-gate module is unavailable to both consumers.
+`attention_heads` targets standard decoder attention outputs before their output
+projection; `router_logits` targets an accessible MoE gate. A fused router that
+bypasses the gate module is unavailable to both consumers.
 
 Discovery uses attention/Mamba and MoE interfaces plus indexed decoder-stack
 contracts, without model-class lists. Residual-stream blocks can supplement an
@@ -36,15 +37,19 @@ accessor; new layouts outside these contracts require an explicit adaptation.
 
 `discover_components` resolves one `ModelComponents` directory for the model.
 Steering and capture consume its `ComponentTarget` records, which contain the
-global layer index, module name and usable hook target. Controllers are indexed
-directly by component and layer. Each controller declares its graph masks and
+global layer index, module name and usable hook target. Attention targets also
+record the query head count and value-output head size to determine the actual
+component width. Controllers are indexed directly by component and layer.
+Each controller declares its graph masks and
 initializes its component tables; graph state uses this shared interface without
 testing concrete controller classes.
 
 Steering controllers live under `model_hooks/steering/controllers/`, with one
 module each for hidden states and router logits. A component's eager and graph
-execution stay together. The shared controller lifecycle and controller index
-live in `base.py` and `manager.py`. Graph eligibility, persistent state and tensor
+execution stay together. Attention head outputs reuse the hidden-state
+controller and additive kernel with their own component width. The shared
+controller lifecycle and controller index live in `base.py` and `manager.py`.
+Graph eligibility, persistent state and tensor
 kernels live in `model_hooks/steering/graph/`.
 
 Algorithm capabilities declare the target component, so controller installation
@@ -85,14 +90,14 @@ request gets a lightweight layer mapping. Algorithms using the same content
 share materialized values. Application scale, selectors
 and normalization belong to configuration slots rather than the payload cache.
 
-The frontend validates hidden dimensions, each vector's effective target layers
+The frontend validates component widths, each vector's effective target layers
 and router top-k against an inventory returned by the loaded workers. Pipeline
 stages contribute their global layer indices to that inventory. Invalid requests
 are rejected before worker admission, including a composition with one invalid
-vector. Preloads also validate hidden dimensions before the worker RPC. The cache
+vector. Preloads also validate component widths before the worker RPC. The cache
 retains a defensive shape check before materialization. Canonical payloads
 validate matrix and bias relationships when constructed. Graph tables may pad
-low-rank axes to their configured capacity; hidden dimensions must match exactly.
+low-rank axes to their configured capacity; component widths must match exactly.
 
 ## The two graph tiers
 
@@ -245,7 +250,10 @@ cleanup do not participate in the new stream.
 Within a forward pass, each capture stream reuses its row-selection plan and labels across layers. Only the layer values are gathered or reduced again. Plans are invalidated for a new batch geometry or store, and distinguish device and effective token length. Captured values are staged until the step-end transfer, with ownership preserved for model buffers that may be reused.
 
 Capture serialization and deserialization use one dtype contract in
-`capture/serialization.py`. Storage budgets apply to currently retained rows;
+`capture/serialization.py`. Fetch results include each captured layer's component
+layout; `attention_heads` records `width`, query `num_heads`, and value-output
+`head_size`. Stored values remain two-dimensional `(rows, width)` tensors.
+Storage budgets apply to currently retained rows;
 fetching and clearing a layer releases its row budget for subsequent captures.
 Budget limits are applied before gathering activation values. When all requested
 layers are full, normal graph dispatch resumes while selected dropped rows are

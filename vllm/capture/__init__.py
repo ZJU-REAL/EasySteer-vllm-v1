@@ -8,6 +8,7 @@ _EXPORTS = {
     "SelectSpec": "vllm.model_hooks.selection.spec",
     "HIDDEN_STATES": "vllm.model_hooks.components.registry",
     "ROUTER_LOGITS": "vllm.model_hooks.components.registry",
+    "ATTENTION_HEADS": "vllm.model_hooks.components.registry",
     "CaptureMeta": "vllm.model_hooks.capture.serialization",
     "deserialize_captured": "vllm.model_hooks.capture.serialization",
     "match_capture_request_id": "vllm.model_hooks.capture.serialization",

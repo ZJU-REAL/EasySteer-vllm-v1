@@ -4,6 +4,7 @@
 
 from vllm.model_hooks.steering.algorithms import get_algorithm
 from vllm.model_hooks.steering.algorithms.registry import ALGORITHM_REGISTRY
+from vllm.model_hooks.steering.capabilities import algorithm_target
 from vllm.model_hooks.steering.request import SteeringRequest
 
 from .kernels import GRAPH_FAMILIES
@@ -144,6 +145,8 @@ def resolve_graph_mode(
 
 def declared_graph_families(
     algorithms: list[str] | str | None,
+    *,
+    component_id: str | None = None,
 ) -> frozenset[str]:
     """Decoder kernel families the declared workload can ever use.
 
@@ -156,10 +159,13 @@ def declared_graph_families(
     keeps every family.
     """
 
-    if algorithms is None or algorithms == "all":
-        return frozenset(GRAPH_FAMILIES)
+    names = (
+        ALGORITHM_REGISTRY if algorithms is None or algorithms == "all" else algorithms
+    )
     families = set()
-    for name in algorithms:
+    for name in names:
+        if component_id is not None and algorithm_target(name) != component_id:
+            continue
         family = get_algorithm(name).graph_family
         if family in GRAPH_FAMILIES:  # decoder families only (not moe_gate)
             families.add(family)

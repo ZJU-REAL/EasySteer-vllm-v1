@@ -3,7 +3,7 @@
 
 from .base import BaseSteerVectorAlgorithm
 from .concept_replace import ConceptReplaceAlgorithm
-from .direct import DirectAlgorithm
+from .direct import AttentionAddAlgorithm, DirectAlgorithm
 from .erase import EraseAlgorithm
 from .linear import LinearTransformAlgorithm
 from .lm_steer import LMSteerAlgorithm
@@ -17,6 +17,7 @@ from .registry import (
 from .replace import ReplaceAlgorithm
 
 __all__ = [
+    "AttentionAddAlgorithm",
     "BaseSteerVectorAlgorithm",
     "ConceptReplaceAlgorithm",
     "DirectAlgorithm",

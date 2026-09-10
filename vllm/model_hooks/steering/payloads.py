@@ -82,9 +82,8 @@ class Payload:
 class DirectionVector(Payload):
     """Per-layer direction vectors: ``h' = h + scale * v``.
 
-    Accepted by the direct, erase and replace algorithms. Layers are
-    keyed by true layer id; each value is a 1-D vector of the model's
-    hidden size.
+    Accepted by direct, erase, replace and attention_add. Each true layer id
+    maps to a 1-D vector; admission checks its width against the component.
     """
 
     kind = "direction"
@@ -96,9 +95,6 @@ class DirectionVector(Payload):
             int(layer): _as_array(f"layers[{layer}]", vec, ndim=1)
             for layer, vec in layers.items()
         }
-        dims = {v.shape[0] for v in self.layers.values()}
-        if len(dims) > 1:
-            raise ValueError(f"layer vectors have differing sizes: {sorted(dims)}")
 
     def _tensors(self) -> dict[str, np.ndarray]:
         return {f"layer.{layer}": vec for layer, vec in self.layers.items()}
@@ -494,7 +490,9 @@ def from_wire(wire: dict[str, Any]) -> Payload:
     return payload
 
 
-def validate_model_shape(wire: dict[str, Any], hidden_size: int) -> None:
+def validate_model_shape(
+    wire: dict[str, Any], hidden_size: int | dict[int, int | None]
+) -> None:
     """Check admitted tensor shapes against the model before device allocation.
 
     Hidden axes must match exactly in every execution mode; rank axes are
@@ -512,13 +510,21 @@ def validate_model_shape(wire: dict[str, Any], hidden_size: int) -> None:
         "router": {},
     }
     for name, entry in wire["tensors"].items():
+        if isinstance(hidden_size, dict):
+            layer = int(name.rsplit(".", 1)[1])
+            if layer not in hidden_size:
+                continue
+            width = hidden_size[layer]
+            expected = f"component width {width} at layer {layer}"
+        else:
+            width = hidden_size
+            expected = f"model hidden size {width}"
         axes = (0,) if kind in ("direction", "concept_pair") else named_axes[kind][name]
         shape = entry["shape"]
-        if any(shape[axis] != hidden_size for axis in axes):
+        if width is None or any(shape[axis] != width for axis in axes):
             raise ValueError(
                 f"{kind} payload {name!r} shape {tuple(shape)} does not match "
-                f"model hidden size {hidden_size}; hidden dimensions must match "
-                "exactly"
+                f"{expected}; hidden dimensions must match exactly"
             )
 
 

@@ -52,23 +52,33 @@ class SteeringGraphState:
         families = declared_graph_families(self.config.algorithms)
         if declared_graph_gate(self.config.algorithms):
             families = families | {"moe_gate"}
-        plans = [
-            (controller, controller.graph_mask_names(families))
-            for controller in controller_manager.controllers.values()
-        ]
-        num_masks = sum(len(names) for _, names in plans if names is not None)
+        plans = []
+        for controller in controller_manager.controllers.values():
+            local_families = declared_graph_families(
+                self.config.algorithms, component_id=controller.component_id
+            )
+            if "moe_gate" in families:
+                local_families = local_families | {"moe_gate"}
+            plans.append(
+                (
+                    controller,
+                    local_families,
+                    controller.graph_mask_names(local_families),
+                )
+            )
+        num_masks = sum(len(names) for _, _, names in plans if names is not None)
         self.step_masks = torch.zeros(
             (num_masks, max_num_tokens), dtype=dtype, device=self.device
         )
         mask_rows = iter(self.step_masks.unbind(0))
-        for controller, names in plans:
+        for controller, local_families, names in plans:
             if names is None:
                 continue
             controller.init_graph_buffers(
-                families,
+                local_families,
                 {name: next(mask_rows) for name in names},
                 capacity=self.config.max_steer_vectors,
-                hidden_size=hidden_size,
+                hidden_size=controller.output_width or hidden_size,
                 max_rank=self.config.graph_max_rank,
                 dtype=dtype,
                 device=self.device,

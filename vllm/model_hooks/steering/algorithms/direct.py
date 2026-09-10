@@ -29,3 +29,8 @@ class DirectAlgorithm(BaseSteerVectorAlgorithm):
         if self.normalize:
             return self._renormalize(hidden_state, transformed)
         return transformed
+
+
+@register_algorithm("attention_add")
+class AttentionAddAlgorithm(DirectAlgorithm):
+    """Add a concatenated head direction before the attention output projection."""

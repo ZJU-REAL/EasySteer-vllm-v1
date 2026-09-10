@@ -1128,6 +1128,7 @@ class AsyncLLM(EngineClient):
         self, paths: list[str], algorithm: str = "direct", params: dict | None = None
     ) -> None:
         """Resolve once at the frontend, then preload exact content on all workers."""
+        await self._ensure_steering_model_info()
         payloads = await asyncio.to_thread(
             self.input_processor.prepare_steering_preload, paths, algorithm, params
         )

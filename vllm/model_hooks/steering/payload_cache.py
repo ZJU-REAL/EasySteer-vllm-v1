@@ -9,7 +9,6 @@ from vllm.model_hooks.steering.payloads import (
     effective_layers,
     is_broadcast_payload,
     materialize,
-    validate_model_shape,
 )
 
 logger = init_logger(__name__)
@@ -18,10 +17,9 @@ logger = init_logger(__name__)
 class PayloadCache:
     """Cache tensor content independently of a request's layer mapping."""
 
-    def __init__(self, device: str, steer_vector_config, *, hidden_size: int):
+    def __init__(self, device: str, steer_vector_config):
         self.device = device
         self.steer_vector_config = steer_vector_config
-        self.hidden_size = hidden_size
         self.capacity = max(1, steer_vector_config.max_steer_vectors)
         self._entries: OrderedDict[str, dict] = OrderedDict()
 
@@ -40,7 +38,6 @@ class PayloadCache:
         if entry is not None:
             self._entries.move_to_end(key)
         else:
-            validate_model_shape(wire, self.hidden_size)
             layer_payloads = materialize(
                 wire,
                 self.device,
