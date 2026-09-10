@@ -30,7 +30,8 @@ class StreamConfig:
     same clause semantics steering resolves, so "which rows to capture"
     and "which tokens to steer" mean the same thing. `reduce` applies a
     within-sample reduction ("all" | "last" | "mean"); `budget_rows`
-    caps stored rows per layer.
+    caps stored rows per layer. `budget_bytes` limits stored values/labels and
+    pending transfers across layers, reporting overflow when capture is fetched.
     """
 
     def __init__(
@@ -40,6 +41,7 @@ class StreamConfig:
         reduce: str = "all",
         select: dict | None = None,
         budget_rows: int | None = None,
+        budget_bytes: int | None = None,
     ):
         if reduce not in ("all", "last", "mean"):
             raise ValueError(f"reduce must be 'all', 'last' or 'mean', got {reduce!r}")
@@ -58,7 +60,17 @@ class StreamConfig:
         if budget_rows is not None and budget_rows < 0:
             raise ValueError("budget_rows must be nonnegative")
         self.budget_rows = budget_rows
-        if reduce == "all" and select is None and budget_rows is None:
+        if budget_bytes is not None and (
+            type(budget_bytes) is not int or budget_bytes < 0
+        ):
+            raise ValueError("budget_bytes must be a nonnegative integer")
+        self.budget_bytes = budget_bytes
+        if (
+            reduce == "all"
+            and select is None
+            and budget_rows is None
+            and budget_bytes is None
+        ):
             logger.warning_once(
                 "Capture enabled with reduce='all', no select clause and "
                 "no budget_rows: every position of every request "
@@ -112,6 +124,8 @@ class StreamStore:
         self.tokens_dropped = 0
         self._warned_budget = False
         self._pending: list[tuple[int, torch.Tensor, torch.Tensor, str]] = []
+        self._stored_bytes = 0
+        self._budget_error: str | None = None
         # Geometry and request selections are fixed during one forward pass.
         # Layers share its row plans; a fresh geometry invalidates every plan.
         self._row_plan_geometry: BatchGeometry | None = None
@@ -125,6 +139,44 @@ class StreamStore:
 
     def wants_layer(self, layer_id: int) -> bool:
         return self.config.layers is None or layer_id in self.config.layers
+
+    @property
+    def storage_bytes(self) -> int:
+        """Raw stored values/labels plus their pending transfer volume.
+
+        Graph buffers, model temporaries and serialization copies are separate.
+        """
+        return self._stored_bytes + sum(
+            tensor.numel() * tensor.element_size() + meta.numel() * meta.element_size()
+            for _, tensor, meta, _ in self._pending
+        )
+
+    def row_bytes(self, tensor: torch.Tensor) -> int:
+        dtype = self.config.dtype
+        element_size = (
+            tensor.element_size()
+            if dtype is None
+            else torch.empty((), dtype=dtype, device="cpu").element_size()
+        )
+        return (tensor.numel() // tensor.shape[0]) * element_size + 3 * 4
+
+    def _within_byte_budget(self, rows: int, row_bytes: int) -> bool:
+        if self._budget_error is not None:
+            return False
+        budget = self.config.budget_bytes
+        if budget is None:
+            return True
+        required = self.storage_bytes + rows * row_bytes
+        if required > budget:
+            # Report at fetch, keeping the model forward and engine healthy.
+            self._budget_error = (
+                f"Capture CPU storage budget ({budget} bytes) exceeded: "
+                f"the next rows require {required} bytes. Reduce the capture "
+                "batch, layers or selected rows, or increase budget_bytes. "
+                "No complete capture result is available."
+            )
+            return False
+        return True
 
     def mark_elided(self, req_id: str) -> None:
         """Flag a request admitted with a prefix-cache hit as incomplete.
@@ -177,6 +229,8 @@ class StreamStore:
                 self._failed_requests.update(errors)
 
     def remaining_rows(self, layer_id: int) -> int | None:
+        if self._budget_error is not None:
+            return 0
         if self.config.budget_rows is None:
             return None
         pending = sum(t.shape[0] for lid, t, _, _ in self._pending if lid == layer_id)
@@ -201,15 +255,22 @@ class StreamStore:
             self._drop_rows(count)
 
     def _limit_rows(self, layer_id: int, count: int) -> int:
+        if self._budget_error is not None:
+            return 0
         remaining = self.remaining_rows(layer_id)
         keep = count if remaining is None else min(count, remaining)
         self._drop_rows(count - keep)
         return keep
 
-    def limit_rows(self, layer_id: int, count: int) -> int:
+    def limit_rows(
+        self, layer_id: int, count: int, row_bytes: int | None = None
+    ) -> int:
         """Apply the budget before gathering or cloning activation values."""
         with self.lock:
-            return self._limit_rows(layer_id, count)
+            keep = self._limit_rows(layer_id, count)
+            if row_bytes is not None and not self._within_byte_budget(keep, row_bytes):
+                return 0
+            return keep
 
     def append(
         self,
@@ -244,6 +305,10 @@ class StreamStore:
                 )
             keep = self._limit_rows(layer_id, tensor.shape[0])
             if keep == 0:
+                return
+            if self.config.budget_bytes is not None and not self._within_byte_budget(
+                keep, self.row_bytes(tensor)
+            ):
                 return
             tensor = tensor[:keep]
             meta = meta[:keep]
@@ -312,6 +377,10 @@ class StreamStore:
                 self._layer_rows[layer_id] = (
                     self._layer_rows.get(layer_id, 0) + host.shape[0]
                 )
+                self._stored_bytes += (
+                    host.numel() * host.element_size()
+                    + meta_host.numel() * meta_host.element_size()
+                )
             self._reclaim_requests()
 
     def serialize(
@@ -338,6 +407,8 @@ class StreamStore:
         request with bounded peak message size.
         """
         with self.lock:
+            if self._budget_error is not None:
+                raise RuntimeError(self._budget_error)
             failed = {
                 rid: reason
                 for rid, reason in self._failed_requests.items()
@@ -396,8 +467,11 @@ class StreamStore:
                 if not chunk_ids:
                     continue
                 selected = [chunks[index] for index in chunk_ids]
-                tensor = torch.cat([chunk.tensor for chunk in selected], dim=0)
-                meta = torch.cat([chunk.meta for chunk in selected], dim=0)
+                if len(selected) == 1:
+                    tensor, meta = selected[0].tensor, selected[0].meta
+                else:
+                    tensor = torch.cat([chunk.tensor for chunk in selected], dim=0)
+                    meta = torch.cat([chunk.meta for chunk in selected], dim=0)
                 result[layer_id] = serialize_capture_layer(
                     tensor, meta, self.req_table, layer_name
                 )
@@ -410,6 +484,10 @@ class StreamStore:
 
     def _remove_chunk(self, layer_id: int, chunk_id: int) -> None:
         chunk = self.chunks[layer_id].pop(chunk_id)
+        self._stored_bytes -= (
+            chunk.tensor.numel() * chunk.tensor.element_size()
+            + chunk.meta.numel() * chunk.meta.element_size()
+        )
         self._layer_rows[layer_id] -= chunk.tensor.shape[0]
         if not self.chunks[layer_id]:
             self.chunks.pop(layer_id)
@@ -457,6 +535,8 @@ class StreamStore:
             self.elided_reqs.clear()
             self._failed_requests.clear()
             self._layer_rows.clear()
+            self._stored_bytes = 0
+            self._budget_error = None
             self.tokens_dropped = 0
             self._warned_budget = False
             self._pending.clear()

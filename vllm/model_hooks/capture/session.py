@@ -501,6 +501,8 @@ class CaptureSession:
             "layers_captured": len(store.chunks),
             "tokens_stored": store.tokens_stored,
             "tokens_dropped": store.tokens_dropped,
+            "storage_bytes": store.storage_bytes,
+            "budget_bytes": store.config.budget_bytes,
             "reduce": store.config.reduce,
             "select": store.config.select,
             "meta_complete": True,

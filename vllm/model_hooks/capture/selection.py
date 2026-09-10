@@ -254,7 +254,10 @@ def prepare_rows(
     if plan is None:
         return None, None
     count = plan.meta.shape[0]
-    keep = store.limit_rows(layer_id, count)
+    row_bytes = (
+        store.row_bytes(tensor) if store.config.budget_bytes is not None else None
+    )
+    keep = store.limit_rows(layer_id, count, row_bytes)
     if keep == 0:
         return None, None
     if plan.mean_spans is not None:
@@ -268,7 +271,11 @@ def prepare_rows(
         )
     elif plan.indices is None:
         # Staged rows must survive subsequent model operations until flush().
-        rows = tensor[:keep] if tensor_owned else tensor[:keep].clone()
+        rows = (
+            tensor[:keep]
+            if tensor_owned and keep == tensor.shape[0]
+            else tensor[:keep].clone()
+        )
     else:
         rows = tensor[:total][plan.indices[:keep]]
     return rows, plan.meta if keep == count else plan.meta[:keep]

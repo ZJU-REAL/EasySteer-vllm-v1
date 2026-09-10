@@ -68,7 +68,7 @@ class CaptureModelRunnerMixin:
         Args:
             stream: 'hidden_states', 'router_logits', or 'attention_heads'.
             **config_kwargs: StreamConfig options: layers, dtype, select,
-                reduce, and budget_rows. Select uses SelectSpec.to_wire().
+                reduce, budget_rows, and budget_bytes. Select uses SelectSpec.to_wire().
         """
         self._capture_session().enable_stream(stream, **config_kwargs)
         return True
