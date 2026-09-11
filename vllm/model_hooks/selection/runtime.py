@@ -54,13 +54,15 @@ def clause_cache_key(apply_spec: dict | None) -> tuple | None:
 def selects_all_tokens(apply_spec: dict) -> bool:
     """Whether the clause selects every token of both phases.
 
-    Enables the fast path that skips position collection and steers
-    all of the slot's token rows directly.
+    Include selectors are unions with the phase-wide ``all`` selectors, so
+    they are redundant when both phases are already selected.  Only an
+    exclusion can make such a clause partial.  This enables the fast path
+    that skips position collection and steers all of the slot's token rows
+    directly, while leaving the original clause in the config fingerprint.
     """
     return (
         apply_spec.get("prompt") == "all"
         and apply_spec.get("generation") == "all"
-        and all(apply_spec.get(key) is None for key in INCLUDE_SELECTOR_KEYS)
         and all(apply_spec.get(key) is None for key in EXCLUDE_SELECTOR_KEYS)
     )
 
