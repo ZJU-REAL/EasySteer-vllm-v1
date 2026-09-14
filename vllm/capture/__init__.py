@@ -11,6 +11,8 @@ _EXPORTS = {
     "ATTENTION_HEADS": "vllm.model_hooks.components.registry",
     "CaptureMeta": "vllm.model_hooks.capture.serialization",
     "deserialize_captured": "vllm.model_hooks.capture.serialization",
+    "assemble_captured": "vllm.model_hooks.capture.serialization",
+    "validate_capture_topology": "vllm.model_hooks.capture.serialization",
     "match_capture_request_id": "vllm.model_hooks.capture.serialization",
     "CaptureSession": "vllm.model_hooks.capture.session",
     "StreamConfig": "vllm.model_hooks.capture.store",

@@ -66,6 +66,8 @@ class ControllerManager:
             controller.component_id = component_id
             controller.layer_id = layer.layer_id
             controller._output_width = layer.width
+            controller._global_output_width = layer.global_width
+            controller._feature_start = layer.feature_start
             controller._op_key = op_key
             # Keep a reference to the hooked module without registering
             # it as a submodule (that would cycle the module tree); the

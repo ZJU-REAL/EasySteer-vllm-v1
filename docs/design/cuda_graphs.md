@@ -276,9 +276,13 @@ endpoint or empty-spec clearing operation.
 
 Activation capture leaves ordinary graphs unchanged. Steps without selected
 capture rows keep their normal dispatch. Selected steps can use a separate FULL
-graph on a single worker, without speculative decoding or LoRA, when steering
+graph with ordinary TP, without speculative decoding or LoRA, when steering
 is disabled or `in_graph` and the batch is eligible for FULL replay. Other
-capture steps execute eagerly. The capture graph writes fixed GPU buffers;
+capture steps execute eagerly. Ordinary TP capture is supported with `PP=DP=1`
+and no context, sequence, or expert parallelism. All TP ranks coordinate graph
+creation and replay, even when a rank owns no captured outputs. Piecewise-only
+capture batches still execute eagerly.
+The capture graph writes fixed GPU buffers;
 selection, reduction and storage happen after replay. Its stream/layer variant
 is reused across selector, reduction and output-dtype changes.
 

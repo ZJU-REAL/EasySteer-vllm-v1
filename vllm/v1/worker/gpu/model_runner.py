@@ -405,13 +405,10 @@ class GPUModelRunner(
                     self.model, self.vllm_config, self.device
                 )
             from vllm.model_hooks.components.registry import (
-                ATTENTION_HEADS,
                 discover_components,
             )
 
             components = discover_components(self.model)
-            if self.parallel_config.tensor_parallel_size != 1:
-                components[ATTENTION_HEADS] = ()
             self._attach_steering_hooks(components)
             # Capture observes the outputs after steering has run.
             self._attach_capture_hooks(self.model, components)

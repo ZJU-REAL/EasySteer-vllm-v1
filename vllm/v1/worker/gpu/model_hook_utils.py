@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adapt V2 batches and CUDA graph execution to model hooks."""
 
+import hashlib
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_hooks.capture.graph import CaptureGraphState
 from vllm.model_hooks.selection.batch import BatchGeometry
 from vllm.platforms import current_platform
@@ -36,29 +39,81 @@ def prepare_capture_graph(
     """Select and warm up a capture variant before staging real batch inputs."""
     idle = runner.cudagraph_manager
     steer = runner.vllm_config.steer_vector_config
+    topology = runner._capture_topology()
     if not (
         idle is not None
         and idle.cudagraph_mode.has_full_cudagraphs()
-        and runner.parallel_config.world_size_across_dp == 1
+        and all(
+            topology[key] == 1 for key in ("pp_size", "dp_size", "pcp_size", "dcp_size")
+        )
+        and not any(
+            topology[key]
+            for key in ("sequence_parallel", "sequence_parallel_moe", "expert_parallel")
+        )
         and runner.speculative_config is None
         and runner.lora_config is None
         and (steer is None or steer.graph_mode == "in_graph")
     ):
         return None
-    candidate = idle.dispatch(
-        num_reqs, num_tokens, uniform_tok_count, num_active_loras, max_query_len
+    session = runner.capture_session
+    state = session.graph_state
+    candidate = None
+    signature = ()
+    expected_outputs = set()
+    local_error = None
+    try:
+        candidate = idle.dispatch(
+            num_reqs, num_tokens, uniform_tok_count, num_active_loras, max_query_len
+        )
+        if session.tp_size == 1 and candidate.cg_mode != CUDAGraphMode.FULL:
+            return None
+        signature = session.graph_signature()
+        expected_outputs = session.graph_expected_outputs()
+    except Exception as error:
+        local_error = error
+    rebuild = (
+        state is None
+        or state.signature != signature
+        or not state.ready
+        or runner.capture_graph_manager is None
     )
+    if session.tp_size > 1:
+        # Scheduling is shared, but graph cache state is local. A rank whose
+        # graph was released must not enter capture while its peers replay.
+        plan = (signature, candidate, idle._capture_descs.get(CUDAGraphMode.FULL, ()))
+        digest = hashlib.sha256(repr(plan).encode()).digest()
+        decisions = torch.zeros((session.tp_size, 6), dtype=torch.int64, device="cpu")
+        decisions[session.tp_rank, :4] = torch.tensor(
+            [
+                int.from_bytes(digest[i : i + 8], byteorder="big", signed=True)
+                for i in range(0, 32, 8)
+            ],
+            device="cpu",
+        )
+        decisions[session.tp_rank, 4] = local_error is None
+        decisions[session.tp_rank, 5] = rebuild
+        dist.all_reduce(decisions, group=get_tp_group().cpu_group)
+        if not decisions[:, 4].all():
+            raise RuntimeError(
+                "TP capture graph output validation failed"
+            ) from local_error
+        if not torch.equal(
+            decisions[:, :4], decisions[0, :4].expand(session.tp_size, 4)
+        ):
+            raise RuntimeError(
+                "TP workers disagree on the capture graph variant or batch"
+            )
+        rebuild = bool(decisions[:, 5].any())
+    elif local_error is not None:
+        raise local_error
+    assert candidate is not None
     if candidate.cg_mode != CUDAGraphMode.FULL:
         return None
-
-    session = runner.capture_session
-    signature = session.graph_signature()
-    state = session.graph_state
-    if state is not None and state.signature != signature:
+    if rebuild:
         release_capture_graph(runner)
         state = None
     if state is None:
-        state = CaptureGraphState(signature)
+        state = CaptureGraphState(signature, expected_outputs)
         session.graph_state = state
         initialized = False
         try:

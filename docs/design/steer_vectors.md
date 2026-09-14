@@ -38,8 +38,10 @@ accessor; new layouts outside these contracts require an explicit adaptation.
 `discover_components` resolves one `ModelComponents` directory for the model.
 Steering and capture consume its `ComponentTarget` records, which contain the
 global layer index, module name and usable hook target. Attention targets also
-record the query head count and value-output head size to determine the actual
-component width. Controllers are indexed directly by component and layer.
+record the local query head count, value-output head size, and owning output
+projection's TP rank and size. These determine local and global component widths
+and the feature offset; decoder outputs and accessible router logits remain
+replicated under ordinary TP. Controllers are indexed directly by component and layer.
 Each controller declares its graph masks and
 initializes its component tables; graph state uses this shared interface without
 testing concrete controller classes.
@@ -89,6 +91,14 @@ Broadcast payloads share their tensors across target-layer combinations; each
 request gets a lightweight layer mapping. Algorithms using the same content
 share materialized values. Application scale, selectors
 and normalization belong to configuration slots rather than the payload cache.
+
+Attention direction payloads retain their global head order on the public API
+and in content identity. Worker materialization slices the direction to the
+target's feature interval before filling local controller and graph tables.
+Hidden-state payloads remain replicated. Each rank applies its local attention
+delta before the existing row-parallel output projection, whose reduction
+combines the result; steering adds no forward collective. Graph table addresses
+stay fixed while slots are updated, as for single-worker steering.
 
 The frontend validates component widths, each vector's effective target layers
 and router top-k against an inventory returned by the loaded workers. Pipeline
@@ -217,15 +227,27 @@ describes the available structural checks, numerical comparisons and benchmarks.
 
 Capture lives in `model_hooks/capture/` and can run without steering algorithms,
 configuration slots or payload loading. Its hooks use the shared component
-descriptors and token-selection rules. The
-EasySteer capture helper currently requires a single worker and does not merge
-tensor-parallel shards.
+descriptors and token-selection rules. The EasySteer capture helper supports one
+ordinary TP group with `PP=DP=1`, without prefill/decode context parallelism,
+sequence parallelism (including MoE sequence parallelism), or expert parallelism.
+It validates worker topology before starting the stream, checks every worker's
+status, and assembles complete public results after fetch.
+
+All workers participate in stream lifecycle and dispatch. TP rank 0 alone
+stores and exports replicated hidden states and router logits. Attention is
+stored as local feature shards. Each exported layer declares its representation
+kind, TP rank and size, feature offset, and global width. `assemble_captured()`
+validates ownership, complete feature coverage, and identical row labels before
+joining attention shards in global query-head order. RPC reply order is not a
+layout contract, and `deserialize_captured()` alone only decodes local values.
 
 Steps whose effective selections are empty keep ordinary graph dispatch. When
-selected rows may exist, a single-worker engine can use a separate FULL capture
+selected rows may exist, an ordinary TP engine can use a separate FULL capture
 graph if the batch is eligible for FULL replay, speculative decoding and LoRA
 are disabled, and steering is either disabled or `in_graph`. Other capture steps
-use the raw eager forward. Ordinary compiled graphs contain no capture hooks.
+use the raw eager forward. At `TP>1`, all ranks participate in recording and
+replaying capture graphs, including ranks that do not store replicated values.
+Ordinary compiled graphs contain no capture hooks.
 
 The separate graph records the raw model forward, including steering, and copies
 component outputs into fixed GPU buffers. Selection, reduction, dtype conversion
@@ -234,6 +256,13 @@ is retained for the active streams and discovered layer sets; changing selectors
 reduction or output dtype does not require recording it again. Stopping capture
 disables its dispatch while retaining that variant for reuse. A different stream
 or layer signature replaces it when another FULL capture is needed.
+
+The variant signature is shared across TP ranks; expected capture outputs are
+local to each rank's ownership. A small control exchange checks compatible
+capture plans and coordinates rebuilding before native distributed graph
+recording. Activation tensors need no additional forward collective. A recording
+failure propagates as an engine error rather than choosing eager execution on
+one rank while peers remain in graph collectives.
 
 Successful capture RPCs are mirrored at request admission. `InputProcessor`
 evaluates each request's effective selection, including per-request overrides,
@@ -251,13 +280,24 @@ Within a forward pass, each capture stream reuses its row-selection plan and lab
 
 Capture serialization and deserialization use one dtype contract in
 `capture/serialization.py`. Fetch results include each captured layer's component
-layout; `attention_heads` records `width`, query `num_heads`, and value-output
-`head_size`. Stored values remain two-dimensional `(rows, width)` tensors.
+layout; `attention_heads` records local `width`, query `num_heads`, and value-output
+`head_size`. Assembly returns global layouts. Stored values remain
+two-dimensional `(rows, width)` tensors.
 Storage budgets apply to currently retained rows;
 fetching and clearing a layer releases its row budget for subsequent captures.
 Budget limits are applied before gathering activation values. When all requested
-layers are full, normal graph dispatch resumes while selected dropped rows are
-still counted. Draining retained rows makes that capacity available again.
+layers are full at `TP=1`, normal graph dispatch resumes while selected dropped
+rows are still counted. TP capture keeps a common execution decision while rows
+are selected, independent of local storage capacity. Draining retained rows
+makes that capacity available again.
+
+`start_capture` treats `budget_bytes` as a total across layers and workers,
+covering raw CPU values, labels, and pending transfers. Attention divides the
+limit equally across TP workers, rounding down; each share includes its own
+labels. Replicated streams keep the full limit on their owner. Unused headroom
+is not redistributed. Status reports each worker's assigned budget and usage.
+Overflow is recorded without failing a rank inside model forward and is raised
+at fetch; the client checks every rank and cleans up the stream on failure.
 
 Each serialized layer includes only the request IDs referenced by its labels.
 CPU chunks own rows for one request and are indexed by request and layer. A

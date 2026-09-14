@@ -143,7 +143,7 @@ class SteeringGraphState:
                 controller.set_graph_row(
                     row,
                     vector.algorithm,
-                    payload,
+                    controller.localize_payload(payload),
                     vector.scale,
                     normalize=bool(vector.normalize),
                 )

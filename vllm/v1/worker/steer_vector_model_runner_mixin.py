@@ -44,9 +44,22 @@ class SteerVectorModelRunnerMixin:
 
     def _attach_steering_hooks(self, components: "ModelComponents") -> None:
         """Attach steering to the discovered components after loading the model."""
+        from vllm.model_hooks.components.registry import ROUTER_LOGITS
+        from vllm.model_hooks.steering.capabilities import declared_components
+
         self._close_steering()
         vllm_config = self.vllm_config
         if vllm_config.steer_vector_config is not None:
+            parallel = getattr(vllm_config, "parallel_config", None)
+            if getattr(parallel, "use_sequence_parallel_moe", False) and (
+                ROUTER_LOGITS
+                in declared_components(vllm_config.steer_vector_config.algorithms)
+            ):
+                raise ValueError(
+                    "moe_router steering requires replicated token rows and does "
+                    "not support sequence-parallel MoE; omit moe_router from "
+                    "steer_algorithms or disable sequence-parallel MoE."
+                )
             try:
                 self._init_steer_vector_manager(vllm_config)
                 manager = self.steer_vector_manager

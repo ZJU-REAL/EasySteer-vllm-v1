@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import weakref
+from collections import deque
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from vllm.v1.executor.multiproc_executor import WorkerProc
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor, WorkerProc
 
 
 class _ExitWorkerLoop(RuntimeError):
@@ -65,3 +66,75 @@ def test_execute_worker_rpc_returns_worker_exception():
     assert len(outputs) == 1
     assert isinstance(outputs[0], RuntimeError)
     assert str(outputs[0]) == "test error"
+
+
+def _executor_with_response_queues(response_mqs):
+    executor = MultiprocExecutor.__new__(MultiprocExecutor)
+    executor.is_failed = False
+    executor.rpc_broadcast_mq = SimpleNamespace(enqueue=lambda message: None)
+    executor.response_mqs = response_mqs
+    executor.futures_queue = deque()
+    return executor
+
+
+@pytest.mark.parametrize("failed_ranks", [(0,), (1,), (0, 1)])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "start_capture",
+        "stop_capture",
+        "fetch_captured",
+        "clear_captured",
+        "capture_status",
+    ],
+)
+def test_failed_capture_control_drains_workers_before_next_rpc(method, failed_ranks):
+    """A recoverable worker error must not become the next call's response."""
+    success = WorkerProc.ResponseStatus.SUCCESS
+    failure = WorkerProc.ResponseStatus.FAILURE
+    queues = [
+        deque(
+            [(failure if rank in failed_ranks else success, "invalid"), (success, rank)]
+        )
+        for rank in range(2)
+    ]
+    executor = _executor_with_response_queues(
+        [
+            SimpleNamespace(dequeue=lambda timeout, queue=queue: queue.popleft())
+            for queue in queues
+        ]
+    )
+    with pytest.raises(RuntimeError, match="invalid"):
+        executor.collective_rpc(method)
+    assert executor.collective_rpc("stop_capture") == [0, 1]
+    assert all(not queue for queue in queues)
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "compile_or_warm_up_model",
+        "determine_available_memory",
+        "execute_model",
+        pytest.param(lambda worker: None, id="callable"),
+    ],
+)
+def test_model_rpc_failure_does_not_wait_for_rank_blocked_in_collective(method):
+    """Initialization failures must surface without waiting for other ranks."""
+
+    def blocked_rank_reply(*, timeout):
+        pytest.fail("Must not wait for a rank blocked in a model collective")
+
+    executor = _executor_with_response_queues(
+        [
+            SimpleNamespace(
+                dequeue=lambda timeout: (
+                    WorkerProc.ResponseStatus.FAILURE,
+                    "rank 0 failed",
+                )
+            ),
+            SimpleNamespace(dequeue=blocked_rank_reply),
+        ]
+    )
+    with pytest.raises(RuntimeError, match="rank 0 failed"):
+        executor.collective_rpc(method)

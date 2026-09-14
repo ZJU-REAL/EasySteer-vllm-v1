@@ -90,13 +90,18 @@ an accessible gate; `attention_add` edits `attention_heads` before the attention
 output projection. The other algorithms edit decoder `hidden_states`.
 Steering and capture share component discovery and availability checks.
 
-`attention_add` supports standard decoder MHA/GQA with tensor parallel size 1.
-MLA, encoder attention, and cross-attention are not exposed as head outputs.
-Vectors concatenate query head slices, with zero slices for unselected heads,
-and require `normalize=False`. The width is the query head count times the
-per-head value-output size, which can differ from the residual hidden size.
-Capture the same activations with `stream="attention_heads"`; fetch results
-include per-layer `layouts` with `width`, `num_heads`, and `head_size`.
+`attention_add` supports standard decoder MHA/GQA with ordinary tensor
+parallelism, including `tensor_parallel_size=2`. The supported scope is
+`PP=DP=1`, without context, sequence, or expert parallelism. MLA, encoder
+attention, and cross-attention are not exposed as head outputs. Vectors
+concatenate all query heads in global order, with zero slices for unselected
+heads, and require `normalize=False`. Supply the same full-width vector with
+TP; the engine handles distribution. The width is the global query head count
+times the per-head value-output size, which can differ from the residual hidden
+size. Capture the same activations with `stream="attention_heads"` through
+`easysteer.hidden_states.capture()`; results include global per-layer `layouts`
+with `width`, `num_heads`, and `head_size`. TP capture supports a separate FULL
+CUDA graph with `in_graph` steering; ineligible capture batches run eagerly.
 The [ITI example](https://github.com/ZJU-REAL/EasySteer/tree/main/replications/iti)
 constructs these vectors from a small TruthfulQA subset.
 

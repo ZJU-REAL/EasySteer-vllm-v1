@@ -156,3 +156,166 @@ def deserialize_captured(
             token_ids=torch.from_numpy(token_ids.copy()),
         )
     return tensors, meta
+
+
+def validate_capture_topology(statuses: list[dict[str, Any]]) -> int:
+    """Require one complete ordinary TP group before changing its streams."""
+    if not statuses:
+        raise ValueError("Capture requires at least one worker")
+    if len(statuses) == 1 and "topology" not in statuses[0]:
+        # Preserve compatibility with the original single-worker RPC format.
+        return 1
+    ranks = set()
+    for status in statuses:
+        topology = status.get("topology")
+        if not isinstance(topology, dict):
+            raise ValueError("Multiworker capture requires explicit worker topology")
+        rank, size = topology.get("tp_rank"), topology.get("tp_size")
+        if (
+            type(rank) is not int
+            or type(size) is not int
+            or size != len(statuses)
+            or not 0 <= rank < size
+            or rank in ranks
+        ):
+            raise ValueError(
+                "Capture worker topology has missing or duplicate TP ranks"
+            )
+        ranks.add(rank)
+        for name in ("pp_size", "dp_size", "pcp_size", "dcp_size"):
+            if topology.get(name) != 1:
+                raise ValueError(f"Capture requires {name}=1")
+        for name in ("sequence_parallel", "sequence_parallel_moe", "expert_parallel"):
+            if topology.get(name) is not False:
+                raise ValueError(f"Capture does not support {name}")
+    return len(statuses)
+
+
+def assemble_captured(
+    worker_results: list[dict[int, dict[str, Any]]],
+    *,
+    tp_size: int,
+) -> tuple[dict[int, torch.Tensor], dict[int, CaptureMeta], dict[int, dict[str, int]]]:
+    """Decode owner exports and join labelled attention feature shards.
+
+    Worker reply order does not determine shard order. Every distributed layer
+    declares its TP rank, feature offset, global width and representation kind.
+    Replicated values must come from exactly one owner; feature shards must cover
+    the full TP group and agree on row identities before concatenation.
+    """
+    if tp_size < 1 or len(worker_results) != tp_size:
+        raise ValueError("Capture fetch returned an incomplete worker group")
+    if tp_size == 1:
+        raw = worker_results[0]
+        tensors, meta = deserialize_captured(raw)
+        layouts = {lid: info["layout"] for lid, info in raw.items() if "layout" in info}
+        return tensors, meta, layouts
+
+    by_layer: dict[int, list[tuple]] = {}
+    worker_ranks = set()
+    for raw in worker_results:
+        tensors, meta = deserialize_captured(raw)
+        reply_rank = None
+        for layer, info in raw.items():
+            shard = info.get("shard")
+            if not isinstance(shard, dict):
+                raise ValueError(f"Capture layer {layer} is missing shard metadata")
+            rank = shard.get("tp_rank")
+            if (
+                type(rank) is not int
+                or not 0 <= rank < tp_size
+                or shard.get("tp_size") != tp_size
+                or (reply_rank is not None and rank != reply_rank)
+            ):
+                raise ValueError(f"Capture layer {layer} has inconsistent TP topology")
+            reply_rank = rank
+            by_layer.setdefault(layer, []).append((info, tensors[layer], meta[layer]))
+        if reply_rank is not None:
+            if reply_rank in worker_ranks:
+                raise ValueError("Capture fetch returned duplicate TP ranks")
+            worker_ranks.add(reply_rank)
+
+    tensors, metadata, layouts = {}, {}, {}
+    for layer, parts in by_layer.items():
+        first_info, first_tensor, first_meta = parts[0]
+        first_shard = first_info["shard"]
+        kind, width = first_shard.get("kind"), first_shard.get("global_width")
+        if kind not in ("replicated", "feature_shard") or type(width) is not int:
+            raise ValueError(f"Capture layer {layer} has an unsupported shard layout")
+        if width <= 0:
+            raise ValueError(f"Capture layer {layer} has an invalid global width")
+        ranks = {info["shard"]["tp_rank"] for info, _, _ in parts}
+        expected_ranks = {0} if kind == "replicated" else set(range(tp_size))
+        if ranks != expected_ranks or len(parts) != len(expected_ranks):
+            raise ValueError(f"Capture layer {layer} has missing or duplicate shards")
+
+        head_size = None
+        for info, tensor, labels in parts:
+            shard = info["shard"]
+            start = shard.get("feature_start")
+            if (
+                shard.get("kind") != kind
+                or shard.get("global_width") != width
+                or type(start) is not int
+                or start < 0
+                or tensor.ndim != 2
+                or tensor.dtype != first_tensor.dtype
+                or info.get("layer_name") != first_info.get("layer_name")
+            ):
+                raise ValueError(f"Capture layer {layer} has inconsistent shard layout")
+            if (
+                labels.req_ids != first_meta.req_ids
+                or not torch.equal(labels.positions, first_meta.positions)
+                or not torch.equal(labels.token_ids, first_meta.token_ids)
+            ):
+                raise ValueError(
+                    f"Capture layer {layer} shards have different row labels"
+                )
+            layout = info.get("layout")
+            if kind == "feature_shard" or layout is not None:
+                if not isinstance(layout, dict):
+                    raise ValueError(
+                        f"Capture layer {layer} is missing attention layout"
+                    )
+                size, heads = layout.get("head_size"), layout.get("num_heads")
+                if (
+                    type(size) is not int
+                    or size <= 0
+                    or type(heads) is not int
+                    or heads <= 0
+                    or layout.get("width") != tensor.shape[1]
+                    or heads * size != tensor.shape[1]
+                    or start % size != 0
+                    or width % size != 0
+                    or (head_size is not None and size != head_size)
+                ):
+                    raise ValueError(
+                        f"Capture layer {layer} has inconsistent head layout"
+                    )
+                head_size = size
+
+        ordered = sorted(parts, key=lambda part: part[0]["shard"]["feature_start"])
+        offset = 0
+        for info, tensor, _ in ordered:
+            if info["shard"]["feature_start"] != offset:
+                raise ValueError(
+                    f"Capture layer {layer} has overlapping or missing features"
+                )
+            offset += tensor.shape[1]
+        if offset != width:
+            raise ValueError(
+                f"Capture layer {layer} shards do not cover its global width"
+            )
+        tensors[layer] = (
+            first_tensor
+            if kind == "replicated"
+            else torch.cat([tensor for _, tensor, _ in ordered], dim=-1)
+        )
+        metadata[layer] = first_meta
+        if head_size is not None:
+            layouts[layer] = {
+                "width": width,
+                "num_heads": width // head_size,
+                "head_size": head_size,
+            }
+    return tensors, metadata, layouts

@@ -301,7 +301,7 @@ class WorkerSteeringState:
             width = (
                 self.hidden_size
                 if controller.component_id == HIDDEN_STATES
-                else controller.output_width
+                else controller.global_output_width
             )
             assert controller.layer_id is not None
             info.setdefault(controller.component_id, {})[controller.layer_id] = width

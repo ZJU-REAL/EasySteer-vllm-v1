@@ -98,7 +98,7 @@ COMPONENTS = {
 
 @dataclass(frozen=True)
 class ComponentTarget:
-    """One usable hook target with its model name and global layer index."""
+    """One hook target with a global layer index and local output geometry."""
 
     name: str
     layer_id: int
@@ -107,6 +107,21 @@ class ComponentTarget:
     num_heads: int | None = None
     # Per-head output width, which can differ from the query/key head size.
     head_size: int | None = None
+    # Feature partition owned by this module, independent of engine topology.
+    tp_rank: int = 0
+    tp_size: int = 1
+
+    @property
+    def global_width(self) -> int | None:
+        return None if self.width is None else self.width * self.tp_size
+
+    @property
+    def global_num_heads(self) -> int | None:
+        return None if self.num_heads is None else self.num_heads * self.tp_size
+
+    @property
+    def feature_start(self) -> int:
+        return (self.width or 0) * self.tp_rank
 
 
 ModelComponents = dict[str, tuple[ComponentTarget, ...]]
@@ -127,6 +142,8 @@ def discover_components(model: nn.Module) -> ModelComponents:
                         "width": target.num_heads * target.head_size_v,
                         "num_heads": target.num_heads,
                         "head_size": target.head_size_v,
+                        "tp_rank": layer.tp_rank,
+                        "tp_size": layer.tp_size,
                     }
                 targets.append(
                     ComponentTarget(layer.name, layer.layer_id, target, **layout)

@@ -80,7 +80,9 @@ logger = init_logger(__name__)
 class CaptureSession:
     """Owns capture hooks and streams for one worker's model."""
 
-    def __init__(self):
+    def __init__(self, *, tp_rank: int = 0, tp_size: int = 1):
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
         self._streams: dict[str, StreamStore | None] = dict.fromkeys(COMPONENTS)
         # Engine-internal request id -> {stream: SelectSpec wire dict}.
         self._request_selects: dict[str, dict[str, dict]] = {}
@@ -96,6 +98,7 @@ class CaptureSession:
             name: set() for name in COMPONENTS
         }
         self._layouts: dict[str, dict[int, dict[str, int]]] = {}
+        self._shards: dict[str, dict[int, dict[str, Any]]] = {}
         self._attached = False
         self.graph_state: CaptureGraphState | None = None
         self._graph_replays = 0
@@ -208,6 +211,14 @@ class CaptureSession:
     def attach(self, model: nn.Module, components: ModelComponents) -> None:
         if self._attached:
             return
+        for targets in components.values():
+            for target in targets:
+                if target.tp_size not in (1, self.tp_size) or (
+                    target.tp_size > 1 and target.tp_rank != self.tp_rank
+                ):
+                    raise ValueError(
+                        f"Capture target {target.name!r} has an unsupported TP group"
+                    )
         self._model = model
         self._components = components
         for component in COMPONENTS.values():
@@ -222,6 +233,16 @@ class CaptureSession:
             }
             self._available_layers[component.id] = {
                 target.layer_id for target in components[component.id]
+            }
+            self._shards[component.id] = {
+                target.layer_id: {
+                    "kind": "feature_shard" if target.tp_size > 1 else "replicated",
+                    "tp_rank": self.tp_rank,
+                    "tp_size": self.tp_size,
+                    "feature_start": target.feature_start,
+                    "global_width": target.global_width,
+                }
+                for target in components[component.id]
             }
         self._attached = True
 
@@ -249,6 +270,8 @@ class CaptureSession:
         for layer in targets:
             name, layer_id = layer.name, layer.layer_id
             if not store.wants_layer(layer_id):
+                continue
+            if layer.tp_size == 1 and self.tp_rank != 0:
                 continue
             target = layer.module
 
@@ -301,6 +324,7 @@ class CaptureSession:
         self._cache_hits.clear()
         self._unsupported_requests.clear()
         self._layouts.clear()
+        self._shards.clear()
         for layers in self._available_layers.values():
             layers.clear()
 
@@ -312,6 +336,7 @@ class CaptureSession:
         return any(store is not None for store in self._streams.values())
 
     def graph_signature(self) -> tuple:
+        """Common variant key, including outputs owned by another TP rank."""
         return tuple(
             (
                 stream,
@@ -326,6 +351,25 @@ class CaptureSession:
             for stream, store in self._streams.items()
             if store is not None
         )
+
+    def graph_expected_outputs(self) -> set[tuple[str, int]]:
+        """Validate the hooks that must write this rank's fixed graph outputs."""
+        expected: set[tuple[str, int]] = set()
+        for stream, store in self._streams.items():
+            if store is None:
+                continue
+            layers = {
+                target.layer_id
+                for target in self._components[stream]
+                if store.wants_layer(target.layer_id)
+                and (target.tp_size > 1 or self.tp_rank == 0)
+            }
+            if len(self._hook_handles.get(stream, ())) != len(layers):
+                raise RuntimeError(
+                    f"Capture graph hooks do not match local outputs for {stream}"
+                )
+            expected.update((stream, layer) for layer in layers)
+        return expected
 
     def release_graph(self) -> None:
         """Release fixed outputs after the runner releases their graph."""
@@ -399,7 +443,10 @@ class CaptureSession:
         """Keep normal graph dispatch when every effective selection is empty."""
         for stream, store in self._streams.items():
             if store is None or not any(
-                store.wants_layer(layer) and store.remaining_rows(layer) != 0
+                store.wants_layer(layer)
+                # Replicas do not retain rows, and byte budgets can fill on
+                # different ranks. Keep TP dispatch independent of local storage.
+                and (self.tp_size > 1 or store.remaining_rows(layer) != 0)
                 for layer in self._available_layers[stream]
             ):
                 continue
@@ -429,6 +476,10 @@ class CaptureSession:
                 "discovery happens once at model load."
             )
         config = StreamConfig(**config_kwargs)
+        if stream == ATTENTION_HEADS and config.budget_bytes is not None:
+            # Equal worker shares bound the total values, labels and pending
+            # transfers, including duplicated labels for head shards.
+            config.budget_bytes //= self.tp_size
         if stream == ATTENTION_HEADS:
             available = self._available_layers[stream]
             if not available:
@@ -485,6 +536,11 @@ class CaptureSession:
         for layer, info in result.items():
             if layout := self._layouts.get(stream, {}).get(layer):
                 info["layout"] = layout.copy()
+            if self.tp_size > 1:
+                shard = self._shards[stream][layer].copy()
+                if shard["global_width"] is None:
+                    shard["global_width"] = info["shape"][-1]
+                info["shard"] = shard
         return result
 
     def clear_stream(self, stream: str) -> None:

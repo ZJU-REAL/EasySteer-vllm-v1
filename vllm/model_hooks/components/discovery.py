@@ -26,6 +26,8 @@ class DiscoveredLayer:
     name: str
     module: nn.Module
     layer_id: int
+    tp_rank: int = 0
+    tp_size: int = 1
 
 
 class ModelDiscovery:
@@ -105,8 +107,58 @@ def _find_attention_heads(decoders: list[DiscoveredLayer]) -> list[DiscoveredLay
                     full_name,
                 )
                 continue
-            layers.append(DiscoveredLayer(full_name, module, decoder.layer_id))
+            layout = _attention_tp_layout(modules, name, module)
+            if layout is None:
+                logger.warning_once(
+                    "Cannot establish the attention head TP layout on %s; "
+                    "attention-head steering and capture are unavailable.",
+                    full_name,
+                )
+                continue
+            layers.append(DiscoveredLayer(full_name, module, decoder.layer_id, *layout))
     return [layer for layer in layers if id(layer.module) not in shared_modules]
+
+
+def _attention_tp_layout(
+    modules: dict[str, nn.Module], name: str, attention: nn.Module
+) -> tuple[int, int] | None:
+    """Read the head partition from the owning output projection."""
+    from vllm.distributed import (
+        get_tensor_model_parallel_world_size,
+        model_parallel_is_initialized,
+    )
+    from vllm.model_executor.layers.linear import RowParallelLinear
+
+    width = attention.num_heads * attention.head_size_v
+    owner_name = name.rpartition(".")[0]
+    while True:
+        projections = []
+        for child in modules[owner_name].children():
+            # LoRA preserves the original parallel layer as base_layer.
+            projection = getattr(child, "base_layer", child)
+            if isinstance(projection, RowParallelLinear):
+                projections.append(projection)
+        if projections:
+            matches = [
+                projection
+                for projection in projections
+                if projection.input_is_parallel
+                and projection.input_size_per_partition == width
+                and projection.input_size == width * projection.tp_size
+                and 0 <= projection.tp_rank < projection.tp_size
+            ]
+            if len(matches) == 1:
+                return matches[0].tp_rank, matches[0].tp_size
+            return None
+        if not owner_name:
+            break
+        owner_name = owner_name.rpartition(".")[0]
+    if (
+        not model_parallel_is_initialized()
+        or get_tensor_model_parallel_world_size() == 1
+    ):
+        return 0, 1
+    return None
 
 
 def _stack_indices(model: nn.Module) -> dict[str, int]:

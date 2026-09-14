@@ -10,15 +10,19 @@ from torch import nn
 
 
 class CaptureGraphState:
-    def __init__(self, signature: tuple):
+    def __init__(
+        self, signature: tuple, expected_outputs: set[tuple[str, int]] | None = None
+    ):
         self.signature = signature
         self.ready = False
         self.recording = False
         self.buffers: dict[tuple[str, int], tuple[torch.Tensor, str]] = {}
         self.allocation_bytes = 0
-        self._expected = {
-            (stream, layer) for stream, layers in signature for layer in layers
-        }
+        self._expected = (
+            {(stream, layer) for stream, layers in signature for layer in layers}
+            if expected_outputs is None
+            else expected_outputs
+        )
         self._seen: set[tuple[str, int]] | None = None
 
     def close(self) -> None:

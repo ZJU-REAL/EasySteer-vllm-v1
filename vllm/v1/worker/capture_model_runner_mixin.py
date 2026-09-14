@@ -31,9 +31,32 @@ class CaptureModelRunnerMixin:
 
     def _capture_session(self) -> CaptureSession:
         if not hasattr(self, "capture_session"):
-            self.capture_session = CaptureSession()
+            topology = self._capture_topology()
+            self.capture_session = CaptureSession(
+                tp_rank=topology["tp_rank"], tp_size=topology["tp_size"]
+            )
             self.capture_graph_manager = None
         return self.capture_session
+
+    def _capture_topology(self) -> dict[str, Any]:
+        parallel = getattr(self, "parallel_config", None)
+        tp_size = getattr(parallel, "tensor_parallel_size", 1)
+        compilation = getattr(self, "compilation_config", None)
+        return {
+            "tp_rank": getattr(parallel, "rank", 0) % tp_size,
+            "tp_size": tp_size,
+            "pp_size": getattr(parallel, "pipeline_parallel_size", 1),
+            "dp_size": getattr(parallel, "data_parallel_size", 1),
+            "pcp_size": getattr(parallel, "prefill_context_parallel_size", 1),
+            "dcp_size": getattr(parallel, "decode_context_parallel_size", 1),
+            "sequence_parallel": getattr(
+                getattr(compilation, "pass_config", None), "enable_sp", False
+            ),
+            "sequence_parallel_moe": getattr(
+                parallel, "use_sequence_parallel_moe", False
+            ),
+            "expert_parallel": getattr(parallel, "enable_expert_parallel", False),
+        }
 
     def _detach_capture_hooks(self) -> None:
         session = getattr(self, "capture_session", None)
@@ -71,6 +94,17 @@ class CaptureModelRunnerMixin:
             **config_kwargs: StreamConfig options: layers, dtype, select,
                 reduce, budget_rows, and budget_bytes. Select uses SelectSpec.to_wire().
         """
+        topology = self._capture_topology()
+        if any(
+            topology[key] != 1 for key in ("pp_size", "dp_size", "pcp_size", "dcp_size")
+        ) or any(
+            topology[key]
+            for key in ("sequence_parallel", "sequence_parallel_moe", "expert_parallel")
+        ):
+            raise ValueError(
+                "Capture supports tensor parallelism with PP=DP=1 and no "
+                "context, sequence or expert parallelism."
+            )
         self._capture_session().enable_stream(stream, **config_kwargs)
         return True
 
@@ -104,4 +138,5 @@ class CaptureModelRunnerMixin:
     def capture_status(self, stream: str) -> dict[str, Any]:
         status = self._capture_session().stream_status(stream)
         status["graph_ready"] = self.capture_graph_manager is not None
+        status["topology"] = self._capture_topology()
         return status

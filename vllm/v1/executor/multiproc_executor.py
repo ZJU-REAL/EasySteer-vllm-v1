@@ -422,9 +422,17 @@ class MultiprocExecutor(Executor):
         response_mqs: Sequence[MessageQueue] = self.response_mqs
         if output_rank is not None:
             response_mqs = (response_mqs[output_rank],)
+        drain_capture_replies = isinstance(method, str) and method in (
+            "start_capture",
+            "stop_capture",
+            "fetch_captured",
+            "clear_captured",
+            "capture_status",
+        )
 
         def get_response():
             responses = []
+            error = None
             for mq in response_mqs:
                 dequeue_timeout = (
                     None if deadline is None else max(0.0, deadline - time.monotonic())
@@ -434,11 +442,19 @@ class MultiprocExecutor(Executor):
                 except TimeoutError as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
                 if status != WorkerProc.ResponseStatus.SUCCESS:
-                    raise RuntimeError(
+                    error = error or RuntimeError(
                         f"Worker failed with error '{result}', please check the"
                         " stack trace above for the root cause"
                     )
+                    if not drain_capture_replies:
+                        # Another rank may be blocked in a model collective.
+                        # Surface the failure so the caller can shut workers down.
+                        raise error
                 responses.append(result)
+            # Capture control methods have no distributed collectives. Drain
+            # their independent replies before allowing another capture RPC.
+            if error is not None:
+                raise error
             return responses[0] if output_rank is not None else responses
 
         future = FutureWrapper(

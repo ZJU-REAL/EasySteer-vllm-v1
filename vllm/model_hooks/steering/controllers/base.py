@@ -38,10 +38,29 @@ class SteeringController(nn.Module):
         # op (set when the hook is registered).
         self._op_key: str | None = None
         self._output_width: int | None = None
+        self._global_output_width: int | None = None
+        self._feature_start: int = 0
 
     @property
     def output_width(self) -> int | None:
         return self._output_width
+
+    @property
+    def global_output_width(self) -> int | None:
+        return self._global_output_width or self.output_width
+
+    def localize_payload(self, payload):
+        """Slice a canonical head direction once when installing a slot."""
+        width = self.output_width
+        global_width = self.global_output_width
+        if width is None or global_width == width:
+            return payload
+        if payload.ndim != 1 or payload.shape[0] != global_width:
+            raise ValueError(
+                f"{self.component_id} requires a global direction of width "
+                f"{global_width}, got shape {tuple(payload.shape)}"
+            )
+        return payload.narrow(0, self._feature_start, width)
 
     def configure_slot(
         self,
@@ -61,7 +80,10 @@ class SteeringController(nn.Module):
                 spec["algorithm"], normalize=bool(spec.get("normalize", False))
             )
             scale = spec.get("scale")
-            algo.set_payload(spec["payload"], 1.0 if scale is None else scale)
+            algo.set_payload(
+                self.localize_payload(spec["payload"]),
+                1.0 if scale is None else scale,
+            )
             entries.append(algo)
         self.slot_interventions[slot] = entries
         self.slot_position_groups[slot] = (
