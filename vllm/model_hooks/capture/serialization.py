@@ -272,7 +272,15 @@ def assemble_captured(
                     f"Capture layer {layer} shards have different row labels"
                 )
             layout = info.get("layout")
-            if kind == "feature_shard" or layout is not None:
+            if layout is not None and (
+                not isinstance(layout, dict) or layout.get("width") != tensor.shape[1]
+            ):
+                raise ValueError(
+                    f"Capture layer {layer} has inconsistent output layout"
+                )
+            if kind == "feature_shard" or (
+                layout is not None and ("head_size" in layout or "num_heads" in layout)
+            ):
                 if not isinstance(layout, dict):
                     raise ValueError(
                         f"Capture layer {layer} is missing attention layout"
@@ -312,6 +320,8 @@ def assemble_captured(
             else torch.cat([tensor for _, tensor, _ in ordered], dim=-1)
         )
         metadata[layer] = first_meta
+        if first_info.get("layout") is not None:
+            layouts[layer] = {"width": width}
         if head_size is not None:
             layouts[layer] = {
                 "width": width,

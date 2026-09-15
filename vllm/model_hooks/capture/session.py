@@ -288,7 +288,7 @@ class CaptureSession:
                 recording = graph_state is not None and graph_state.recording
                 if not recording and store.remaining_rows(_lid) == 0:
                     return
-                tensor, tensor_owned = component.adapter.capture_rows(output)
+                tensor, residual, _, _ = component.adapter.read_output(output)
                 if tensor is None:
                     return
                 if _width is not None and (
@@ -300,10 +300,11 @@ class CaptureSession:
                     )
                 if recording:
                     assert graph_state is not None
-                    graph_state.record(stream, _lid, tensor, _name)
+                    graph_state.record(stream, _lid, tensor, _name, residual=residual)
                     return
+                kwargs = {} if residual is None else {"residual": residual}
                 rows, meta = prepare_rows(
-                    tensor, store, _lid, stream, self._request_selects, tensor_owned
+                    tensor, store, _lid, stream, self._request_selects, **kwargs
                 )
                 if rows is not None:
                     store.append(_lid, rows, meta, _name)
@@ -376,10 +377,49 @@ class CaptureSession:
         if self.graph_state is not None:
             self.graph_state.close()
             self.graph_state = None
+        for store in self._streams.values():
+            if store is not None:
+                store.device_reserved_bytes = 0
+
+    def graph_memory_estimate(self, num_tokens: int) -> int | None:
+        """Bound fixed outputs, selection/cast workspace and pending row labels.
+
+        Unknown component dimensions require eager capture.
+        Eight bytes per value covers every supported capture storage dtype.
+        """
+        total = 0
+        expected = self.graph_expected_outputs()
+        for stream, store in self._streams.items():
+            if store is None:
+                continue
+            width = 0
+            layers = 0
+            for name, layer in expected:
+                if name != stream:
+                    continue
+                layout = self._layouts.get(stream, {}).get(layer, {})
+                if not layout.get("width"):
+                    return None
+                width += layout["width"]
+                layers += 1
+            size = num_tokens * width * 8
+            required = 3 * size + num_tokens * layers * 12
+            budget = store.config.device_budget_bytes
+            if budget is not None and required > budget:
+                return None
+            total += required
+        return total
 
     def collect_graph_outputs(self, num_tokens: int) -> None:
         assert self.graph_state is not None
         self._graph_replays += 1
+        for stream, store in self._streams.items():
+            if store is not None:
+                store.device_reserved_bytes = sum(
+                    tensor.numel() * tensor.element_size()
+                    for (name, _), (tensor, _) in self.graph_state.buffers.items()
+                    if name == stream
+                )
         for (stream, layer), (tensor, name) in self.graph_state.buffers.items():
             store = self._streams[stream]
             assert store is not None
@@ -396,6 +436,17 @@ class CaptureSession:
 
     def prepare_batch(self, geometry: "BatchGeometry") -> None:
         """Account for full layers even when this batch uses ordinary graphs."""
+        for stream, store in self._streams.items():
+            if store is not None:
+                store.device_reserved_bytes = (
+                    sum(
+                        tensor.numel() * tensor.element_size()
+                        for (name, _), (tensor, _) in self.graph_state.buffers.items()
+                        if name == stream
+                    )
+                    if self.graph_state is not None
+                    else 0
+                )
         unsupported = (
             {
                 req_id: "Capture does not support requests with prompt embeddings"
@@ -517,14 +568,20 @@ class CaptureSession:
         clear: bool = True,
         layers: list[int] | None = None,
         req_ids: list[str] | None = None,
+        max_rows: int | None = None,
+        row_offset: int = 0,
     ) -> dict[int, dict[str, Any]]:
         store = self._streams.get(stream)
         if store is None:
             return {}
         store.flush()  # capture any rows staged since the last step
-        if req_ids is not None:
+        if req_ids is not None or max_rows is not None or row_offset:
             result = store.serialize(
-                layers=layers, req_ids=req_ids, clear_selected=clear
+                layers=layers,
+                req_ids=req_ids,
+                clear_selected=clear,
+                max_rows=max_rows,
+                row_offset=row_offset,
             )
         else:
             result = store.serialize(layers=layers)
@@ -553,6 +610,7 @@ class CaptureSession:
         hooked = len(self._hook_handles.get(stream, ()))
         execution = {
             "layouts": self._layouts.get(stream, {}),
+            "shards": self._shards.get(stream, {}),
             "graph_ready": self.graph_state is not None and self.graph_state.ready,
             "graph_buffer_bytes": 0
             if self.graph_state is None
@@ -571,9 +629,20 @@ class CaptureSession:
             "enabled": True,
             "hooked_layers": hooked,
             "layers_captured": len(store.chunks),
+            "layer_rows": {
+                layer: store._layer_rows.get(layer, 0)
+                for layer in sorted(self._available_layers[stream])
+                if store.wants_layer(layer)
+            },
             "tokens_stored": store.tokens_stored,
             "tokens_dropped": store.tokens_dropped,
             "storage_bytes": store.storage_bytes,
+            "pending_bytes": store.pending_bytes,
+            "pending_device_bytes": store.pending_device_bytes,
+            "device_reserved_bytes": store.device_reserved_bytes,
+            "staging_allocation_bytes": store.staging_allocation_bytes,
+            "staging_bytes": store.config.staging_bytes,
+            "device_budget_bytes": store.config.device_budget_bytes,
             "budget_bytes": store.config.budget_bytes,
             "reduce": store.config.reduce,
             "select": store.config.select,

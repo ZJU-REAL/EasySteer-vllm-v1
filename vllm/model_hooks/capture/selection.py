@@ -219,6 +219,8 @@ def prepare_rows(
     stream: str = "",
     request_selects: "dict[str, dict[str, dict]] | None" = None,
     tensor_owned: bool = False,
+    *,
+    residual: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Select/reduce step rows with a plan shared by this stream's layers.
 
@@ -254,30 +256,64 @@ def prepare_rows(
     if plan is None:
         return None, None
     count = plan.meta.shape[0]
-    row_bytes = (
-        store.row_bytes(tensor) if store.config.budget_bytes is not None else None
+    output_dtype = (
+        tensor.dtype
+        if residual is None
+        else torch.promote_types(tensor.dtype, residual.dtype)
     )
-    keep = store.limit_rows(layer_id, count, row_bytes)
+    output_size = torch.empty((), dtype=output_dtype, device="cpu").element_size()
+    storage_size = torch.empty(
+        (), dtype=store.config.dtype or output_dtype, device="cpu"
+    ).element_size()
+    width = tensor.numel() // tensor.shape[0]
+    row_bytes = width * storage_size + 12
+    device_bytes = None
+    if tensor.is_cuda and store.config.device_budget_bytes is not None:
+        remaining = store.remaining_rows(layer_id)
+        planned = count if remaining is None else min(count, remaining)
+        device_bytes = planned * width * (output_size + storage_size)
+        if plan.mean_spans is not None:
+            # Preserve sum-before-mean rounding while holding at most one
+            # request span's residual sum and the reduced rows.
+            device_bytes += planned * width * output_size
+            if residual is not None:
+                largest = max(
+                    (end - start for start, end in plan.mean_spans[:planned]), default=0
+                )
+                device_bytes += largest * width * output_size
+        elif residual is not None and plan.indices is not None:
+            device_bytes += (
+                planned * width * (tensor.element_size() + residual.element_size())
+            )
+        device_bytes += plan.meta.numel() * plan.meta.element_size()
+    keep = store.limit_rows(layer_id, count, row_bytes, device_bytes=device_bytes)
     if keep == 0:
         return None, None
     if plan.mean_spans is not None:
-        rows = torch.stack(
-            [
-                tensor[start:end].mean(dim=0)
-                if end > start
-                else torch.zeros_like(tensor[0])
-                for start, end in plan.mean_spans[:keep]
-            ]
-        )
+        means = []
+        for start, end in plan.mean_spans[:keep]:
+            if end <= start:
+                means.append(torch.zeros_like(tensor[0], dtype=output_dtype))
+                continue
+            values = tensor[start:end]
+            if residual is not None:
+                values = values + residual[start:end]
+            means.append(values.mean(dim=0))
+        rows = torch.stack(means)
     elif plan.indices is None:
         # Staged rows must survive subsequent model operations until flush().
-        rows = (
-            tensor[:keep]
-            if tensor_owned and keep == tensor.shape[0]
-            else tensor[:keep].clone()
-        )
+        if residual is not None:
+            rows = tensor[:keep] + residual[:keep]
+        else:
+            rows = (
+                tensor[:keep]
+                if tensor_owned and keep == tensor.shape[0]
+                else tensor[:keep].clone()
+            )
     else:
         rows = tensor[:total][plan.indices[:keep]]
+        if residual is not None:
+            rows = rows + residual[:total][plan.indices[:keep]]
     return rows, plan.meta if keep == count else plan.meta[:keep]
 
 
@@ -303,6 +339,19 @@ def _build_row_plan(
                 overrides[i] = per_req[stream]
 
     if config.reduce == "mean" and not overrides:
+        computed, prompt = geo.num_computed.numpy(), geo.num_prompt.numpy()
+        scheduled = geo.query_start_loc_cpu[1:] - geo.query_start_loc_cpu[:-1]
+        partial = (computed < prompt) & ((computed > 0) | (scheduled < prompt))
+        if partial.any():
+            store.fail_requests(
+                {
+                    req_id: "Capture mean reduction requires an unchunked prompt; "
+                    "capture rows and pool each sample during extraction instead"
+                    for i, req_id in enumerate(geo.req_ids)
+                    if partial[i]
+                }
+            )
+            return None
         return _mean_plan(geo, _request_indices(geo, store, device), total)
 
     batch = geo.device_view(device)
@@ -388,13 +437,6 @@ def _request_indices(
 
 def _mean_plan(geo: "BatchGeometry", step_req: torch.Tensor, total: int) -> _RowPlan:
     """One mean per sample/chunk, with synthetic position/token labels."""
-    computed, prompt = geo.num_computed.numpy(), geo.num_prompt.numpy()
-    if ((computed > 0) & (computed < prompt)).any():
-        logger.warning_once(
-            "Capture 'mean' reduction under chunked prefill produces one "
-            "mean per chunk, not per prompt; use reduce='all' and "
-            "reduce client-side for chunked prompts."
-        )
     offsets = geo.query_start_loc_cpu.clip(max=total).tolist()
     sentinel = torch.full_like(step_req, -1)
     meta = torch.stack([step_req, sentinel, sentinel], dim=1)

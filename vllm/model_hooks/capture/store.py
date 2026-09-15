@@ -32,6 +32,9 @@ class StreamConfig:
     within-sample reduction ("all" | "last" | "mean"); `budget_rows`
     caps stored rows per layer. `budget_bytes` limits stored values/labels and
     pending transfers across layers, reporting overflow when capture is fetched.
+    `staging_bytes` bounds reusable pinned transfer storage; retained chunks use
+    pageable memory. `device_budget_bytes` covers pending GPU rows and capture
+    outputs reserved by the session.
     """
 
     def __init__(
@@ -42,6 +45,8 @@ class StreamConfig:
         select: dict | None = None,
         budget_rows: int | None = None,
         budget_bytes: int | None = None,
+        staging_bytes: int = 16 * 1024 * 1024,
+        device_budget_bytes: int | None = None,
     ):
         if reduce not in ("all", "last", "mean"):
             raise ValueError(f"reduce must be 'all', 'last' or 'mean', got {reduce!r}")
@@ -57,14 +62,24 @@ class StreamConfig:
         self.dtype = resolve_storage_dtype(dtype) if dtype is not None else None
         self.reduce = reduce
         self.select = select
-        if budget_rows is not None and budget_rows < 0:
-            raise ValueError("budget_rows must be nonnegative")
+        if budget_rows is not None and (
+            type(budget_rows) is not int or budget_rows < 0
+        ):
+            raise ValueError("budget_rows must be a nonnegative integer")
         self.budget_rows = budget_rows
         if budget_bytes is not None and (
             type(budget_bytes) is not int or budget_bytes < 0
         ):
             raise ValueError("budget_bytes must be a nonnegative integer")
         self.budget_bytes = budget_bytes
+        if type(staging_bytes) is not int or staging_bytes < 1:
+            raise ValueError("staging_bytes must be a positive integer")
+        self.staging_bytes = staging_bytes
+        if device_budget_bytes is not None and (
+            type(device_budget_bytes) is not int or device_budget_bytes < 0
+        ):
+            raise ValueError("device_budget_bytes must be a nonnegative integer")
+        self.device_budget_bytes = device_budget_bytes
         if (
             reduce == "all"
             and select is None
@@ -124,6 +139,8 @@ class StreamStore:
         self.tokens_dropped = 0
         self._warned_budget = False
         self._pending: list[tuple[int, torch.Tensor, torch.Tensor, str]] = []
+        self._staging: torch.Tensor | None = None
+        self.device_reserved_bytes = 0
         self._stored_bytes = 0
         self._budget_error: str | None = None
         # Geometry and request selections are fixed during one forward pass.
@@ -146,10 +163,44 @@ class StreamStore:
 
         Graph buffers, model temporaries and serialization copies are separate.
         """
-        return self._stored_bytes + sum(
+        return self._stored_bytes + self.pending_bytes
+
+    @property
+    def pending_bytes(self) -> int:
+        return sum(
             tensor.numel() * tensor.element_size() + meta.numel() * meta.element_size()
             for _, tensor, meta, _ in self._pending
         )
+
+    @property
+    def pending_device_bytes(self) -> int:
+        return sum(
+            value.numel() * value.element_size()
+            for _, tensor, meta, _ in self._pending
+            for value in (tensor, meta)
+            if value.is_cuda
+        )
+
+    @property
+    def staging_allocation_bytes(self) -> int:
+        return 0 if self._staging is None else self._staging.numel()
+
+    def _within_device_budget(self, additional_bytes: int) -> bool:
+        budget = self.config.device_budget_bytes
+        if budget is None:
+            return True
+        required = (
+            self.device_reserved_bytes + self.pending_device_bytes + additional_bytes
+        )
+        if required > budget:
+            self._budget_error = (
+                f"Capture device staging budget ({budget} bytes) exceeded: "
+                f"the next rows require {required} bytes. Reduce the capture "
+                "batch, layers or selected rows, or increase device_budget_bytes. "
+                "No complete capture result is available."
+            )
+            return False
+        return True
 
     def row_bytes(self, tensor: torch.Tensor) -> int:
         dtype = self.config.dtype
@@ -263,12 +314,35 @@ class StreamStore:
         return keep
 
     def limit_rows(
-        self, layer_id: int, count: int, row_bytes: int | None = None
+        self,
+        layer_id: int,
+        count: int,
+        row_bytes: int | None = None,
+        *,
+        device_bytes: int | None = None,
     ) -> int:
         """Apply the budget before gathering or cloning activation values."""
+        budget = self.config.device_budget_bytes
+        if device_bytes is not None and budget is not None:
+            with self.lock:
+                flush = (
+                    self.device_reserved_bytes + device_bytes <= budget
+                    and self.device_reserved_bytes
+                    + self.pending_device_bytes
+                    + device_bytes
+                    > budget
+                )
+            if flush:
+                # The caller's row plan may already contain request indices
+                # that its next append has not claimed yet.
+                self.flush(reclaim_requests=False)
         with self.lock:
             keep = self._limit_rows(layer_id, count)
             if row_bytes is not None and not self._within_byte_budget(keep, row_bytes):
+                return 0
+            if device_bytes is not None and not self._within_device_budget(
+                device_bytes
+            ):
                 return 0
             return keep
 
@@ -282,11 +356,9 @@ class StreamStore:
         """Stage one layer's selected rows for this step (GPU side).
 
         ``meta`` is an int32 ``[rows, 3]`` tensor of
-        (req_idx, position, token_id) labels. The device-to-host copy happens once
-        per step in
-        ``flush()``: per-layer synchronous ``.cpu()`` calls stall the
-        GPU stream once per hooked layer, which serializes
-        capture-heavy runs.
+        (req_idx, position, token_id) labels. ``flush()`` coalesces device-to-host
+        transfers across layers. A device budget can trigger an earlier flush
+        before the next layer materializes its selected rows.
         """
         with self.lock:
             if (
@@ -312,6 +384,14 @@ class StreamStore:
                 return
             tensor = tensor[:keep]
             meta = meta[:keep]
+            if tensor.is_cuda:
+                device_bytes = tensor.numel() * tensor.element_size()
+                if meta.is_cuda:
+                    device_bytes += meta.numel() * meta.element_size()
+                if self.config.dtype is not None and tensor.dtype != self.config.dtype:
+                    device_bytes += keep * (self.row_bytes(tensor) - 3 * 4)
+                if not self._within_device_budget(device_bytes):
+                    return
             if self.config.dtype is not None:
                 tensor = tensor.to(self.config.dtype)
             # `tensor` is owned by the hook (freshly materialized), so an
@@ -325,71 +405,131 @@ class StreamStore:
                 )
             )
 
-    def flush(self):
-        """Move this step's staged rows to CPU in one coalesced pass.
+    def flush(self, *, reclaim_requests: bool = True):
+        """Copy through one reusable pinned page into owned pageable chunks.
 
-        Copies go through pinned staging buffers with non_blocking=True
-        (one stream sync at the end), amortizing D2H latency across all
-        hooked layers instead of paying it per layer.
+        Layers share a transfer and synchronization when they fit in the page.
+        Larger steps reuse that page instead of pinning their entire payload.
         """
         with self.lock:
             if not self._pending:
                 return
-            pinned = []
-            any_cuda = False
+            jobs: list[tuple[int, torch.Tensor, torch.Tensor, str]] = []
+            cursor = 0
+
+            def finish_page():
+                nonlocal cursor
+                if jobs:
+                    torch.cuda.current_stream().synchronize()
+                    for layer, values, labels, name in jobs:
+                        self._store_page(layer, values, labels, name)
+                    jobs.clear()
+                    cursor = 0
+
             for layer_id, tensor, meta, layer_name in self._pending:
-                host_pair = []
-                for t in (tensor, meta):
-                    if t.is_cuda:
-                        host = torch.empty_like(t, device="cpu", pin_memory=True)
-                        host.copy_(t, non_blocking=True)
-                        any_cuda = True
-                    else:
-                        host = t
-                    host_pair.append(host)
-                pinned.append((layer_id, host_pair[0], host_pair[1], layer_name))
-            if any_cuda:
-                torch.cuda.current_stream().synchronize()
-            self._pending.clear()
-            for layer_id, host, meta_host, layer_name in pinned:
-                requests, counts = torch.unique_consecutive(
-                    meta_host[:, 0], return_counts=True
-                )
-                start = 0
-                for request_index, count in zip(requests.tolist(), counts.tolist()):
-                    tensor = host[start : start + count]
-                    meta = meta_host[start : start + count]
-                    # Each request owns its storage. Draining one must release
-                    # its values without copying or pinning another request's rows.
-                    if len(counts) > 1:
-                        tensor, meta = tensor.clone(), meta.clone()
-                    chunk_id = self._next_chunk
-                    self._next_chunk += 1
-                    self.chunks.setdefault(layer_id, {})[chunk_id] = _StoredChunk(
-                        tensor, meta, request_index
+                value_bytes = tensor[0].numel() * tensor.element_size()
+                row_bytes = value_bytes + 3 * 4
+                page_rows = max(1, self.config.staging_bytes // row_bytes)
+                if not tensor.is_cuda and not meta.is_cuda:
+                    finish_page()
+                    for start in range(0, tensor.shape[0], page_rows):
+                        self._store_page(
+                            layer_id,
+                            tensor[start : start + page_rows],
+                            meta[start : start + page_rows],
+                            layer_name,
+                        )
+                    continue
+                # A single wide row can use a synchronous pageable copy without
+                # exceeding the pinned staging limit.
+                if row_bytes + 8 > self.config.staging_bytes:
+                    finish_page()
+                    for start in range(tensor.shape[0]):
+                        self._store_page(
+                            layer_id,
+                            tensor[start : start + 1].cpu(),
+                            meta[start : start + 1].cpu(),
+                            layer_name,
+                        )
+                    continue
+                if self._staging is None:
+                    self._staging = torch.empty(
+                        self.config.staging_bytes,
+                        dtype=torch.uint8,
+                        device="cpu",
+                        pin_memory=True,
                     )
-                    self._request_chunks.setdefault(request_index, {}).setdefault(
-                        layer_id, set()
-                    ).add(chunk_id)
-                    self._unused_request_indices.discard(request_index)
+                start = 0
+                while start < tensor.shape[0]:
+                    offset = (cursor + 7) // 8 * 8
+                    available = (self.config.staging_bytes - offset - 4) // row_bytes
+                    if available < 1:
+                        finish_page()
+                        continue
+                    count = min(tensor.shape[0] - start, available)
+                    end_values = offset + count * value_bytes
+                    meta_offset = (end_values + 3) // 4 * 4
+                    end_meta = meta_offset + count * 3 * 4
+                    values = (
+                        self._staging[offset:end_values]
+                        .view(tensor.dtype)
+                        .view(count, *tensor.shape[1:])
+                    )
+                    labels = (
+                        self._staging[meta_offset:end_meta]
+                        .view(torch.int32)
+                        .view(count, 3)
+                    )
+                    values.copy_(tensor[start : start + count], non_blocking=True)
+                    labels.copy_(meta[start : start + count], non_blocking=True)
+                    jobs.append((layer_id, values, labels, layer_name))
+                    cursor = end_meta
                     start += count
-                self.layer_names[layer_id] = layer_name
-                self._layer_rows[layer_id] = (
-                    self._layer_rows.get(layer_id, 0) + host.shape[0]
-                )
-                self._stored_bytes += (
-                    host.numel() * host.element_size()
-                    + meta_host.numel() * meta_host.element_size()
-                )
-            self._reclaim_requests()
+            finish_page()
+            self._pending.clear()
+            if reclaim_requests:
+                self._reclaim_requests()
+
+    @staticmethod
+    def _pageable_copy(tensor: torch.Tensor) -> torch.Tensor:
+        result = torch.empty(
+            tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=False
+        )
+        result.copy_(tensor)
+        return result
+
+    def _store_page(self, layer_id, values, labels, layer_name):
+        requests, counts = torch.unique_consecutive(labels[:, 0], return_counts=True)
+        start = 0
+        for request_index, count in zip(requests.tolist(), counts.tolist()):
+            tensor = self._pageable_copy(values[start : start + count])
+            meta = self._pageable_copy(labels[start : start + count])
+            chunk_id = self._next_chunk
+            self._next_chunk += 1
+            self.chunks.setdefault(layer_id, {})[chunk_id] = _StoredChunk(
+                tensor, meta, request_index
+            )
+            self._request_chunks.setdefault(request_index, {}).setdefault(
+                layer_id, set()
+            ).add(chunk_id)
+            self._unused_request_indices.discard(request_index)
+            start += count
+        self.layer_names[layer_id] = layer_name
+        self._layer_rows[layer_id] = self._layer_rows.get(layer_id, 0) + values.shape[0]
+        self._stored_bytes += (
+            values.numel() * values.element_size()
+            + labels.numel() * labels.element_size()
+        )
 
     def serialize(
         self,
         layers: list[int] | None = None,
         req_ids: list[str] | None = None,
         clear_selected: bool = False,
+        max_rows: int | None = None,
+        row_offset: int = 0,
     ) -> dict[int, dict[str, Any]]:
-        """Concatenate selected chunks and pack for RPC transmission.
+        """Pack a bounded page per layer for RPC transmission.
 
         Tensors ship as raw bytes of their stored dtype (bf16 rides as
         int16 bytes and is reinterpreted client-side) — no float32
@@ -405,7 +545,16 @@ class StreamStore:
         of those requests; with ``clear_selected`` the emitted rows are
         also removed from the store, so clients can drain request by
         request with bounded peak message size.
+
+        ``max_rows`` caps each layer after request filtering. ``row_offset``
+        skips rows in that filtered order and requires a non-clearing fetch.
         """
+        if max_rows is not None and (type(max_rows) is not int or max_rows < 1):
+            raise ValueError("max_rows must be a positive integer")
+        if type(row_offset) is not int or row_offset < 0:
+            raise ValueError("row_offset must be a nonnegative integer")
+        if clear_selected and row_offset:
+            raise ValueError("row_offset requires clear=False")
         with self.lock:
             if self._budget_error is not None:
                 raise RuntimeError(self._budget_error)
@@ -466,18 +615,54 @@ class StreamStore:
                     chunk_ids = list(chunks)
                 if not chunk_ids:
                     continue
-                selected = [chunks[index] for index in chunk_ids]
+                selected = []
+                remaining = max_rows
+                skip = row_offset
+                for index in chunk_ids:
+                    chunk = chunks[index]
+                    count = chunk.tensor.shape[0]
+                    if skip >= count:
+                        skip -= count
+                        continue
+                    end = count if remaining is None else min(count, skip + remaining)
+                    selected.append((index, skip, end))
+                    if remaining is not None:
+                        remaining -= end - skip
+                        if remaining == 0:
+                            break
+                    skip = 0
+                if not selected:
+                    continue
                 if len(selected) == 1:
-                    tensor, meta = selected[0].tensor, selected[0].meta
+                    index, start, end = selected[0]
+                    tensor = chunks[index].tensor[start:end]
+                    meta = chunks[index].meta[start:end]
                 else:
-                    tensor = torch.cat([chunk.tensor for chunk in selected], dim=0)
-                    meta = torch.cat([chunk.meta for chunk in selected], dim=0)
+                    tensor = torch.cat(
+                        [
+                            chunks[index].tensor[start:end]
+                            for index, start, end in selected
+                        ]
+                    )
+                    meta = torch.cat(
+                        [
+                            chunks[index].meta[start:end]
+                            for index, start, end in selected
+                        ]
+                    )
                 result[layer_id] = serialize_capture_layer(
                     tensor, meta, self.req_table, layer_name
                 )
                 if clear_selected:
-                    for index in chunk_ids:
-                        self._remove_chunk(layer_id, index)
+                    for index, _, end in selected:
+                        chunk = chunks[index]
+                        if end == chunk.tensor.shape[0]:
+                            self._remove_chunk(layer_id, index)
+                        else:
+                            self._stored_bytes -= end * self.row_bytes(chunk.tensor)
+                            self._layer_rows[layer_id] -= end
+                            chunk.tensor = self._pageable_copy(chunk.tensor[end:])
+                            chunk.meta = self._pageable_copy(chunk.meta[end:])
             if clear_selected:
                 self._reclaim_requests()
             return result

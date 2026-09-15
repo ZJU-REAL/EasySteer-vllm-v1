@@ -51,7 +51,14 @@ class CaptureGraphState:
             for tensor, _ in self.buffers.values()
         )
 
-    def record(self, stream: str, layer: int, tensor: torch.Tensor, name: str) -> None:
+    def record(
+        self,
+        stream: str,
+        layer: int,
+        tensor: torch.Tensor,
+        name: str,
+        residual: torch.Tensor | None = None,
+    ) -> None:
         key = (stream, layer)
         if self._seen is not None:
             if key in self._seen:
@@ -59,11 +66,19 @@ class CaptureGraphState:
             self._seen.add(key)
         if key not in self.buffers:
             # FULL buckets warm up in descending size, outside graph recording.
-            self.buffers[key] = (torch.empty_like(tensor), name)
+            dtype = (
+                tensor.dtype
+                if residual is None
+                else torch.promote_types(tensor.dtype, residual.dtype)
+            )
+            self.buffers[key] = (torch.empty_like(tensor, dtype=dtype), name)
         target, _ = self.buffers[key]
         if tensor.shape[0] > target.shape[0] or tensor.shape[1:] != target.shape[1:]:
             raise RuntimeError("Capture graph output exceeds its fixed buffer")
-        target[: tensor.shape[0]].copy_(tensor)
+        if residual is None:
+            target[: tensor.shape[0]].copy_(tensor)
+        else:
+            torch.add(tensor, residual, out=target[: tensor.shape[0]])
 
     @contextmanager
     def record_outputs(self, model: nn.Module) -> Iterator[None]:

@@ -127,6 +127,53 @@ class ComponentTarget:
 ModelComponents = dict[str, tuple[ComponentTarget, ...]]
 
 
+def _decoder_width(model: nn.Module, layer: DiscoveredLayer) -> int | None:
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    widths = set()
+    width = getattr(layer.module, "hidden_size", None)
+    if type(width) is int and width > 0:
+        widths.add(width)
+    for child in layer.module.children():
+        if isinstance(child, RMSNorm):
+            width = child.hidden_size
+        elif isinstance(child, (nn.LayerNorm, nn.RMSNorm)):
+            shape = child.normalized_shape
+            width = shape[0] if len(shape) == 1 else None
+        else:
+            continue
+        if type(width) is int and width > 0:
+            widths.add(width)
+    if widths:
+        return next(iter(widths)) if len(widths) == 1 else None
+
+    name = layer.name
+    while True:
+        owner = model.get_submodule(name) if name else model
+        config = getattr(owner, "config", None)
+        width = getattr(config, "hidden_size", None)
+        if type(width) is int and width > 0:
+            return width
+        if not name:
+            return None
+        name = name.rpartition(".")[0]
+
+
+def _router_width(target: nn.Module) -> int | None:
+    from vllm.model_executor.layers.linear import ReplicatedLinear
+
+    target = getattr(target, "base_layer", target)
+    if isinstance(target, ReplicatedLinear):
+        # Quantized weights may be packed; the declared output size remains
+        # valid and is replicated even when the layer knows its engine TP group.
+        width = target.output_size
+    elif isinstance(target, nn.Linear):
+        width = target.out_features
+    else:
+        return None
+    return width if type(width) is int and width > 0 else None
+
+
 def discover_components(model: nn.Module) -> ModelComponents:
     """Resolve each component once for both steering and capture hooks."""
     discovery = ModelDiscovery(model)
@@ -145,6 +192,10 @@ def discover_components(model: nn.Module) -> ModelComponents:
                         "tp_rank": layer.tp_rank,
                         "tp_size": layer.tp_size,
                     }
+                elif component.id == HIDDEN_STATES:
+                    layout = {"width": _decoder_width(model, layer)}
+                elif component.id == ROUTER_LOGITS:
+                    layout = {"width": _router_width(target)}
                 targets.append(
                     ComponentTarget(layer.name, layer.layer_id, target, **layout)
                 )

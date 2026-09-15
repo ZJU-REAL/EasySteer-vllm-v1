@@ -980,6 +980,7 @@ class GPUModelRunner(
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
         elapsed_time = end_time - start_time
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        self.cudagraph_memory_bytes = max(0, cuda_graph_size)
         # This usually takes 5~20 seconds.
         logger.info(
             "Graph capturing finished in %.0f secs, took %.2f GiB",

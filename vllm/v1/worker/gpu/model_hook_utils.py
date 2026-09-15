@@ -61,14 +61,25 @@ def prepare_capture_graph(
     signature = ()
     expected_outputs = set()
     local_error = None
+    memory_allowed = True
     try:
         candidate = idle.dispatch(
             num_reqs, num_tokens, uniform_tok_count, num_active_loras, max_query_len
         )
-        if session.tp_size == 1 and candidate.cg_mode != CUDAGraphMode.FULL:
-            return None
         signature = session.graph_signature()
         expected_outputs = session.graph_expected_outputs()
+        descriptors = idle._capture_descs.get(CUDAGraphMode.FULL, ())
+        largest = max((desc.num_tokens for desc in descriptors), default=0)
+        estimate = session.graph_memory_estimate(largest)
+        memory_allowed = estimate is not None
+        if (
+            estimate is not None
+            and hasattr(runner, "device")
+            and (state is None or state.signature != signature)
+        ):
+            free, _ = torch.accelerator.get_memory_info(runner.device)
+            graph_memory = getattr(runner, "cudagraph_memory_bytes", 0)
+            memory_allowed = free >= 2 * (estimate + graph_memory)
     except Exception as error:
         local_error = error
     rebuild = (
@@ -82,7 +93,7 @@ def prepare_capture_graph(
         # graph was released must not enter capture while its peers replay.
         plan = (signature, candidate, idle._capture_descs.get(CUDAGraphMode.FULL, ()))
         digest = hashlib.sha256(repr(plan).encode()).digest()
-        decisions = torch.zeros((session.tp_size, 6), dtype=torch.int64, device="cpu")
+        decisions = torch.zeros((session.tp_size, 7), dtype=torch.int64, device="cpu")
         decisions[session.tp_rank, :4] = torch.tensor(
             [
                 int.from_bytes(digest[i : i + 8], byteorder="big", signed=True)
@@ -92,6 +103,7 @@ def prepare_capture_graph(
         )
         decisions[session.tp_rank, 4] = local_error is None
         decisions[session.tp_rank, 5] = rebuild
+        decisions[session.tp_rank, 6] = memory_allowed
         dist.all_reduce(decisions, group=get_tp_group().cpu_group)
         if not decisions[:, 4].all():
             raise RuntimeError(
@@ -104,9 +116,13 @@ def prepare_capture_graph(
                 "TP workers disagree on the capture graph variant or batch"
             )
         rebuild = bool(decisions[:, 5].any())
+        memory_allowed = bool(decisions[:, 6].all())
     elif local_error is not None:
         raise local_error
     assert candidate is not None
+    if not memory_allowed:
+        release_capture_graph(runner)
+        return None
     if candidate.cg_mode != CUDAGraphMode.FULL:
         return None
     if rebuild:

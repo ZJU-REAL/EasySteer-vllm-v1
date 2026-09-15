@@ -1321,10 +1321,20 @@ class Worker(WorkerBase):
         clear: bool = True,
         layers: list[int] | None = None,
         req_ids: list[str] | None = None,
+        max_rows: int | None = None,
+        row_offset: int = 0,
     ) -> dict:
         return self._model_hook_runner("Capture").fetch_captured(
-            stream, clear=clear, layers=layers, req_ids=req_ids
+            stream,
+            clear=clear,
+            layers=layers,
+            req_ids=req_ids,
+            max_rows=max_rows,
+            row_offset=row_offset,
         )
+
+    def release_capture_cache(self) -> bool:
+        return self._model_hook_runner("Capture").release_capture_cache()
 
     def clear_captured(self, stream: str) -> bool:
         return self._model_hook_runner("Capture").clear_captured(stream)

@@ -118,6 +118,8 @@ class CaptureModelRunnerMixin:
         clear: bool = True,
         layers: list[int] | None = None,
         req_ids: list[str] | None = None,
+        max_rows: int | None = None,
+        row_offset: int = 0,
     ) -> dict[int, dict[str, Any]]:
         """Fetch (and by default clear) captured rows.
 
@@ -127,8 +129,19 @@ class CaptureModelRunnerMixin:
         bounds peak message size for large corpora.
         """
         return self._capture_session().fetch_stream(
-            stream, clear=clear, layers=layers, req_ids=req_ids
+            stream,
+            clear=clear,
+            layers=layers,
+            req_ids=req_ids,
+            max_rows=max_rows,
+            row_offset=row_offset,
         )
+
+    def release_capture_cache(self) -> bool:
+        """Release cached capture graphs and their fixed GPU output buffers."""
+        self._capture_session()
+        release_capture_graph(self)
+        return True
 
     def clear_captured(self, stream: str) -> bool:
         """Drop captured rows, keeping the stream enabled."""
