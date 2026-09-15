@@ -80,7 +80,7 @@ execution path and slot cache as explicit steering.
 | `erase` | remove a direction (projection) | `.gguf` or data | split, in-graph |
 | `replace` | replace the hidden state | `.gguf` or data | split, in-graph |
 | `concept_replace` | swap one direction for another | data | split, in-graph |
-| `loreft` | learned low-rank edit (ReFT) | data (`from_pyreft`) | split; in-graph when rank ≤ `steer_graph_max_rank` |
+| `loreft` | learned low-rank edit (ReFT) | data (`easysteer.vectors.from_training`) | split; in-graph when rank ≤ `steer_graph_max_rank` |
 | `lm_steer` | low-rank projector pair at the selected decoder layers | data (`from_lm_steer`) | split; in-graph when rank ≤ `steer_graph_max_rank` |
 | `linear` | full affine map `h' = W·h + b` | data (`from_linear_transport`) | split only |
 | `moe_router` | adjust MoE expert routing at the gate | `RouterConfig`, inline config, or file | split; in-graph for `activate`, `deactivate`, `soft`, and `soft_topk` |
@@ -99,7 +99,7 @@ heads, and require `normalize=False`. Supply the same full-width vector with
 TP; the engine handles distribution. The width is the global query head count
 times the per-head value-output size, which can differ from the residual hidden
 size. Capture the same activations with `stream="attention_heads"` through
-`easysteer.hidden_states.capture()`; results include global per-layer `layouts`
+`easysteer.capture.capture()`; results include global per-layer `layouts`
 with `width`, `num_heads`, and `head_size`. TP capture supports a separate FULL
 CUDA graph with `in_graph` steering; ineligible capture batches run eagerly.
 The [ITI example](https://github.com/ZJU-REAL/EasySteer/tree/main/replications/iti)
